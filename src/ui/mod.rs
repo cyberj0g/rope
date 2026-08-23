@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use tokio::sync::mpsc;
 
@@ -30,6 +30,71 @@ use crate::{
 };
 use history::PromptHistory;
 use state::{ChatBlock, MessageKind, ToolStatus, UiState};
+
+#[derive(Clone, Copy)]
+struct SlashCommand {
+    name: &'static str,
+    title: &'static str,
+    hotkey: &'static str,
+    argument: bool,
+}
+
+const COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/new",
+        title: "New session",
+        hotkey: "Ctrl+N",
+        argument: false,
+    },
+    SlashCommand {
+        name: "/save",
+        title: "Save session",
+        hotkey: "Ctrl+S",
+        argument: false,
+    },
+    SlashCommand {
+        name: "/add",
+        title: "Add context file",
+        hotkey: "—",
+        argument: true,
+    },
+    SlashCommand {
+        name: "/drop",
+        title: "Drop context file",
+        hotkey: "—",
+        argument: true,
+    },
+    SlashCommand {
+        name: "/diff",
+        title: "Toggle Git diff",
+        hotkey: "Ctrl+D",
+        argument: false,
+    },
+    SlashCommand {
+        name: "/model",
+        title: "Switch model",
+        hotkey: "Alt+M",
+        argument: false,
+    },
+    SlashCommand {
+        name: "/reason",
+        title: "Switch reasoning effort",
+        hotkey: "Alt+R",
+        argument: false,
+    },
+    SlashCommand {
+        name: "/thinking",
+        title: "Toggle thinking visibility",
+        hotkey: "Alt+T",
+        argument: false,
+    },
+    SlashCommand {
+        name: "/tools",
+        title: "Toggle tool visibility",
+        hotkey: "Alt+O",
+        argument: false,
+    },
+];
 
 pub async fn run(
     config: Config,
@@ -58,8 +123,15 @@ pub async fn run(
                         }
                         TerminalEvent::Mouse(mouse) => {
                             let size = terminal.terminal.size()?;
-                            let area = conversation_area(Rect::new(0, 0, size.width, size.height), &state);
-                            handle_mouse(mouse, &mut state, area);
+                            let page = Rect::new(0, 0, size.width, size.height);
+                            let [_, _, input] = page_areas(page, &state);
+                            let area = conversation_area(page, &state);
+                            handle_mouse(mouse, &mut state, area, input, &commands).await?;
+                        }
+                        TerminalEvent::Paste(text) => {
+                            history.reset_navigation();
+                            state.input.push_str(&text);
+                            state.palette_selected = 0;
                         }
                         _ => {}
                     }
@@ -94,6 +166,10 @@ async fn handle_key(
         }
         return Ok(false);
     }
+    if let Some(command) = hotkey_command(key) {
+        dispatch(command.into(), state, history, commands).await?;
+        return Ok(false);
+    }
     if state.conversation_focused() {
         match key.code {
             KeyCode::Esc => state.focus_input(),
@@ -108,6 +184,11 @@ async fn handle_key(
         }
         return Ok(false);
     }
+    if key.code == KeyCode::Esc && palette_commands(&state.input).is_some() {
+        state.input.clear();
+        state.palette_selected = 0;
+        return Ok(false);
+    }
     if key.code == KeyCode::Esc
         || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g'))
     {
@@ -120,6 +201,18 @@ async fn handle_key(
             state.input.push('\n');
         }
         KeyCode::Enter => {
+            if let Some(filtered) = palette_commands(&state.input)
+                && let Some(command) = filtered.get(state.palette_selected).copied()
+            {
+                if command.argument {
+                    state.input = format!("{} ", command.name);
+                    state.palette_selected = 0;
+                } else {
+                    state.input.clear();
+                    dispatch(command.name.into(), state, history, commands).await?;
+                }
+                return Ok(false);
+            }
             if let Some(input) = state.take_input() {
                 dispatch(input, state, history, commands).await?;
             }
@@ -127,13 +220,28 @@ async fn handle_key(
         KeyCode::Backspace => {
             history.reset_navigation();
             state.input.pop();
+            state.palette_selected = 0;
         }
         KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             history.reset_navigation();
-            state.input.push(character)
+            state.input.push(character);
+            state.palette_selected = 0;
         }
-        KeyCode::Up => history.previous(&mut state.input),
-        KeyCode::Down => history.next(&mut state.input),
+        KeyCode::Up => {
+            if palette_commands(&state.input).is_some() {
+                state.palette_selected = state.palette_selected.saturating_sub(1);
+            } else {
+                history.previous(&mut state.input);
+            }
+        }
+        KeyCode::Down => {
+            if let Some(filtered) = palette_commands(&state.input) {
+                state.palette_selected =
+                    (state.palette_selected + 1).min(filtered.len().saturating_sub(1));
+            } else {
+                history.next(&mut state.input);
+            }
+        }
         KeyCode::Tab => state.focus_next(),
         KeyCode::BackTab => state.focus_previous(),
         KeyCode::PageUp => state.scroll = state.scroll.saturating_add(8),
@@ -174,6 +282,8 @@ async fn dispatch(
         }
         "/model" if argument.is_empty() => commands.send(Command::NextModel).await?,
         "/reason" if argument.is_empty() => commands.send(Command::NextReasoningEffort).await?,
+        "/thinking" if argument.is_empty() => state.toggle_thinking_default(),
+        "/tools" if argument.is_empty() => state.toggle_tools_default(),
         "/diff" if argument.is_empty() => commands.send(Command::RefreshProject).await?,
         value if value.starts_with('/') => {
             history.reset_navigation();
@@ -193,9 +303,30 @@ async fn dispatch(
     Ok(())
 }
 
-fn handle_mouse(mouse: MouseEvent, state: &mut UiState, conversation: Rect) {
+async fn handle_mouse(
+    mouse: MouseEvent,
+    state: &mut UiState,
+    conversation: Rect,
+    input: Rect,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && mouse.row == input.y {
+        let model_start = input.x + 2;
+        let model_end = model_start + state.model.chars().count() as u16;
+        let reason_start = model_end + 3;
+        let reason_end = reason_start
+            + state
+                .reasoning_effort
+                .map_or(3, |effort| effort.to_string().chars().count() as u16);
+        if (model_start..model_end).contains(&mouse.column) {
+            commands.send(Command::NextModel).await?;
+        } else if (reason_start..reason_end).contains(&mouse.column) {
+            commands.send(Command::NextReasoningEffort).await?;
+        }
+        return Ok(());
+    }
     if !conversation.contains((mouse.column, mouse.row).into()) {
-        return;
+        return Ok(());
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -208,6 +339,7 @@ fn handle_mouse(mouse: MouseEvent, state: &mut UiState, conversation: Rect) {
         MouseEventKind::ScrollDown => state.scroll = state.scroll.saturating_sub(3),
         _ => {}
     }
+    Ok(())
 }
 
 fn page_areas(area: Rect, state: &UiState) -> [Rect; 3] {
@@ -278,6 +410,7 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         ),
         input,
     );
+    draw_command_palette(frame, state, input);
 
     let input_width = input.width.saturating_sub(3).max(1);
     let last_line = state
@@ -290,6 +423,68 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
     if !state.conversation_focused() {
         frame.set_cursor_position((input.x + 2 + column, input.y + 1 + row));
     }
+}
+
+fn palette_commands(input: &str) -> Option<Vec<SlashCommand>> {
+    if !input.starts_with('/') || input.contains(char::is_whitespace) {
+        return None;
+    }
+    let query = input.trim_start_matches('/').to_ascii_lowercase();
+    Some(
+        COMMANDS
+            .iter()
+            .copied()
+            .filter(|command| {
+                command.name[1..].to_ascii_lowercase().contains(&query)
+                    || command.title.to_ascii_lowercase().contains(&query)
+            })
+            .collect(),
+    )
+}
+
+fn hotkey_command(key: KeyEvent) -> Option<&'static str> {
+    match (key.modifiers, key.code) {
+        (KeyModifiers::CONTROL, KeyCode::Char('n')) => Some("/new"),
+        (KeyModifiers::CONTROL, KeyCode::Char('s')) => Some("/save"),
+        (KeyModifiers::CONTROL, KeyCode::Char('d')) => Some("/diff"),
+        (KeyModifiers::ALT, KeyCode::Char('m')) => Some("/model"),
+        (KeyModifiers::ALT, KeyCode::Char('r')) => Some("/reason"),
+        (KeyModifiers::ALT, KeyCode::Char('t')) => Some("/thinking"),
+        (KeyModifiers::ALT, KeyCode::Char('o')) => Some("/tools"),
+        _ => None,
+    }
+}
+
+fn draw_command_palette(frame: &mut ratatui::Frame, state: &UiState, input: Rect) {
+    let Some(commands) = palette_commands(&state.input) else {
+        return;
+    };
+    let height = (commands.len() as u16 + 2).min(input.y);
+    if height <= 2 {
+        return;
+    }
+    let area = Rect::new(input.x, input.y - height, input.width, height);
+    let lines = commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let style = if index == state.palette_selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(format!(" {:<12}", command.name), style.fg(Color::Cyan)),
+                Span::styled(format!("{:<32}", command.title), style),
+                Span::styled(command.hotkey, style.fg(Color::DarkGray)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" commands ")),
+        area,
+    );
 }
 
 fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
@@ -1137,5 +1332,22 @@ mod tests {
 
         assert_eq!(text[0], "▾ You");
         assert_eq!(text[1], " hello");
+    }
+
+    #[test]
+    fn command_palette_filters_by_name_and_title() {
+        let by_name = palette_commands("/rea").unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].name, "/reason");
+
+        let by_title = palette_commands("/visibility").unwrap();
+        assert_eq!(
+            by_title
+                .iter()
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["/thinking", "/tools"]
+        );
+        assert!(palette_commands("/add ").is_none());
     }
 }

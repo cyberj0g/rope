@@ -133,6 +133,9 @@ pub struct UiState {
     pub reasoning_effort: Option<crate::runtime::ReasoningEffort>,
     pub project: ProjectState,
     pub approval: Option<ToolCall>,
+    pub palette_selected: usize,
+    pub thinking_expanded: bool,
+    pub tools_expanded: bool,
     assistant: Option<usize>,
     reasoning: Option<usize>,
     response_model: String,
@@ -157,6 +160,9 @@ impl UiState {
             reasoning_effort: None,
             project: ProjectState::default(),
             approval: None,
+            palette_selected: 0,
+            thinking_expanded: false,
+            tools_expanded: false,
             assistant: None,
             reasoning: None,
             response_model: String::new(),
@@ -190,6 +196,30 @@ impl UiState {
 
     pub fn set_error(&mut self, error: impl Into<String>) {
         self.error = Some(error.into());
+    }
+
+    pub fn toggle_thinking_default(&mut self) {
+        self.thinking_expanded = !self.thinking_expanded;
+        self.notice = Some(format!(
+            "thinking blocks default to {}",
+            if self.thinking_expanded {
+                "expanded"
+            } else {
+                "collapsed"
+            }
+        ));
+    }
+
+    pub fn toggle_tools_default(&mut self) {
+        self.tools_expanded = !self.tools_expanded;
+        self.notice = Some(format!(
+            "tool blocks default to {}",
+            if self.tools_expanded {
+                "expanded"
+            } else {
+                "collapsed"
+            }
+        ));
     }
 
     pub fn conversation_focused(&self) -> bool {
@@ -315,7 +345,7 @@ impl UiState {
                     None => {
                         self.blocks.push(ChatBlock::Thinking {
                             content: String::new(),
-                            expanded: false,
+                            expanded: self.thinking_expanded,
                             elapsed: Elapsed::started(),
                         });
                         let block = self.blocks.len() - 1;
@@ -363,7 +393,7 @@ impl UiState {
                             arguments: String::new(),
                             output: None,
                             status: ToolStatus::Streaming,
-                            expanded: false,
+                            expanded: self.tools_expanded,
                             counter: ToolCounter::default(),
                             elapsed: Elapsed::started(),
                         });
@@ -495,7 +525,7 @@ impl UiState {
                     if !reasoning.is_empty() {
                         self.blocks.push(ChatBlock::Thinking {
                             content: reasoning,
-                            expanded: false,
+                            expanded: self.thinking_expanded,
                             elapsed: Elapsed::default(),
                         });
                     }
@@ -518,7 +548,7 @@ impl UiState {
                                 .unwrap_or_default(),
                             output: None,
                             status: ToolStatus::Pending,
-                            expanded: false,
+                            expanded: self.tools_expanded,
                             counter,
                             elapsed: Elapsed::default(),
                         });
@@ -707,5 +737,27 @@ mod tests {
 
         counter.push(r"\\nthird\nfourth");
         assert_eq!(counter.label(), "3 lines");
+    }
+
+    #[test]
+    fn visibility_commands_change_new_block_defaults() {
+        let mut state = UiState::new();
+        state.toggle_thinking_default();
+        state.toggle_tools_default();
+        state.apply(Event::ReasoningDelta("visible".into()));
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("read".into()),
+            arguments: "{}".into(),
+        });
+
+        assert!(matches!(
+            state.blocks[0],
+            ChatBlock::Thinking { expanded: true, .. }
+        ));
+        assert!(matches!(
+            state.blocks[1],
+            ChatBlock::Tool { expanded: true, .. }
+        ));
     }
 }
