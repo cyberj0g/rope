@@ -1134,4 +1134,16 @@ mod tests {
         assert_eq!(lines[0].spans[1].content, "one");
         assert_eq!(lines[1].spans[1].content, "two");
     }
+
+    #[test]
+    fn terminal_carriage_returns_can_be_normalized_before_paste() {
+        let mut state = UiState::new();
+        let text = "one\r\ntwo\rthree"
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        state.insert_paste(&text, 200);
+
+        assert_eq!(state.input, "one\ntwo\nthree");
+        assert_eq!(state.input_lines().len(), 3);
+    }
 }

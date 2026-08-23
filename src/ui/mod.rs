@@ -137,6 +137,7 @@ pub async fn run(
                         }
                         TerminalEvent::Paste(text) => {
                             history.reset_navigation();
+                            let text = text.replace("\r\n", "\n").replace('\r', "\n");
                             state.insert_paste(&text, config.paste_collapse_chars);
                             state.palette_selected = 0;
                         }
