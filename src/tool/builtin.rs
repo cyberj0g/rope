@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
@@ -14,6 +15,7 @@ pub struct EditTool(pub PathBuf);
 pub struct ShellTool(pub PathBuf);
 pub struct GrepTool(pub PathBuf);
 pub struct GlobTool(pub PathBuf);
+pub struct ViewImageTool(pub PathBuf);
 
 fn path(root: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
@@ -47,6 +49,7 @@ impl Tool for ReadTool {
         let args: Args = serde_json::from_value(args)?;
         Ok(ToolResult {
             output: tokio::fs::read_to_string(path(&self.0, &args.path)).await?,
+            image: None,
         })
     }
 }
@@ -79,6 +82,7 @@ impl Tool for WriteTool {
         tokio::fs::write(&target, args.content).await?;
         Ok(ToolResult {
             output: format!("wrote {}", target.display()),
+            image: None,
         })
     }
 }
@@ -119,6 +123,7 @@ impl Tool for EditTool {
         tokio::fs::write(&target, content.replacen(&args.old, &args.new, 1)).await?;
         Ok(ToolResult {
             output: format!("edited {}", target.display()),
+            image: None,
         })
     }
 }
@@ -152,7 +157,10 @@ impl Tool for ShellTool {
         if !output.status.success() {
             bail!("command exited with {}\n{text}", output.status);
         }
-        Ok(ToolResult { output: text })
+        Ok(ToolResult {
+            output: text,
+            image: None,
+        })
     }
 }
 
@@ -193,6 +201,7 @@ impl Tool for GrepTool {
         }
         Ok(ToolResult {
             output: String::from_utf8_lossy(&output.stdout).into_owned(),
+            image: None,
         })
     }
 }
@@ -227,6 +236,55 @@ impl Tool for GlobTool {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(ToolResult { output })
+        Ok(ToolResult {
+            output,
+            image: None,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ViewImageTool {
+    fn name(&self) -> &str {
+        "view_image"
+    }
+    fn description(&self) -> &str {
+        "View a local image file"
+    }
+    fn schema(&self) -> Value {
+        object(json!({ "path": { "type": "string" } }), &["path"])
+    }
+    fn vision_only(&self) -> bool {
+        true
+    }
+    async fn run(&self, args: Value) -> Result<ToolResult> {
+        #[derive(Deserialize)]
+        struct Args {
+            path: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let target = path(&self.0, &args.path);
+        let extension = target
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mime_type = match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => bail!("unsupported image format: {}", target.display()),
+        };
+        let data = tokio::fs::read(&target)
+            .await
+            .with_context(|| format!("read image {}", target.display()))?;
+        Ok(ToolResult {
+            output: format!("viewed {}", target.display()),
+            image: Some(crate::runtime::ImageContent {
+                mime_type: mime_type.into(),
+                data: STANDARD.encode(data),
+            }),
+        })
     }
 }

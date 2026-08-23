@@ -24,6 +24,7 @@
 - configurable context fill tracking and automatic continuation compaction
 - preserved visible transcripts with persisted `Context compacted` markers
 - built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
+- multimodal `view_image` tool advertised only by vision-enabled model profiles
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
 - executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`
 - local external tools override global tools with the same filename

@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ImageContent {
+    pub mime_type: String,
+    pub data: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
     System {
@@ -22,6 +28,8 @@ pub enum Message {
     Tool {
         call_id: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<ImageContent>,
     },
 }
 
@@ -52,8 +60,12 @@ impl Message {
             tool_calls,
         }
     }
-    pub fn tool(call_id: String, content: String) -> Self {
-        Self::Tool { call_id, content }
+    pub fn tool(call_id: String, content: String, image: Option<ImageContent>) -> Self {
+        Self::Tool {
+            call_id,
+            content,
+            image,
+        }
     }
 
     #[cfg(test)]

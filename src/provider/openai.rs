@@ -87,11 +87,32 @@ struct StreamOptions {
 struct WireMessage {
     role: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<WireContent>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<WireToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum WireContent {
+    Text(String),
+    Parts(Vec<WireContentPart>),
+}
+
+#[derive(Serialize)]
+struct WireContentPart {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<WireImageUrl>,
+}
+
+#[derive(Serialize)]
+struct WireImageUrl {
+    url: String,
 }
 
 #[derive(Serialize)]
@@ -140,7 +161,7 @@ impl From<Message> for WireMessage {
                 tool_calls,
             } => Self {
                 role: "assistant",
-                content: (!content.is_empty()).then_some(content),
+                content: (!content.is_empty()).then_some(WireContent::Text(content)),
                 tool_calls: tool_calls
                     .into_iter()
                     .map(|call| WireToolCall {
@@ -154,9 +175,29 @@ impl From<Message> for WireMessage {
                     .collect(),
                 tool_call_id: None,
             },
-            Message::Tool { call_id, content } => Self {
+            Message::Tool {
+                call_id,
+                content,
+                image,
+            } => Self {
                 role: "tool",
-                content: Some(content),
+                content: Some(match image {
+                    Some(image) => WireContent::Parts(vec![
+                        WireContentPart {
+                            r#type: "text",
+                            text: Some(content),
+                            image_url: None,
+                        },
+                        WireContentPart {
+                            r#type: "image_url",
+                            text: None,
+                            image_url: Some(WireImageUrl {
+                                url: format!("data:{};base64,{}", image.mime_type, image.data),
+                            }),
+                        },
+                    ]),
+                    None => WireContent::Text(content),
+                }),
                 tool_calls: Vec::new(),
                 tool_call_id: Some(call_id),
             },
@@ -168,7 +209,7 @@ impl WireMessage {
     fn plain(role: &'static str, content: String) -> Self {
         Self {
             role,
-            content: Some(content),
+            content: Some(WireContent::Text(content)),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -288,6 +329,25 @@ mod tests {
         assert_eq!(
             parse_delta(legacy).unwrap(),
             vec![ResponseDelta::Reasoning("legacy".into())]
+        );
+    }
+
+    #[test]
+    fn image_tool_results_use_multimodal_content_parts() {
+        let message = WireMessage::from(Message::tool(
+            "call_1".into(),
+            "viewed image.png".into(),
+            Some(crate::runtime::ImageContent {
+                mime_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            }),
+        ));
+        let value = serde_json::to_value(message).unwrap();
+
+        assert_eq!(value["content"][1]["type"], "image_url");
+        assert_eq!(
+            value["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
         );
     }
 }

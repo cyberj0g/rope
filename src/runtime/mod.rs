@@ -17,7 +17,7 @@ use crate::{
     session::Session,
     tool::{Approval, ToolDefinition, ToolRegistry},
 };
-pub use message::{Message, ToolCall};
+pub use message::{ImageContent, Message, ToolCall};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -527,7 +527,7 @@ async fn agent<P: Provider>(
             reasoning_effort: config.reasoning_effort,
             max_tokens: None,
             stream: true,
-            tools: tools.definitions(),
+            tools: tools.definitions(config.active_model().vision),
         };
         let stream = stream_with_retry(&provider, request, events).await?;
         let (reasoning, text, calls) = collect(stream, events, internal).await?;
@@ -575,9 +575,9 @@ async fn agent<P: Provider>(
             } else {
                 bail_tool_denied(&call.name)
             };
-            let (output, success) = match result {
-                Ok(result) => (result.output, true),
-                Err(error) => (format!("Error: {error:#}"), false),
+            let (output, image, success) = match result {
+                Ok(result) => (result.output, result.image, true),
+                Err(error) => (format!("Error: {error:#}"), None, false),
             };
             events
                 .send(Event::ToolResult {
@@ -587,7 +587,7 @@ async fn agent<P: Provider>(
                 })
                 .await
                 .ok();
-            messages.push(Message::tool(call.id, output));
+            messages.push(Message::tool(call.id, output, image));
         }
     }
     bail!("tool loop exceeded 32 model turns")
@@ -741,6 +741,7 @@ mod tests {
         async fn run(&self, args: Value) -> Result<ToolResult> {
             Ok(ToolResult {
                 output: args["value"].as_str().unwrap().to_owned(),
+                image: None,
             })
         }
     }

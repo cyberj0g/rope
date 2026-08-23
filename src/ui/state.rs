@@ -777,7 +777,9 @@ impl UiState {
                         self.tool_calls.insert(call.id, self.blocks.len() - 1);
                     }
                 }
-                Message::Tool { call_id, content } => {
+                Message::Tool {
+                    call_id, content, ..
+                } => {
                     if let Some(block) = self.tool_calls.get(&call_id).copied()
                         && let ChatBlock::Tool {
                             output,

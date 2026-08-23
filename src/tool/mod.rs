@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::Config;
-use builtin::{EditTool, GlobTool, GrepTool, ReadTool, ShellTool, WriteTool};
+use crate::{config::Config, runtime::ImageContent};
+use builtin::{EditTool, GlobTool, GrepTool, ReadTool, ShellTool, ViewImageTool, WriteTool};
 use external::ExternalTool;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -23,6 +23,8 @@ pub enum Approval {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResult {
     pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageContent>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -43,6 +45,9 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
+    fn vision_only(&self) -> bool {
+        false
+    }
     async fn run(&self, args: Value) -> Result<ToolResult>;
 }
 
@@ -74,9 +79,10 @@ impl ToolRegistry {
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))
     }
 
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
+    pub fn definitions(&self, vision: bool) -> Vec<ToolDefinition> {
         self.tools
             .values()
+            .filter(|entry| vision || !entry.tool.vision_only())
             .map(|entry| ToolDefinition {
                 r#type: "function",
                 function: FunctionDefinition {
@@ -98,6 +104,7 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     registry.insert(ShellTool(cwd.clone()), config.tools.shell);
     registry.insert(GrepTool(cwd.clone()), config.tools.grep);
     registry.insert(GlobTool(cwd.clone()), config.tools.glob);
+    registry.insert(ViewImageTool(cwd.clone()), config.tools.read);
 
     if let Some(global) =
         directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("rope/tools"))
@@ -147,4 +154,21 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vision_tool_is_only_advertised_to_vision_models() {
+        let mut tools = ToolRegistry::default();
+        tools.insert(ViewImageTool(PathBuf::new()), Approval::Allow);
+
+        assert!(tools.definitions(false).is_empty());
+        assert_eq!(
+            tools.definitions(true)[0].function.name,
+            "view_image".to_owned()
+        );
+    }
 }
