@@ -1,0 +1,16 @@
+base_url = "http://localhost:8000/v1"
+api_key = ""
+model = "vllm/qwen3.8-27b"
+
+temperature = 1.0
+reasoning_effort = "medium"
+price_per_token = 0.0
+
+[tools]
+read = "allow"
+write = "ask"
+edit = "ask"
+shell = "ask"
+grep = "allow"
+glob = "allow"
+external = "ask"
