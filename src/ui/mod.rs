@@ -753,7 +753,12 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                         ));
                     }
                     if *expanded {
-                        lines.extend(markdown(content).into_iter().map(pad_line));
+                        let rendered = if matches!(kind, MessageKind::User) {
+                            markdown_preserving_breaks(content)
+                        } else {
+                            markdown(content)
+                        };
+                        lines.extend(rendered.into_iter().map(pad_line));
                     }
                 } else {
                     lines.push(Line::styled(
@@ -1135,12 +1140,23 @@ fn tool_color(status: ToolStatus) -> Color {
 }
 
 fn markdown(content: &str) -> Vec<Line<'static>> {
+    render_markdown(content, false)
+}
+
+fn markdown_preserving_breaks(content: &str) -> Vec<Line<'static>> {
+    render_markdown(content, true)
+}
+
+fn render_markdown(content: &str, preserve_soft_breaks: bool) -> Vec<Line<'static>> {
     let options = Options::ENABLE_GFM
         | Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS;
-    let mut renderer = MarkdownRenderer::default();
+    let mut renderer = MarkdownRenderer {
+        preserve_soft_breaks,
+        ..MarkdownRenderer::default()
+    };
     for event in Parser::new_ext(content, options) {
         renderer.event(event);
     }
@@ -1157,6 +1173,7 @@ struct MarkdownRenderer {
     quote_depth: usize,
     code_block: bool,
     table: Option<MarkdownTable>,
+    preserve_soft_breaks: bool,
 }
 
 struct MarkdownTable {
@@ -1195,6 +1212,7 @@ impl MarkdownRenderer {
             MarkdownEvent::FootnoteReference(label) => {
                 self.span(format!("[^{label}]"), self.style.fg(Color::Blue));
             }
+            MarkdownEvent::SoftBreak if self.preserve_soft_breaks => self.line(),
             MarkdownEvent::SoftBreak => self.text(" "),
             MarkdownEvent::HardBreak if self.table.is_some() => self.text(" "),
             MarkdownEvent::HardBreak => self.line(),
@@ -1550,6 +1568,23 @@ mod tests {
         assert!(lines[0].spans.iter().any(|span| {
             span.content == "italic" && span.style.add_modifier.contains(Modifier::ITALIC)
         }));
+    }
+
+    #[test]
+    fn user_markdown_preserves_original_soft_breaks() {
+        let lines = markdown_preserving_breaks("first line\nsecond line\nthird line");
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, ["first line", "second line", "third line"]);
+        assert_eq!(markdown("first line\nsecond line").len(), 1);
     }
 
     #[test]
