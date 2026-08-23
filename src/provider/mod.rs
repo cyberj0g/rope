@@ -16,13 +16,19 @@ pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<ResponseDelta>> + Sen
 pub enum ResponseDelta {
     Reasoning(String),
     Text(String),
-    Usage(u64),
+    Usage(Usage),
     ToolCall {
         index: usize,
         id: Option<String>,
         name: Option<String>,
         arguments: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub total_tokens: u64,
 }
 
 #[async_trait]

@@ -129,6 +129,8 @@ pub struct UiState {
     pub scroll: u16,
     pub session: String,
     pub total_tokens: u64,
+    pub context_tokens: u64,
+    pub max_context_tokens: u64,
     pub model: String,
     pub reasoning_effort: Option<crate::runtime::ReasoningEffort>,
     pub project: ProjectState,
@@ -167,6 +169,8 @@ impl UiState {
             scroll: 0,
             session: String::new(),
             total_tokens: 0,
+            context_tokens: 0,
+            max_context_tokens: 0,
             model: String::new(),
             reasoning_effort: None,
             project: ProjectState::default(),
@@ -491,6 +495,10 @@ impl UiState {
             Event::History(messages) => self.set_history(messages),
             Event::SessionChanged(session) => self.session = session,
             Event::UsageChanged(tokens) => self.total_tokens = tokens,
+            Event::ContextChanged { tokens, max_tokens } => {
+                self.context_tokens = tokens;
+                self.max_context_tokens = max_tokens;
+            }
             Event::SettingsChanged {
                 model,
                 reasoning_effort,
@@ -650,6 +658,33 @@ impl UiState {
             Event::Retrying { seconds } => {
                 self.connecting = true;
                 self.notice = Some(format!("retrying in {seconds}s · Esc to cancel"));
+            }
+            Event::CompactionStarted => {
+                self.notice = Some("compacting context".into());
+            }
+            Event::ContextCompacted => {
+                let block = ChatBlock::Message {
+                    label: "System".into(),
+                    content: "Context compacted".into(),
+                    model: String::new(),
+                    kind: MessageKind::System,
+                    expanded: true,
+                };
+                let before_user = self.blocks.iter().rposition(|block| {
+                    matches!(
+                        block,
+                        ChatBlock::Message {
+                            kind: MessageKind::User,
+                            ..
+                        }
+                    )
+                });
+                if let Some(index) = before_user {
+                    self.blocks.insert(index, block);
+                } else {
+                    self.blocks.push(block);
+                }
+                self.notice = Some("context compacted".into());
             }
             Event::GenerationFinished => {
                 self.finish_reasoning();
@@ -877,6 +912,34 @@ mod tests {
         state.apply(Event::ResponseStarted);
         assert!(state.notice.is_none());
         assert!(!state.connecting);
+    }
+
+    #[test]
+    fn context_compaction_marker_precedes_pending_user_message() {
+        let mut state = UiState::new();
+        state.push_user("continue".into());
+        state.apply(Event::ContextChanged {
+            tokens: 750,
+            max_tokens: 1000,
+        });
+        state.apply(Event::ContextCompacted);
+
+        assert_eq!(state.context_tokens, 750);
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                kind: MessageKind::System,
+                content,
+                ..
+            } if content == "Context compacted"
+        ));
+        assert!(matches!(
+            state.blocks[1],
+            ChatBlock::Message {
+                kind: MessageKind::User,
+                ..
+            }
+        ));
     }
 
     #[test]

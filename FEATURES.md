@@ -21,6 +21,8 @@
 - iterative model → tool → model execution
 - immediate Escape cancellation with force-killed child processes
 - automatic 2/5/10/30-second retry backoff for transient model failures
+- configurable context fill tracking and automatic continuation compaction
+- preserved visible transcripts with persisted `Context compacted` markers
 - built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
 - executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`

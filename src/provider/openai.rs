@@ -70,6 +70,8 @@ struct WireRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<crate::runtime::ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
     stream: bool,
     stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -116,6 +118,7 @@ impl From<CompletionRequest> for WireRequest {
                 .collect(),
             temperature: request.temperature,
             reasoning_effort: request.reasoning_effort,
+            max_tokens: request.max_tokens,
             stream: request.stream,
             stream_options: StreamOptions {
                 include_usage: true,
@@ -182,7 +185,7 @@ fn parse_delta(data: &str) -> Result<Vec<ResponseDelta>> {
     struct Chunk {
         #[serde(default)]
         choices: Vec<Choice>,
-        usage: Option<Usage>,
+        usage: Option<WireUsage>,
     }
     #[derive(Deserialize)]
     struct Choice {
@@ -209,7 +212,9 @@ fn parse_delta(data: &str) -> Result<Vec<ResponseDelta>> {
         arguments: String,
     }
     #[derive(Deserialize)]
-    struct Usage {
+    struct WireUsage {
+        #[serde(default)]
+        prompt_tokens: u64,
         total_tokens: u64,
     }
 
@@ -240,7 +245,10 @@ fn parse_delta(data: &str) -> Result<Vec<ResponseDelta>> {
         }));
     }
     if let Some(usage) = chunk.usage {
-        output.push(ResponseDelta::Usage(usage.total_tokens));
+        output.push(ResponseDelta::Usage(crate::provider::Usage {
+            prompt_tokens: usage.prompt_tokens,
+            total_tokens: usage.total_tokens,
+        }));
     }
     Ok(output)
 }
@@ -268,8 +276,14 @@ mod tests {
             vec![ResponseDelta::Reasoning("think".into())]
         );
 
-        let usage = r#"{"choices":[],"usage":{"total_tokens":321}}"#;
-        assert_eq!(parse_delta(usage).unwrap(), vec![ResponseDelta::Usage(321)]);
+        let usage = r#"{"choices":[],"usage":{"prompt_tokens":200,"total_tokens":321}}"#;
+        assert_eq!(
+            parse_delta(usage).unwrap(),
+            vec![ResponseDelta::Usage(crate::provider::Usage {
+                prompt_tokens: 200,
+                total_tokens: 321,
+            })]
+        );
         let legacy = r#"{"choices":[{"delta":{"reasoning_content":"legacy"}}]}"#;
         assert_eq!(
             parse_delta(legacy).unwrap(),

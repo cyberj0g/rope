@@ -13,7 +13,7 @@ use tokio::{
 use crate::{
     config::{Config, Startup},
     project::ProjectState,
-    provider::{Provider, ResponseDelta},
+    provider::{Provider, ResponseDelta, Usage},
     session::Session,
     tool::{Approval, ToolDefinition, ToolRegistry},
 };
@@ -55,6 +55,7 @@ pub struct CompletionRequest {
     pub messages: Vec<Message>,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub max_tokens: Option<u32>,
     pub stream: bool,
     pub tools: Vec<ToolDefinition>,
 }
@@ -78,6 +79,10 @@ pub enum Event {
     History(Vec<Message>),
     SessionChanged(String),
     UsageChanged(u64),
+    ContextChanged {
+        tokens: u64,
+        max_tokens: u64,
+    },
     SettingsChanged {
         model: String,
         reasoning_effort: Option<ReasoningEffort>,
@@ -109,20 +114,32 @@ pub enum Event {
     Retrying {
         seconds: u64,
     },
+    CompactionStarted,
+    ContextCompacted,
     GenerationFinished,
     Saved,
     Error(String),
 }
 
 enum InternalEvent {
-    Finished(Vec<Message>),
+    Finished(TurnResult),
     Failed(String),
-    Usage(u64),
+    Usage(Usage),
     Approval {
         call: ToolCall,
         reply: oneshot::Sender<bool>,
     },
     ProjectChanged(ProjectState),
+}
+
+struct TurnResult {
+    completed: Vec<Message>,
+    compaction: Option<Compaction>,
+}
+
+struct Compaction {
+    summary: String,
+    through: usize,
 }
 
 pub async fn spawn<P: Provider>(
@@ -173,6 +190,7 @@ async fn run<P: Provider>(
         .await
         .ok();
     send_settings(&events, &config).await;
+    send_context(&events, &session, &config).await;
     events
         .send(Event::ProjectChanged(project.clone()))
         .await
@@ -184,7 +202,8 @@ async fn run<P: Provider>(
                 Command::Submit(prompt) if generation.is_none() => {
                     let persist_from = messages.len();
                     messages.push(Message::user(prompt));
-                    let request_messages = messages.clone();
+                    let request_messages = request_context(&messages, &session);
+                    let context_tokens = session.meta.context_tokens;
                     let provider = provider.clone();
                     let tools = tools.clone();
                     let config = config.clone();
@@ -194,11 +213,11 @@ async fn run<P: Provider>(
                     events.send(Event::GenerationStarted).await.ok();
                     generation = Some(tokio::spawn(async move {
                         let result = match project_prompt {
-                            Ok(prompt) => agent(provider, &tools, &config, request_messages, persist_from, prompt, &events, &internal).await,
+                            Ok(prompt) => turn(provider, &tools, &config, request_messages, persist_from, context_tokens, prompt, &events, &internal).await,
                             Err(error) => Err(error),
                         };
                         let event = match result {
-                            Ok(messages) => InternalEvent::Finished(messages),
+                            Ok(result) => InternalEvent::Finished(result),
                             Err(error) => InternalEvent::Failed(format!("{error:#}")),
                         };
                         internal.send(event).await.ok();
@@ -223,6 +242,7 @@ async fn run<P: Provider>(
                         events.send(Event::History(Vec::new())).await.ok();
                         events.send(Event::SessionChanged(session.meta.name.clone())).await.ok();
                         events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
+                        send_context(&events, &session, &config).await;
                     }
                     Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
                 }
@@ -239,7 +259,10 @@ async fn run<P: Provider>(
                     Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
                 }
                 Command::NextModel if generation.is_none() => match config.next_model() {
-                    Ok(()) => send_settings(&events, &config).await,
+                    Ok(()) => {
+                        send_settings(&events, &config).await;
+                        send_context(&events, &session, &config).await;
+                    },
                     Err(error) => { events.send(Event::Error(format!("save model setting: {error:#}"))).await.ok(); }
                 },
                 Command::NextReasoningEffort if generation.is_none() => match config.next_reasoning_effort() {
@@ -267,12 +290,21 @@ async fn run<P: Provider>(
                 | Command::NextReasoningEffort => {}
             },
             Some(event) = internal_rx.recv() => match event {
-                InternalEvent::Finished(completed) if generation.is_some() => {
+                InternalEvent::Finished(result) if generation.is_some() => {
                     generation = None; pending_approval = None;
                     messages.truncate(messages.len().saturating_sub(1));
-                    messages.extend(completed.clone());
+                    let mut persisted = Vec::new();
+                    if let Some(compaction) = result.compaction {
+                        session.meta.compaction_summary = Some(compaction.summary);
+                        session.meta.compacted_through = compaction.through;
+                        let marker = Message::system("Context compacted".into());
+                        messages.push(marker.clone());
+                        persisted.push(marker);
+                    }
+                    messages.extend(result.completed.clone());
+                    persisted.extend(result.completed);
                     let saved = async {
-                        session.append(&completed).await?;
+                        session.append(&persisted).await?;
                         session.save().await
                     }.await;
                     if let Err(error) = saved {
@@ -289,9 +321,11 @@ async fn run<P: Provider>(
                     events.send(Event::Error(error)).await.ok();
                     refresh_project(project.clone(), internal_tx.clone());
                 }
-                InternalEvent::Usage(tokens) if generation.is_some() => {
-                    session.meta.total_tokens += tokens;
+                InternalEvent::Usage(usage) if generation.is_some() => {
+                    session.meta.total_tokens += usage.total_tokens;
+                    session.meta.context_tokens = usage.total_tokens;
                     events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
+                    send_context(&events, &session, &config).await;
                 }
                 InternalEvent::Approval { call, reply } => {
                     if generation.is_none() || pending_approval.is_some() { reply.send(false).ok(); }
@@ -328,6 +362,144 @@ async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {
         .ok();
 }
 
+async fn send_context(events: &mpsc::Sender<Event>, session: &Session, config: &Config) {
+    events
+        .send(Event::ContextChanged {
+            tokens: session.meta.context_tokens,
+            max_tokens: config.active_model().max_context_tokens,
+        })
+        .await
+        .ok();
+}
+
+fn request_context(messages: &[Message], session: &Session) -> Vec<Message> {
+    let Some(summary) = &session.meta.compaction_summary else {
+        return messages.to_vec();
+    };
+    let mut context = vec![Message::system(format!(
+        "Conversation summary for continuation:\n{summary}"
+    ))];
+    context.extend(
+        messages[session.meta.compacted_through.min(messages.len())..]
+            .iter()
+            .filter(|message| !is_compaction_marker(message))
+            .cloned(),
+    );
+    context
+}
+
+fn is_compaction_marker(message: &Message) -> bool {
+    matches!(message, Message::System { content } if content == "Context compacted")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn turn<P: Provider>(
+    provider: Arc<P>,
+    tools: &ToolRegistry,
+    config: &Config,
+    mut messages: Vec<Message>,
+    visible_through: usize,
+    context_tokens: u64,
+    project_prompt: Option<String>,
+    events: &mpsc::Sender<Event>,
+    internal: &mpsc::Sender<InternalEvent>,
+) -> Result<TurnResult> {
+    let mut compaction = None;
+    let estimated = estimate_tokens(&messages).max(context_tokens);
+    let max_tokens = config.active_model().max_context_tokens;
+    if estimated as f64 >= max_tokens as f64 * config.compaction_threshold as f64 {
+        let user = messages.pop().context("missing user message")?;
+        let summary = compact(provider.clone(), config, messages, events, internal).await?;
+        messages = vec![
+            Message::system(format!("Conversation summary for continuation:\n{summary}")),
+            user,
+        ];
+        compaction = Some(Compaction {
+            summary,
+            through: visible_through,
+        });
+    }
+    let persist_from = messages.len().saturating_sub(1);
+    let completed = agent(
+        provider,
+        tools,
+        config,
+        messages,
+        persist_from,
+        project_prompt,
+        events,
+        internal,
+    )
+    .await?;
+    Ok(TurnResult {
+        completed,
+        compaction,
+    })
+}
+
+async fn compact<P: Provider>(
+    provider: Arc<P>,
+    config: &Config,
+    messages: Vec<Message>,
+    events: &mpsc::Sender<Event>,
+    internal: &mpsc::Sender<InternalEvent>,
+) -> Result<String> {
+    events.send(Event::CompactionStarted).await.ok();
+    events
+        .send(Event::ModelRequestStarted(config.model_id().to_owned()))
+        .await
+        .ok();
+    let mut request_messages = vec![Message::system(
+        "Summarize this conversation for seamless continuation. Preserve requirements, decisions, files, commands, errors, results, and unresolved work. Be dense and factual. Return only the summary."
+            .into(),
+    )];
+    request_messages.extend(messages);
+    let request = CompletionRequest {
+        model: config.model_id().to_owned(),
+        messages: request_messages,
+        temperature: Some(0.0),
+        reasoning_effort: None,
+        max_tokens: Some(
+            (config.active_model().max_context_tokens / 8)
+                .clamp(512, 4096)
+                .try_into()
+                .unwrap(),
+        ),
+        stream: true,
+        tools: Vec::new(),
+    };
+    let mut stream = stream_with_retry(&provider, request, events).await?;
+    let mut summary = String::new();
+    let mut started = false;
+    while let Some(delta) = stream.next().await {
+        let delta = delta?;
+        if !started {
+            events.send(Event::ResponseStarted).await.ok();
+            started = true;
+        }
+        match delta {
+            ResponseDelta::Text(text) => summary.push_str(&text),
+            ResponseDelta::Usage(usage) => {
+                internal.send(InternalEvent::Usage(usage)).await?;
+            }
+            ResponseDelta::Reasoning(_) | ResponseDelta::ToolCall { .. } => {}
+        }
+    }
+    if summary.trim().is_empty() {
+        bail!("compaction returned an empty summary");
+    }
+    events.send(Event::ContextCompacted).await.ok();
+    Ok(summary.trim().to_owned())
+}
+
+fn estimate_tokens(messages: &[Message]) -> u64 {
+    let bytes = messages
+        .iter()
+        .map(|message| serde_json::to_string(message).map_or(0, |value| value.len()))
+        .sum::<usize>();
+    (bytes.div_ceil(4) + messages.len() * 4) as u64
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn agent<P: Provider>(
     provider: Arc<P>,
@@ -353,6 +525,7 @@ async fn agent<P: Provider>(
             messages: request_messages,
             temperature: config.effective_temperature(),
             reasoning_effort: config.reasoning_effort,
+            max_tokens: None,
             stream: true,
             tools: tools.definitions(),
         };
@@ -616,7 +789,10 @@ mod tests {
     async fn runtime_reports_streamed_usage() {
         let provider = Arc::new(MockProvider::new(vec![vec![
             ResponseDelta::Text("done".into()),
-            ResponseDelta::Usage(321),
+            ResponseDelta::Usage(Usage {
+                prompt_tokens: 200,
+                total_tokens: 321,
+            }),
         ]]));
         let (event_tx, _event_rx) = mpsc::channel(16);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
@@ -636,7 +812,10 @@ mod tests {
 
         assert!(matches!(
             internal_rx.recv().await,
-            Some(InternalEvent::Usage(321))
+            Some(InternalEvent::Usage(Usage {
+                prompt_tokens: 200,
+                total_tokens: 321
+            }))
         ));
     }
 
@@ -715,5 +894,64 @@ mod tests {
             (0..6).map(retry_delay).collect::<Vec<_>>(),
             [2, 5, 10, 30, 30, 30]
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_summarizes_model_context_without_dropping_visible_history() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::Text("Earlier requirements and decisions".into()),
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 90,
+                    total_tokens: 100,
+                }),
+            ],
+            vec![
+                ResponseDelta::Text("continued".into()),
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 20,
+                    total_tokens: 25,
+                }),
+            ],
+        ]));
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 100;
+        config.compaction_threshold = 0.75;
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (internal_tx, mut internal_rx) = mpsc::channel(4);
+
+        let result = turn(
+            provider,
+            &ToolRegistry::default(),
+            &config,
+            vec![
+                Message::user("old turn".into()),
+                Message::user("continue".into()),
+            ],
+            1,
+            80,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.completed[0], Message::user("continue".into()));
+        assert_eq!(result.completed[1].content(), "continued");
+        let compaction = result.compaction.unwrap();
+        assert_eq!(compaction.summary, "Earlier requirements and decisions");
+        assert_eq!(compaction.through, 1);
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(Event::CompactionStarted)
+        ));
+        assert!(matches!(
+            internal_rx.recv().await,
+            Some(InternalEvent::Usage(Usage {
+                total_tokens: 100,
+                ..
+            }))
+        ));
     }
 }

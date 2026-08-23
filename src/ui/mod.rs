@@ -417,13 +417,18 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         .map(|value| value.to_string())
         .unwrap_or_else(|| "off".into());
     let price = state.total_tokens as f64 * config.price_per_token;
+    let context_percent = if state.max_context_tokens == 0 {
+        0
+    } else {
+        (state.context_tokens.saturating_mul(100) / state.max_context_tokens).min(100)
+    };
     let (status, status_color) = app_status(state);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
             Span::styled(status, Style::default().fg(status_color)),
             Span::raw(format!(
-                "  {}  tokens:{}  ${price:.2}  {}",
+                "  {}  tokens:{}  context:{context_percent}%  ${price:.2}  {}",
                 state.session,
                 state.total_tokens,
                 state.project.cwd.display()

@@ -15,6 +15,12 @@ pub struct SessionMeta {
     pub created_at: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default)]
+    pub context_tokens: u64,
+    #[serde(default)]
+    pub compaction_summary: Option<String>,
+    #[serde(default)]
+    pub compacted_through: usize,
 }
 
 pub struct Session {
@@ -65,6 +71,9 @@ impl Session {
                 name,
                 created_at: now(),
                 total_tokens: 0,
+                context_tokens: 0,
+                compaction_summary: None,
+                compacted_through: 0,
             },
         };
         session.save().await?;
