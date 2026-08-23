@@ -544,7 +544,7 @@ async fn handle_mouse(
                 if start == end {
                     state.text_selection = None;
                     if let Some(index) = chat_hit_test(state, conversation, mouse.row) {
-                        state.select(index);
+                        state.focus_input();
                         state.toggle(index);
                     }
                 } else {
@@ -1838,6 +1838,49 @@ mod tests {
         let layout = chat_layout(&state, area);
         assert!(layout.lines[0].spans[0].content.starts_with("▸ Thinking"));
         assert_eq!(chat_hit_test(&state, area, area.y), Some(0));
+    }
+
+    #[tokio::test]
+    async fn clicking_a_section_keeps_focus_in_the_composer() {
+        let mut state = UiState::new();
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::ReasoningDelta("details".into()));
+        let area = Rect::new(0, 3, 80, 12);
+        let input = Rect::new(0, 20, 80, 3);
+        let (commands, _events) = mpsc::channel(1);
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            &mut state,
+            area,
+            None,
+            input,
+            &commands,
+        )
+        .await
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            &mut state,
+            area,
+            None,
+            input,
+            &commands,
+        )
+        .await
+        .unwrap();
+
+        assert!(!state.conversation_focused());
+        assert!(matches!(
+            state.blocks[0],
+            ChatBlock::Thinking { expanded: true, .. }
+        ));
     }
 
     #[test]

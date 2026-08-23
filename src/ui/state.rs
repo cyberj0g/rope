@@ -590,6 +590,7 @@ impl UiState {
         self.selected = None;
     }
 
+    #[cfg(test)]
     pub fn select(&mut self, index: usize) {
         if self.blocks.get(index).is_some_and(collapsible) {
             self.selected = Some(index);
