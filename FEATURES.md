@@ -53,5 +53,6 @@ External tools receive their function arguments as JSON on stdin and must return
 - asynchronously refreshed, clickable Git status pane and bounded full-screen `/diff` view
 - drag-to-copy conversation selection with a non-blocking clipboard toast
 - filtered slash-command palette with keyboard navigation and command hotkeys
+- clipboard and `/image` image attachments for vision-capable models
 - `/thinking` and `/tools` defaults plus clickable model and reasoning selectors
 - `/add PATH`, `/drop PATH`, and `/diff`

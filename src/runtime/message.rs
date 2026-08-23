@@ -4,7 +4,18 @@ use serde_json::Value;
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ImageContent {
     pub mime_type: String,
+    #[serde(default, skip_serializing)]
     pub data: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub width: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub height: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -15,6 +26,8 @@ pub enum Message {
     },
     User {
         content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageContent>,
     },
     Assistant {
         content: String,
@@ -44,8 +57,15 @@ impl Message {
     pub fn system(content: String) -> Self {
         Self::System { content }
     }
+    #[cfg(test)]
     pub fn user(content: String) -> Self {
-        Self::User { content }
+        Self::User {
+            content,
+            images: Vec::new(),
+        }
+    }
+    pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
+        Self::User { content, images }
     }
     pub fn assistant(
         content: String,
@@ -72,7 +92,7 @@ impl Message {
     pub fn content(&self) -> &str {
         match self {
             Self::System { content }
-            | Self::User { content }
+            | Self::User { content, .. }
             | Self::Assistant { content, .. }
             | Self::Tool { content, .. } => content,
         }

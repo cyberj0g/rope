@@ -60,8 +60,13 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
 }
 
+pub struct UserPrompt {
+    pub content: String,
+    pub images: Vec<ImageContent>,
+}
+
 pub enum Command {
-    Submit(String),
+    Submit(UserPrompt),
     Cancel,
     Approve(bool),
     NewSession(Option<String>),
@@ -201,7 +206,7 @@ async fn run<P: Provider>(
             Some(command) = commands.recv() => match command {
                 Command::Submit(prompt) if generation.is_none() => {
                     let persist_from = messages.len();
-                    messages.push(Message::user(prompt));
+                    messages.push(Message::user_with_images(prompt.content, prompt.images));
                     let request_messages = request_context(&messages, &session);
                     let context_tokens = session.meta.context_tokens;
                     let provider = provider.clone();

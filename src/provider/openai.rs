@@ -153,7 +153,13 @@ impl From<Message> for WireMessage {
     fn from(message: Message) -> Self {
         match message {
             Message::System { content } => Self::plain("system", content),
-            Message::User { content } => Self::plain("user", content),
+            Message::User { content, images } if images.is_empty() => Self::plain("user", content),
+            Message::User { content, images } => Self {
+                role: "user",
+                content: Some(multimodal_content(content, images)),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
             Message::Assistant {
                 content,
                 model: _,
@@ -182,20 +188,7 @@ impl From<Message> for WireMessage {
             } => Self {
                 role: "tool",
                 content: Some(match image {
-                    Some(image) => WireContent::Parts(vec![
-                        WireContentPart {
-                            r#type: "text",
-                            text: Some(content),
-                            image_url: None,
-                        },
-                        WireContentPart {
-                            r#type: "image_url",
-                            text: None,
-                            image_url: Some(WireImageUrl {
-                                url: format!("data:{};base64,{}", image.mime_type, image.data),
-                            }),
-                        },
-                    ]),
+                    Some(image) => multimodal_content(content, vec![image]),
                     None => WireContent::Text(content),
                 }),
                 tool_calls: Vec::new(),
@@ -203,6 +196,25 @@ impl From<Message> for WireMessage {
             },
         }
     }
+}
+
+fn multimodal_content(content: String, images: Vec<crate::runtime::ImageContent>) -> WireContent {
+    let mut parts = Vec::with_capacity(images.len() + usize::from(!content.is_empty()));
+    if !content.is_empty() {
+        parts.push(WireContentPart {
+            r#type: "text",
+            text: Some(content),
+            image_url: None,
+        });
+    }
+    parts.extend(images.into_iter().map(|image| WireContentPart {
+        r#type: "image_url",
+        text: None,
+        image_url: Some(WireImageUrl {
+            url: format!("data:{};base64,{}", image.mime_type, image.data),
+        }),
+    }));
+    WireContent::Parts(parts)
 }
 
 impl WireMessage {
@@ -340,10 +352,35 @@ mod tests {
             Some(crate::runtime::ImageContent {
                 mime_type: "image/png".into(),
                 data: "aW1hZ2U=".into(),
+                path: None,
+                width: 1,
+                height: 1,
             }),
         ));
         let value = serde_json::to_value(message).unwrap();
 
+        assert_eq!(value["content"][1]["type"], "image_url");
+        assert_eq!(
+            value["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+    }
+
+    #[test]
+    fn user_images_use_multimodal_content_parts() {
+        let message = WireMessage::from(Message::user_with_images(
+            "describe this".into(),
+            vec![crate::runtime::ImageContent {
+                mime_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+                path: None,
+                width: 1,
+                height: 1,
+            }],
+        ));
+        let value = serde_json::to_value(message).unwrap();
+
+        assert_eq!(value["content"][0]["text"], "describe this");
         assert_eq!(value["content"][1]["type"], "image_url");
         assert_eq!(
             value["content"][1]["image_url"]["url"],

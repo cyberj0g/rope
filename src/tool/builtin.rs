@@ -284,6 +284,9 @@ impl Tool for ViewImageTool {
             image: Some(crate::runtime::ImageContent {
                 mime_type: mime_type.into(),
                 data: STANDARD.encode(data),
+                path: None,
+                width: 0,
+                height: 0,
             }),
         })
     }

@@ -5,8 +5,10 @@ use std::{
 
 use crate::{
     project::ProjectState,
-    runtime::{Event, Message, ToolCall},
+    runtime::{Event, ImageContent, Message, ToolCall, UserPrompt},
 };
+
+const IMAGE_SENTINEL: char = '\u{fffc}';
 
 #[derive(Clone, Copy)]
 pub enum MessageKind {
@@ -98,6 +100,7 @@ pub enum ChatBlock {
     Message {
         label: String,
         content: String,
+        images: Vec<ImageContent>,
         model: String,
         kind: MessageKind,
         expanded: bool,
@@ -150,6 +153,7 @@ pub struct UiState {
     selected: Option<usize>,
     input_cursor: usize,
     pasted: Vec<PastedRange>,
+    input_images: Vec<InputImage>,
     pub text_selection: Option<TextSelection>,
     pub selection_anchor: Option<TextPoint>,
     toast: Option<Toast>,
@@ -177,6 +181,13 @@ struct PastedRange {
     start: usize,
     end: usize,
     chars: usize,
+}
+
+#[derive(Clone)]
+struct InputImage {
+    start: usize,
+    end: usize,
+    image: ImageContent,
 }
 
 impl UiState {
@@ -212,30 +223,36 @@ impl UiState {
             selected: None,
             input_cursor: 0,
             pasted: Vec::new(),
+            input_images: Vec::new(),
             text_selection: None,
             selection_anchor: None,
             toast: None,
         }
     }
 
-    pub fn take_input(&mut self) -> Option<String> {
-        let input = self.input.trim().to_owned();
-        if input.is_empty() || self.generating {
+    pub fn take_input(&mut self) -> Option<UserPrompt> {
+        let content = self.input.replace(IMAGE_SENTINEL, "").trim().to_owned();
+        if (content.is_empty() && self.input_images.is_empty()) || self.generating {
             return None;
         }
+        let images = std::mem::take(&mut self.input_images)
+            .into_iter()
+            .map(|item| item.image)
+            .collect();
         self.input.clear();
         self.input_cursor = 0;
         self.pasted.clear();
         self.error = None;
         self.notice = None;
         self.scroll = 0;
-        Some(input)
+        Some(UserPrompt { content, images })
     }
 
     pub fn set_input(&mut self, input: String) {
         self.input = input;
         self.input_cursor = self.input.len();
         self.pasted.clear();
+        self.input_images.clear();
         self.palette_selected = 0;
     }
 
@@ -244,7 +261,7 @@ impl UiState {
     }
 
     pub fn insert_char(&mut self, character: char) {
-        self.shift_pastes(self.input_cursor, character.len_utf8() as isize);
+        self.shift_input_items(self.input_cursor, character.len_utf8() as isize);
         self.input.insert(self.input_cursor, character);
         self.input_cursor += character.len_utf8();
     }
@@ -252,7 +269,7 @@ impl UiState {
     pub fn insert_paste(&mut self, text: &str, collapse_at: usize) {
         let chars = text.chars().count();
         let start = self.input_cursor;
-        self.shift_pastes(start, text.len() as isize);
+        self.shift_input_items(start, text.len() as isize);
         self.input.insert_str(start, text);
         self.input_cursor += text.len();
         if chars > collapse_at {
@@ -265,7 +282,36 @@ impl UiState {
         }
     }
 
+    pub fn insert_image(&mut self, image: ImageContent) {
+        let start = self.input_cursor;
+        let width = IMAGE_SENTINEL.len_utf8();
+        self.shift_input_items(start, width as isize);
+        self.input.insert(start, IMAGE_SENTINEL);
+        self.input_cursor += width;
+        self.input_images.push(InputImage {
+            start,
+            end: self.input_cursor,
+            image,
+        });
+        self.input_images.sort_by_key(|item| item.start);
+    }
+
+    pub fn has_input_images(&self) -> bool {
+        !self.input_images.is_empty()
+    }
+
     pub fn backspace(&mut self) {
+        if let Some(index) = self
+            .input_images
+            .iter()
+            .position(|item| item.end == self.input_cursor)
+        {
+            let item = self.input_images.remove(index);
+            self.input.replace_range(item.start..item.end, "");
+            self.input_cursor = item.start;
+            self.shift_input_items(item.end, -((item.end - item.start) as isize));
+            return;
+        }
         if let Some(index) = self
             .pasted
             .iter()
@@ -274,7 +320,7 @@ impl UiState {
             let range = self.pasted.remove(index);
             self.input.replace_range(range.start..range.end, "");
             self.input_cursor = range.start;
-            self.shift_pastes(range.end, -((range.end - range.start) as isize));
+            self.shift_input_items(range.end, -((range.end - range.start) as isize));
             return;
         }
         let Some((start, _)) = self.input[..self.input_cursor].char_indices().next_back() else {
@@ -283,10 +329,20 @@ impl UiState {
         self.input.replace_range(start..self.input_cursor, "");
         let removed = self.input_cursor - start;
         self.input_cursor = start;
-        self.shift_pastes(start + removed, -(removed as isize));
+        self.shift_input_items(start + removed, -(removed as isize));
     }
 
     pub fn delete(&mut self) {
+        if let Some(index) = self
+            .input_images
+            .iter()
+            .position(|item| item.start == self.input_cursor)
+        {
+            let item = self.input_images.remove(index);
+            self.input.replace_range(item.start..item.end, "");
+            self.shift_input_items(item.end, -((item.end - item.start) as isize));
+            return;
+        }
         if let Some(index) = self
             .pasted
             .iter()
@@ -294,7 +350,7 @@ impl UiState {
         {
             let range = self.pasted.remove(index);
             self.input.replace_range(range.start..range.end, "");
-            self.shift_pastes(range.end, -((range.end - range.start) as isize));
+            self.shift_input_items(range.end, -((range.end - range.start) as isize));
             return;
         }
         let Some(character) = self.input[self.input_cursor..].chars().next() else {
@@ -302,7 +358,7 @@ impl UiState {
         };
         let end = self.input_cursor + character.len_utf8();
         self.input.replace_range(self.input_cursor..end, "");
-        self.shift_pastes(end, -(character.len_utf8() as isize));
+        self.shift_input_items(end, -(character.len_utf8() as isize));
     }
 
     pub fn move_input_left(&mut self) {
@@ -346,13 +402,13 @@ impl UiState {
 
         let mut lines = vec![Line::from(Span::raw(" "))];
         let mut offset = 0;
-        for range in &self.pasted {
-            push_input_text(&mut lines, &self.input[offset..range.start]);
+        for (start, end, label, color) in self.input_plates() {
+            push_input_text(&mut lines, &self.input[offset..start]);
             lines.last_mut().unwrap().spans.push(Span::styled(
-                format!(" Pasted {} chars ", range.chars),
-                Style::default().fg(Color::Black).bg(Color::Magenta),
+                label,
+                Style::default().fg(Color::Black).bg(color),
             ));
-            offset = range.end;
+            offset = end;
         }
         push_input_text(&mut lines, &self.input[offset..]);
         lines
@@ -362,19 +418,13 @@ impl UiState {
         let mut row = 0u16;
         let mut column = 1u16;
         let mut offset = 0;
-        for range in &self.pasted {
-            if range.start >= self.input_cursor {
+        for (start, end, label, _) in self.input_plates() {
+            if start >= self.input_cursor {
                 break;
             }
-            advance_cursor(
-                &self.input[offset..range.start],
-                width,
-                &mut row,
-                &mut column,
-            );
-            let label = format!(" Pasted {} chars ", range.chars);
+            advance_cursor(&self.input[offset..start], width, &mut row, &mut column);
             advance_cursor(&label, width, &mut row, &mut column);
-            offset = range.end;
+            offset = end;
         }
         advance_cursor(
             &self.input[offset..self.input_cursor],
@@ -385,17 +435,63 @@ impl UiState {
         (row, column)
     }
 
-    fn shift_pastes(&mut self, from: usize, delta: isize) {
+    fn input_plates(&self) -> Vec<(usize, usize, String, ratatui::style::Color)> {
+        use ratatui::style::Color;
+
+        let mut plates = self
+            .pasted
+            .iter()
+            .map(|range| {
+                (
+                    range.start,
+                    range.end,
+                    format!(" Pasted {} chars ", range.chars),
+                    Color::Magenta,
+                )
+            })
+            .chain(self.input_images.iter().map(|item| {
+                let dimensions = if item.image.width == 0 || item.image.height == 0 {
+                    String::new()
+                } else {
+                    format!(" · {}×{}", item.image.width, item.image.height)
+                };
+                (
+                    item.start,
+                    item.end,
+                    format!(" Image{dimensions} "),
+                    Color::Cyan,
+                )
+            }))
+            .collect::<Vec<_>>();
+        plates.sort_by_key(|plate| plate.0);
+        plates
+    }
+
+    fn shift_input_items(&mut self, from: usize, delta: isize) {
         for range in self.pasted.iter_mut().filter(|range| range.start >= from) {
             range.start = range.start.checked_add_signed(delta).unwrap();
             range.end = range.end.checked_add_signed(delta).unwrap();
         }
+        for item in self
+            .input_images
+            .iter_mut()
+            .filter(|item| item.start >= from)
+        {
+            item.start = item.start.checked_add_signed(delta).unwrap();
+            item.end = item.end.checked_add_signed(delta).unwrap();
+        }
     }
 
+    #[cfg(test)]
     pub fn push_user(&mut self, content: String) {
+        self.push_user_with_images(content, Vec::new());
+    }
+
+    pub fn push_user_with_images(&mut self, content: String, images: Vec<ImageContent>) {
         self.blocks.push(ChatBlock::Message {
             label: "You".into(),
             content,
+            images,
             model: String::new(),
             kind: MessageKind::User,
             expanded: true,
@@ -595,6 +691,7 @@ impl UiState {
                         self.blocks.push(ChatBlock::Message {
                             label: "Assistant".into(),
                             content: String::new(),
+                            images: Vec::new(),
                             model: self.response_model.clone(),
                             kind: MessageKind::Assistant,
                             expanded: true,
@@ -705,6 +802,7 @@ impl UiState {
                 let block = ChatBlock::Message {
                     label: "System".into(),
                     content: "Context compacted".into(),
+                    images: Vec::new(),
                     model: String::new(),
                     kind: MessageKind::System,
                     expanded: true,
@@ -766,13 +864,15 @@ impl UiState {
                 Message::System { content } => self.blocks.push(ChatBlock::Message {
                     label: "System".into(),
                     content,
+                    images: Vec::new(),
                     model: String::new(),
                     kind: MessageKind::System,
                     expanded: true,
                 }),
-                Message::User { content } => self.blocks.push(ChatBlock::Message {
+                Message::User { content, images } => self.blocks.push(ChatBlock::Message {
                     label: "You".into(),
                     content,
+                    images,
                     model: String::new(),
                     kind: MessageKind::User,
                     expanded: true,
@@ -794,6 +894,7 @@ impl UiState {
                         self.blocks.push(ChatBlock::Message {
                             label: "Assistant".into(),
                             content,
+                            images: Vec::new(),
                             model,
                             kind: MessageKind::Assistant,
                             expanded: true,
@@ -1156,6 +1257,49 @@ mod tests {
                 .iter()
                 .any(|span| span.content == " Pasted 10 chars ")
         );
+    }
+
+    #[test]
+    fn image_plates_are_atomic_input_items() {
+        let mut state = UiState::new();
+        state.insert_char('a');
+        state.insert_image(ImageContent {
+            mime_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+            path: None,
+            width: 10,
+            height: 20,
+        });
+        state.insert_char('z');
+
+        assert!(
+            state.input_lines()[0]
+                .spans
+                .iter()
+                .any(|span| span.content == " Image · 10×20 ")
+        );
+
+        state.move_input_left();
+        state.backspace();
+        let prompt = state.take_input().unwrap();
+        assert_eq!(prompt.content, "az");
+        assert!(prompt.images.is_empty());
+    }
+
+    #[test]
+    fn image_only_input_can_be_submitted() {
+        let mut state = UiState::new();
+        state.insert_image(ImageContent {
+            mime_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+            path: None,
+            width: 1,
+            height: 1,
+        });
+
+        let prompt = state.take_input().unwrap();
+        assert!(prompt.content.is_empty());
+        assert_eq!(prompt.images.len(), 1);
     }
 
     #[test]

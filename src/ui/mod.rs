@@ -3,10 +3,11 @@ mod state;
 
 use std::{
     io::{self, Write},
+    path::Path,
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
@@ -18,6 +19,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use image::{ExtendedColorType, ImageEncoder, codecs::png::PngEncoder};
 use pulldown_cmark::{Alignment, Event as MarkdownEvent, Options, Parser, Tag, TagEnd};
 use ratatui::{
     Terminal,
@@ -31,7 +33,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     config::Config,
-    runtime::{Command, Event},
+    runtime::{Command, Event, ImageContent, UserPrompt},
 };
 use history::PromptHistory;
 use state::{ChatBlock, MessageKind, TextPoint, TextSelection, ToolStatus, UiState};
@@ -67,6 +69,12 @@ const COMMANDS: &[SlashCommand] = &[
         name: "/drop",
         title: "Drop context file",
         hotkey: "—",
+        argument: true,
+    },
+    SlashCommand {
+        name: "/image",
+        title: "Attach image file",
+        hotkey: "Ctrl+V",
         argument: true,
     },
     SlashCommand {
@@ -128,7 +136,7 @@ pub async fn run(
                 while event::poll(Duration::ZERO)? {
                     match event::read()? {
                         TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                            if handle_key(key, size.height, &mut state, &mut history, &commands).await? {
+                            if handle_key(key, size.height, &config, &mut state, &mut history, &commands).await? {
                                 commands.send(Command::Shutdown).await.ok(); return Ok(());
                             }
                         }
@@ -157,6 +165,7 @@ pub async fn run(
 async fn handle_key(
     key: KeyEvent,
     screen_height: u16,
+    config: &Config,
     state: &mut UiState,
     history: &mut PromptHistory,
     commands: &mpsc::Sender<Command>,
@@ -202,7 +211,7 @@ async fn handle_key(
         return Ok(false);
     }
     if let Some(command) = hotkey_command(key) {
-        dispatch(command.into(), state, history, commands).await?;
+        dispatch(command.into(), Vec::new(), config, state, history, commands).await?;
         return Ok(false);
     }
     if state.conversation_focused() {
@@ -241,12 +250,32 @@ async fn handle_key(
                     state.set_input(format!("{} ", command.name));
                 } else {
                     state.clear_input();
-                    dispatch(command.name.into(), state, history, commands).await?;
+                    dispatch(
+                        command.name.into(),
+                        Vec::new(),
+                        config,
+                        state,
+                        history,
+                        commands,
+                    )
+                    .await?;
                 }
                 return Ok(false);
             }
+            if state.has_input_images() && !model_supports_vision(config, state) {
+                state.set_error("the current model does not support image input");
+                return Ok(false);
+            }
             if let Some(input) = state.take_input() {
-                dispatch(input, state, history, commands).await?;
+                dispatch(
+                    input.content,
+                    input.images,
+                    config,
+                    state,
+                    history,
+                    commands,
+                )
+                .await?;
             }
         }
         KeyCode::Backspace => {
@@ -254,11 +283,23 @@ async fn handle_key(
             state.backspace();
             state.palette_selected = 0;
         }
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !model_supports_vision(config, state) {
+                state.set_error("the current model does not support image input");
+            } else {
+                match clipboard_image() {
+                    Ok(image) => state.insert_image(image),
+                    Err(error) => state.set_error(format!("paste image: {error:#}")),
+                }
+            }
+        }
         KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             history.reset_navigation();
             state.insert_char(character);
             state.palette_selected = 0;
         }
+        KeyCode::Up if state.has_input_images() => {}
+        KeyCode::Down if state.has_input_images() => {}
         KeyCode::Up => {
             if palette_commands(&state.input).is_some() {
                 state.palette_selected = state.palette_selected.saturating_sub(1);
@@ -296,10 +337,16 @@ async fn handle_key(
 
 async fn dispatch(
     input: String,
+    images: Vec<ImageContent>,
+    config: &Config,
     state: &mut UiState,
     history: &mut PromptHistory,
     commands: &mpsc::Sender<Command>,
 ) -> Result<()> {
+    if !images.is_empty() {
+        submit(input, images, state, history, commands).await?;
+        return Ok(());
+    }
     let is_command = input.starts_with('/');
     let (command, argument) = input
         .split_once(' ')
@@ -323,6 +370,16 @@ async fn dispatch(
                 .send(Command::DropContext(argument.to_owned()))
                 .await?
         }
+        "/image" if !argument.is_empty() => {
+            if !model_supports_vision(config, state) {
+                state.set_error("the current model does not support image input");
+            } else {
+                match image_from_path(Path::new(argument.trim())).await {
+                    Ok(image) => state.insert_image(image),
+                    Err(error) => state.set_error(format!("attach image: {error:#}")),
+                }
+            }
+        }
         "/model" if argument.is_empty() => commands.send(Command::NextModel).await?,
         "/reason" if argument.is_empty() => commands.send(Command::NextReasoningEffort).await?,
         "/thinking" if argument.is_empty() => state.toggle_thinking_default(),
@@ -336,17 +393,73 @@ async fn dispatch(
             state.set_error(format!("unknown or incomplete command: {value}"))
         }
         _ => {
-            if let Err(error) = history.record(&input).await {
-                state.notice = Some(format!("history was not saved: {error:#}"));
-            }
-            state.push_user(input.clone());
-            commands.send(Command::Submit(input)).await?;
+            submit(input, Vec::new(), state, history, commands).await?;
         }
     }
     if is_command {
         history.reset_navigation();
     }
     Ok(())
+}
+
+async fn submit(
+    content: String,
+    images: Vec<ImageContent>,
+    state: &mut UiState,
+    history: &mut PromptHistory,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    if !content.is_empty()
+        && let Err(error) = history.record(&content).await
+    {
+        state.notice = Some(format!("history was not saved: {error:#}"));
+    }
+    state.push_user_with_images(content.clone(), images.clone());
+    commands
+        .send(Command::Submit(UserPrompt { content, images }))
+        .await?;
+    Ok(())
+}
+
+fn model_supports_vision(config: &Config, state: &UiState) -> bool {
+    config
+        .models
+        .iter()
+        .find(|model| model.name == state.model || model.id == state.model)
+        .is_some_and(|model| model.vision)
+}
+
+fn clipboard_image() -> Result<ImageContent> {
+    let mut clipboard = arboard::Clipboard::new().context("open clipboard")?;
+    let image = clipboard.get_image().context("clipboard has no image")?;
+    encode_image(image.width as u32, image.height as u32, &image.bytes)
+}
+
+async fn image_from_path(path: &Path) -> Result<ImageContent> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read {}", path.display()))?;
+    let decoded = image::load_from_memory(&bytes)
+        .with_context(|| format!("decode {}", path.display()))?
+        .into_rgba8();
+    encode_image(decoded.width(), decoded.height(), decoded.as_raw())
+}
+
+fn encode_image(width: u32, height: u32, rgba: &[u8]) -> Result<ImageContent> {
+    if width == 0 || height == 0 {
+        bail!("image has no pixels");
+    }
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(rgba, width, height, ExtendedColorType::Rgba8)
+        .context("encode image as PNG")?;
+    Ok(ImageContent {
+        mime_type: "image/png".into(),
+        data: STANDARD.encode(png),
+        path: None,
+        width,
+        height,
+    })
 }
 
 async fn handle_mouse(
@@ -804,6 +917,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
             ChatBlock::Message {
                 label,
                 content,
+                images,
                 model,
                 kind,
                 expanded,
@@ -837,6 +951,17 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                             markdown(content)
                         };
                         lines.extend(rendered.into_iter().map(pad_line));
+                        lines.extend(images.iter().map(|image| {
+                            let dimensions = if image.width == 0 || image.height == 0 {
+                                String::new()
+                            } else {
+                                format!(" · {}×{}", image.width, image.height)
+                            };
+                            Line::styled(
+                                format!(" Image{dimensions}"),
+                                Style::default().fg(Color::Cyan),
+                            )
+                        }));
                     }
                 } else {
                     lines.push(Line::styled(
@@ -1763,6 +1888,30 @@ mod tests {
 
         assert_eq!(text[0], "▾ You");
         assert_eq!(text[1], " hello");
+    }
+
+    #[test]
+    fn user_image_attachments_are_visible_in_chat_history() {
+        let mut state = UiState::new();
+        state.push_user_with_images(
+            String::new(),
+            vec![ImageContent {
+                mime_type: "image/png".into(),
+                data: String::new(),
+                path: Some("attachments/image.png".into()),
+                width: 640,
+                height: 480,
+            }],
+        );
+        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10));
+        let text = layout
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Image · 640×480"));
     }
 
     #[test]

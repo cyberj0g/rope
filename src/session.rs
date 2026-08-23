@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
@@ -91,11 +92,14 @@ impl Session {
         let data = tokio::fs::read_to_string(directory.join("messages.jsonl"))
             .await
             .unwrap_or_default();
-        let messages = data
+        let mut messages = data
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(serde_json::from_str)
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        for message in &mut messages {
+            hydrate_images(&directory, message).await?;
+        }
         Ok((Self { root, meta }, messages))
     }
 
@@ -104,8 +108,10 @@ impl Session {
             .append(true)
             .open(self.messages_path())
             .await?;
-        for message in messages {
-            file.write_all(&serde_json::to_vec(message)?).await?;
+        for (index, message) in messages.iter().enumerate() {
+            let mut stored = message.clone();
+            persist_images(&self.directory(), &mut stored, index).await?;
+            file.write_all(&serde_json::to_vec(&stored)?).await?;
             file.write_all(b"\n").await?;
         }
         file.flush().await?;
@@ -126,6 +132,74 @@ impl Session {
     }
     fn messages_path(&self) -> PathBuf {
         self.directory().join("messages.jsonl")
+    }
+}
+
+async fn persist_images(directory: &Path, message: &mut Message, index: usize) -> Result<()> {
+    let images = message_images_mut(message);
+    if images.is_empty() {
+        return Ok(());
+    }
+    let attachments = directory.join("attachments");
+    tokio::fs::create_dir_all(&attachments).await?;
+    for (image_index, image) in images.into_iter().enumerate() {
+        if image.path.is_some() {
+            continue;
+        }
+        let extension = match image.mime_type.as_str() {
+            "image/jpeg" => "jpg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "png",
+        };
+        let name = format!(
+            "{}-{}-{index}-{image_index}.{extension}",
+            now(),
+            std::process::id()
+        );
+        let relative = format!("attachments/{name}");
+        let bytes = STANDARD
+            .decode(&image.data)
+            .context("decode image attachment")?;
+        tokio::fs::write(directory.join(&relative), bytes).await?;
+        image.path = Some(relative);
+    }
+    Ok(())
+}
+
+async fn hydrate_images(directory: &Path, message: &mut Message) -> Result<()> {
+    for image in message_images_mut(message) {
+        if !image.data.is_empty() {
+            continue;
+        }
+        let path = image
+            .path
+            .as_deref()
+            .context("image attachment has no path")?;
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            bail!("invalid image attachment path: {path}");
+        }
+        image.data = STANDARD.encode(
+            tokio::fs::read(directory.join(relative))
+                .await
+                .with_context(|| format!("read image attachment {path}"))?,
+        );
+    }
+    Ok(())
+}
+
+fn message_images_mut(message: &mut Message) -> Vec<&mut crate::runtime::ImageContent> {
+    match message {
+        Message::User { images, .. } => images.iter_mut().collect(),
+        Message::Tool {
+            image: Some(image), ..
+        } => vec![image],
+        _ => Vec::new(),
     }
 }
 
@@ -190,5 +264,43 @@ mod tests {
     fn old_session_metadata_defaults_token_usage() {
         let meta: SessionMeta = serde_json::from_str(r#"{"name":"old","created_at":1}"#).unwrap();
         assert_eq!(meta.total_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn image_data_is_stored_as_a_session_attachment() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-image-session-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create(root.clone(), "images".into())
+            .await
+            .unwrap();
+        let message = Message::user_with_images(
+            "look".into(),
+            vec![crate::runtime::ImageContent {
+                mime_type: "image/png".into(),
+                data: STANDARD.encode(b"png bytes"),
+                path: None,
+                width: 2,
+                height: 3,
+            }],
+        );
+
+        session.append(&[message]).await.unwrap();
+        let stored = tokio::fs::read_to_string(session.messages_path())
+            .await
+            .unwrap();
+        assert!(!stored.contains(&STANDARD.encode(b"png bytes")));
+        assert!(stored.contains("attachments/"));
+
+        let (_, messages) = Session::load(root.clone(), "images".into()).await.unwrap();
+        assert!(matches!(
+            &messages[0],
+            Message::User { images, .. } if images[0].data == STANDARD.encode(b"png bytes")
+        ));
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }
