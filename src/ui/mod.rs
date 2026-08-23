@@ -112,6 +112,11 @@ pub async fn run(
     loop {
         let size = terminal.terminal.size()?;
         state.expire_toast();
+        if state.git_fullscreen_diff {
+            state.git_diff_scroll = state
+                .git_diff_scroll
+                .min(git_diff_max_scroll(&state, size.height));
+        }
         let chat = conversation_area(Rect::new(0, 0, size.width, size.height), &state);
         ensure_selected_visible(&mut state, chat);
         terminal
@@ -123,7 +128,7 @@ pub async fn run(
                 while event::poll(Duration::ZERO)? {
                     match event::read()? {
                         TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                            if handle_key(key, &mut state, &mut history, &commands).await? {
+                            if handle_key(key, size.height, &mut state, &mut history, &commands).await? {
                                 commands.send(Command::Shutdown).await.ok(); return Ok(());
                             }
                         }
@@ -151,6 +156,7 @@ pub async fn run(
 
 async fn handle_key(
     key: KeyEvent,
+    screen_height: u16,
     state: &mut UiState,
     history: &mut PromptHistory,
     commands: &mpsc::Sender<Command>,
@@ -170,7 +176,10 @@ async fn handle_key(
                 state.git_diff_scroll = state.git_diff_scroll.saturating_sub(8)
             }
             KeyCode::Down | KeyCode::PageDown => {
-                state.git_diff_scroll = state.git_diff_scroll.saturating_add(8)
+                state.git_diff_scroll = state
+                    .git_diff_scroll
+                    .saturating_add(8)
+                    .min(git_diff_max_scroll(state, screen_height))
             }
             _ => {}
         }
@@ -271,6 +280,8 @@ async fn handle_key(
         }
         KeyCode::Left => state.move_input_left(),
         KeyCode::Right => state.move_input_right(),
+        KeyCode::Home => state.move_input_home(),
+        KeyCode::End => state.move_input_end(),
         KeyCode::Delete => state.delete(),
         KeyCode::Tab => {
             history.reset_navigation();
@@ -352,7 +363,10 @@ async fn handle_mouse(
                 state.git_diff_scroll = state.git_diff_scroll.saturating_sub(3)
             }
             MouseEventKind::ScrollDown => {
-                state.git_diff_scroll = state.git_diff_scroll.saturating_add(3)
+                state.git_diff_scroll = state
+                    .git_diff_scroll
+                    .saturating_add(3)
+                    .min(git_diff_max_scroll(state, conversation.height))
             }
             _ => {}
         }
@@ -587,6 +601,16 @@ fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
             ),
         frame.area(),
     );
+}
+
+fn git_diff_max_scroll(state: &UiState, height: u16) -> u16 {
+    let line_count = if state.project.git_available {
+        state.project.git_diff.lines().count().max(1)
+    } else {
+        1
+    };
+    let visible = height.saturating_sub(2).max(1) as usize;
+    line_count.saturating_sub(visible).min(u16::MAX as usize) as u16
 }
 
 fn draw_toast(frame: &mut ratatui::Frame, state: &UiState) {
@@ -1755,6 +1779,20 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::BOLD)
         );
+    }
+
+    #[test]
+    fn fullscreen_diff_scroll_stops_at_the_last_visible_line() {
+        let mut state = UiState::new();
+        state.project.git_available = true;
+
+        assert_eq!(git_diff_max_scroll(&state, 10), 0);
+
+        state.project.git_diff = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(git_diff_max_scroll(&state, 5), 7);
     }
 
     #[test]

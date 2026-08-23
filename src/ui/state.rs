@@ -330,6 +330,14 @@ impl UiState {
         }
     }
 
+    pub fn move_input_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    pub fn move_input_end(&mut self) {
+        self.input_cursor = self.input.len();
+    }
+
     pub fn input_lines(&self) -> Vec<ratatui::text::Line<'static>> {
         use ratatui::{
             style::{Color, Style},
@@ -1127,6 +1135,27 @@ mod tests {
         state.move_input_left();
         state.delete();
         assert_eq!(state.input, "az");
+    }
+
+    #[test]
+    fn home_and_end_move_around_collapsed_pastes() {
+        let mut state = UiState::new();
+        state.insert_char('a');
+        state.insert_paste("long paste", 4);
+        state.insert_char('z');
+
+        state.move_input_home();
+        state.insert_char('>');
+        state.move_input_end();
+        state.insert_char('<');
+
+        assert_eq!(state.input, ">along pastez<");
+        assert!(
+            state.input_lines()[0]
+                .spans
+                .iter()
+                .any(|span| span.content == " Pasted 10 chars ")
+        );
     }
 
     #[test]
