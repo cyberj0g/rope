@@ -115,6 +115,7 @@ impl Default for Config {
                 ReasoningEffort::Low,
                 ReasoningEffort::Medium,
                 ReasoningEffort::High,
+                ReasoningEffort::XHigh,
             ],
             price_per_token: 0.0,
             paste_collapse_chars: 200,

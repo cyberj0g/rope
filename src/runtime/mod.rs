@@ -25,6 +25,7 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 impl FromStr for ReasoningEffort {
@@ -34,7 +35,8 @@ impl FromStr for ReasoningEffort {
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
-            _ => bail!("reasoning effort must be low, medium, or high"),
+            "xhigh" => Ok(Self::XHigh),
+            _ => bail!("reasoning effort must be low, medium, high, or xhigh"),
         }
     }
 }
@@ -45,6 +47,7 @@ impl std::fmt::Display for ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
         })
     }
 }
