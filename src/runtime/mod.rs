@@ -19,7 +19,7 @@ use crate::{
 };
 pub use message::{Message, ToolCall};
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
@@ -67,6 +67,8 @@ pub enum Command {
     Save,
     AddContext(String),
     DropContext(String),
+    NextModel,
+    NextReasoningEffort,
     RefreshProject,
     Shutdown,
 }
@@ -75,6 +77,10 @@ pub enum Event {
     History(Vec<Message>),
     SessionChanged(String),
     UsageChanged(u64),
+    SettingsChanged {
+        model: String,
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     ProjectChanged(ProjectState),
     GenerationStarted,
     ModelRequestStarted(String),
@@ -139,7 +145,7 @@ pub async fn spawn<P: Provider>(
 
 #[allow(clippy::too_many_arguments)]
 async fn run<P: Provider>(
-    config: Config,
+    mut config: Config,
     provider: Arc<P>,
     tools: ToolRegistry,
     mut session: Session,
@@ -161,6 +167,7 @@ async fn run<P: Provider>(
         .send(Event::UsageChanged(session.meta.total_tokens))
         .await
         .ok();
+    send_settings(&events, &config).await;
     events
         .send(Event::ProjectChanged(project.clone()))
         .await
@@ -225,6 +232,14 @@ async fn run<P: Provider>(
                     Ok(()) => { events.send(Event::ProjectChanged(project.clone())).await.ok(); }
                     Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
                 }
+                Command::NextModel if generation.is_none() => match config.next_model() {
+                    Ok(()) => send_settings(&events, &config).await,
+                    Err(error) => { events.send(Event::Error(format!("save model setting: {error:#}"))).await.ok(); }
+                },
+                Command::NextReasoningEffort if generation.is_none() => match config.next_reasoning_effort() {
+                    Ok(()) => send_settings(&events, &config).await,
+                    Err(error) => { events.send(Event::Error(format!("save reasoning setting: {error:#}"))).await.ok(); }
+                },
                 Command::RefreshProject => {
                     project.refresh().await;
                     events.send(Event::ProjectChanged(project.clone())).await.ok();
@@ -234,7 +249,7 @@ async fn run<P: Provider>(
                     session.save().await.ok();
                     break;
                 }
-                Command::NewSession(_) => {}
+                Command::NewSession(_) | Command::NextModel | Command::NextReasoningEffort => {}
             },
             Some(event) = internal_rx.recv() => match event {
                 InternalEvent::Finished(completed) if generation.is_some() => {
@@ -274,6 +289,16 @@ async fn run<P: Provider>(
     }
 }
 
+async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {
+    events
+        .send(Event::SettingsChanged {
+            model: config.model_name().to_owned(),
+            reasoning_effort: config.reasoning_effort,
+        })
+        .await
+        .ok();
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn agent<P: Provider>(
     provider: Arc<P>,
@@ -287,7 +312,7 @@ async fn agent<P: Provider>(
 ) -> Result<Vec<Message>> {
     for _ in 0..32 {
         events
-            .send(Event::ModelRequestStarted(config.model.clone()))
+            .send(Event::ModelRequestStarted(config.model_id().to_owned()))
             .await
             .ok();
         let mut request_messages = messages.clone();
@@ -295,9 +320,9 @@ async fn agent<P: Provider>(
             request_messages.insert(0, Message::system(prompt.clone()));
         }
         let request = CompletionRequest {
-            model: config.model.clone(),
+            model: config.model_id().to_owned(),
             messages: request_messages,
-            temperature: config.temperature,
+            temperature: config.effective_temperature(),
             reasoning_effort: config.reasoning_effort,
             stream: true,
             tools: tools.definitions(),
@@ -306,7 +331,7 @@ async fn agent<P: Provider>(
             collect(provider.stream(request).await?, events, internal).await?;
         messages.push(Message::assistant(
             text,
-            config.model.clone(),
+            config.model_id().to_owned(),
             reasoning,
             calls.clone(),
         ));

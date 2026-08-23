@@ -5,6 +5,9 @@
 - provider-independent streaming runtime with an OpenAI-compatible provider
 - deterministic mock provider for runtime tests
 - streamed text and OpenAI function-call assembly
+- layered `~/.config/rope/config.toml` and `./.rope/config.toml` configuration
+- named model profiles with context size, temperature, and vision capabilities
+- automatic global and project `AGENTS.md` instructions
 
 ## Sessions
 
@@ -18,7 +21,7 @@
 - iterative model → tool → model execution
 - built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
-- executable JSON tools discovered from `.harness/tools/` and `~/.config/harness/tools/`
+- executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`
 - local external tools override global tools with the same filename
 
 External tools receive their function arguments as JSON on stdin and must return
@@ -39,4 +42,4 @@ External tools receive their function arguments as JSON on stdin and must return
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
 - current directory and compact session identity on the status bar
-- `/add PATH`, `/drop PATH`, `/context`, and `/diff`
+- `/add PATH`, `/drop PATH`, and `/diff`

@@ -12,7 +12,7 @@ use crate::config::Config;
 use builtin::{EditTool, GlobTool, GrepTool, ReadTool, ShellTool, WriteTool};
 use external::ExternalTool;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Approval {
     Allow,
@@ -100,13 +100,13 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     registry.insert(GlobTool(cwd.clone()), config.tools.glob);
 
     if let Some(global) =
-        directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("harness/tools"))
+        directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("rope/tools"))
     {
         add_external(&mut registry, global, config.tools.external).await?;
     }
     add_external(
         &mut registry,
-        cwd.join(".harness/tools"),
+        cwd.join(".rope/tools"),
         config.tools.external,
     )
     .await?;

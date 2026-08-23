@@ -129,6 +129,8 @@ pub struct UiState {
     pub scroll: u16,
     pub session: String,
     pub total_tokens: u64,
+    pub model: String,
+    pub reasoning_effort: Option<crate::runtime::ReasoningEffort>,
     pub project: ProjectState,
     pub approval: Option<ToolCall>,
     assistant: Option<usize>,
@@ -151,6 +153,8 @@ impl UiState {
             scroll: 0,
             session: String::new(),
             total_tokens: 0,
+            model: String::new(),
+            reasoning_effort: None,
             project: ProjectState::default(),
             approval: None,
             assistant: None,
@@ -283,6 +287,13 @@ impl UiState {
             Event::History(messages) => self.set_history(messages),
             Event::SessionChanged(session) => self.session = session,
             Event::UsageChanged(tokens) => self.total_tokens = tokens,
+            Event::SettingsChanged {
+                model,
+                reasoning_effort,
+            } => {
+                self.model = model;
+                self.reasoning_effort = reasoning_effort;
+            }
             Event::ProjectChanged(project) => self.project = project,
             Event::GenerationStarted => {
                 self.generating = true;

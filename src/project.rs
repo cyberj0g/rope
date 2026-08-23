@@ -44,21 +44,37 @@ impl ProjectState {
     }
 
     pub async fn prompt(&self) -> Result<Option<String>> {
-        if self.context.is_empty() {
-            return Ok(None);
+        let mut sections = Vec::new();
+        if let Some(base) = directories::BaseDirs::new() {
+            let path = base.config_dir().join("rope/AGENTS.md");
+            if path.is_file() {
+                sections.push(format!(
+                    "Global instructions (~/.config/rope/AGENTS.md):\n{}",
+                    tokio::fs::read_to_string(&path).await?
+                ));
+            }
         }
-        let mut output = format!(
-            "Current working directory: {}\nExplicit context files:\n",
-            self.cwd.display()
-        );
+        let local_agents = self.cwd.join("AGENTS.md");
+        if local_agents.is_file() {
+            sections.push(format!(
+                "Project instructions (AGENTS.md):\n{}",
+                tokio::fs::read_to_string(&local_agents).await?
+            ));
+        }
+        if !self.context.is_empty() {
+            sections.push(format!(
+                "Current working directory: {}\nExplicit context files:",
+                self.cwd.display()
+            ));
+        }
         for path in &self.context {
             let relative = path.strip_prefix(&self.cwd).unwrap_or(path);
             let content = tokio::fs::read_to_string(path)
                 .await
                 .with_context(|| format!("read context {}", path.display()))?;
-            output.push_str(&format!("\n--- {} ---\n{}\n", relative.display(), content));
+            sections.push(format!("--- {} ---\n{}", relative.display(), content));
         }
-        Ok(Some(output))
+        Ok((!sections.is_empty()).then(|| sections.join("\n\n")))
     }
 
     pub async fn refresh(&mut self) {

@@ -1,10 +1,21 @@
 base_url = "http://localhost:8000/v1"
 api_key = ""
-model = "vllm/qwen3.8-27b"
+model = "qwen"
 
-temperature = 1.0
+# set this to override every model's temperature
+# temperature = 0.8
 reasoning_effort = "medium"
+reasoning_efforts = ["low", "medium", "high"]
 price_per_token = 0.0
+paste_collapse_chars = 200
+compaction_threshold = 0.75
+
+[[models]]
+name = "qwen"
+id = "vllm/qwen3.8-27b"
+max_context_tokens = 32768
+temperature = 1.0
+vision = false
 
 [tools]
 read = "allow"

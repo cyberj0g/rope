@@ -172,6 +172,8 @@ async fn dispatch(
                 .send(Command::DropContext(argument.to_owned()))
                 .await?
         }
+        "/model" if argument.is_empty() => commands.send(Command::NextModel).await?,
+        "/reason" if argument.is_empty() => commands.send(Command::NextReasoningEffort).await?,
         "/diff" if argument.is_empty() => commands.send(Command::RefreshProject).await?,
         value if value.starts_with('/') => {
             history.reset_navigation();
@@ -227,7 +229,7 @@ fn conversation_area(area: Rect, state: &UiState) -> Rect {
 
 fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
     let [header, body, input] = page_areas(frame.area(), state);
-    let effort = config
+    let effort = state
         .reasoning_effort
         .map(|value| value.to_string())
         .unwrap_or_else(|| "off".into());
@@ -252,7 +254,7 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
 
     let mut title = vec![
         Span::raw(" "),
-        Span::styled(&config.model, Style::default().fg(Color::Cyan)),
+        Span::styled(&state.model, Style::default().fg(Color::Cyan)),
         Span::raw(" · "),
         Span::styled(effort, Style::default().fg(Color::Magenta)),
     ];
