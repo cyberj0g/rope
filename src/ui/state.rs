@@ -98,6 +98,7 @@ pub enum ChatBlock {
     Message {
         label: String,
         content: String,
+        model: String,
         kind: MessageKind,
         expanded: bool,
     },
@@ -130,10 +131,9 @@ pub struct UiState {
     pub total_tokens: u64,
     pub project: ProjectState,
     pub approval: Option<ToolCall>,
-    pub side_panel: bool,
-    pub diff_panel: bool,
     assistant: Option<usize>,
     reasoning: Option<usize>,
+    response_model: String,
     tool_drafts: BTreeMap<usize, usize>,
     tool_calls: BTreeMap<String, usize>,
     selected: Option<usize>,
@@ -153,10 +153,9 @@ impl UiState {
             total_tokens: 0,
             project: ProjectState::default(),
             approval: None,
-            side_panel: true,
-            diff_panel: true,
             assistant: None,
             reasoning: None,
+            response_model: String::new(),
             tool_drafts: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
             selected: None,
@@ -179,6 +178,7 @@ impl UiState {
         self.blocks.push(ChatBlock::Message {
             label: "You".into(),
             content,
+            model: String::new(),
             kind: MessageKind::User,
             expanded: true,
         });
@@ -289,9 +289,10 @@ impl UiState {
                 self.connecting = true;
                 self.error = None;
             }
-            Event::ModelRequestStarted => {
+            Event::ModelRequestStarted(model) => {
                 self.finish_reasoning();
                 self.connecting = true;
+                self.response_model = model;
                 self.tool_drafts.clear();
                 self.assistant = None;
                 self.reasoning = None;
@@ -323,6 +324,7 @@ impl UiState {
                         self.blocks.push(ChatBlock::Message {
                             label: "Assistant".into(),
                             content: String::new(),
+                            model: self.response_model.clone(),
                             kind: MessageKind::Assistant,
                             expanded: true,
                         });
@@ -462,17 +464,20 @@ impl UiState {
                 Message::System { content } => self.blocks.push(ChatBlock::Message {
                     label: "System".into(),
                     content,
+                    model: String::new(),
                     kind: MessageKind::System,
                     expanded: true,
                 }),
                 Message::User { content } => self.blocks.push(ChatBlock::Message {
                     label: "You".into(),
                     content,
+                    model: String::new(),
                     kind: MessageKind::User,
                     expanded: true,
                 }),
                 Message::Assistant {
                     content,
+                    model,
                     reasoning,
                     tool_calls,
                 } => {
@@ -487,6 +492,7 @@ impl UiState {
                         self.blocks.push(ChatBlock::Message {
                             label: "Assistant".into(),
                             content,
+                            model,
                             kind: MessageKind::Assistant,
                             expanded: true,
                         });
@@ -583,7 +589,7 @@ mod tests {
         assert!(state.generating);
         assert!(state.connecting);
 
-        state.apply(Event::ModelRequestStarted);
+        state.apply(Event::ModelRequestStarted("test-model".into()));
         assert!(state.connecting);
 
         state.apply(Event::ResponseStarted);

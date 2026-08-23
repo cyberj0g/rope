@@ -13,6 +13,8 @@ pub enum Message {
     Assistant {
         content: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
+        model: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         reasoning: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
@@ -37,9 +39,15 @@ impl Message {
     pub fn user(content: String) -> Self {
         Self::User { content }
     }
-    pub fn assistant(content: String, reasoning: String, tool_calls: Vec<ToolCall>) -> Self {
+    pub fn assistant(
+        content: String,
+        model: String,
+        reasoning: String,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
         Self::Assistant {
             content,
+            model,
             reasoning,
             tool_calls,
         }

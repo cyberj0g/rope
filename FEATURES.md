@@ -35,6 +35,8 @@ External tools receive their function arguments as JSON on stdin and must return
 - live elapsed time on thinking and tool calls with compact duration units
 - one-space conversation content padding with flush section headers
 - color-coded connecting, generating, idle, and error status with compact chat errors
-- model and reasoning details on the input box; session tokens and cost on the status bar
-- current directory, explicit context files, Git status, and Git diff panes
+- separately colored model and reasoning details on the padded input box; session tokens and cost on the status bar
+- generating model recorded beside each assistant response
+- full-width conversation view with deliberate trailing whitespace
+- current directory and compact session identity on the status bar
 - `/add PATH`, `/drop PATH`, `/context`, and `/diff`

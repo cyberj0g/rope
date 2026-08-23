@@ -132,6 +132,7 @@ impl From<Message> for WireMessage {
             Message::User { content } => Self::plain("user", content),
             Message::Assistant {
                 content,
+                model: _,
                 reasoning: _,
                 tool_calls,
             } => Self {

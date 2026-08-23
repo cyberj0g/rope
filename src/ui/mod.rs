@@ -172,12 +172,7 @@ async fn dispatch(
                 .send(Command::DropContext(argument.to_owned()))
                 .await?
         }
-        "/diff" if argument.is_empty() => {
-            state.side_panel = true;
-            state.diff_panel = !state.diff_panel;
-            commands.send(Command::RefreshProject).await?;
-        }
-        "/context" if argument.is_empty() => state.side_panel = !state.side_panel,
+        "/diff" if argument.is_empty() => commands.send(Command::RefreshProject).await?,
         value if value.starts_with('/') => {
             history.reset_navigation();
             state.set_error(format!("unknown or incomplete command: {value}"))
@@ -227,15 +222,7 @@ fn page_areas(area: Rect, state: &UiState) -> [Rect; 3] {
 }
 
 fn conversation_area(area: Rect, state: &UiState) -> Rect {
-    let body = page_areas(area, state)[1];
-    if state.side_panel && body.width >= 100 {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-            .split(body)[0]
-    } else {
-        body
-    }
+    page_areas(area, state)[1]
 }
 
 fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
@@ -244,10 +231,6 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         .reasoning_effort
         .map(|value| value.to_string())
         .unwrap_or_else(|| "off".into());
-    let temperature = config
-        .temperature
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "default".into());
     let price = state.total_tokens as f64 * config.price_per_token;
     let (status, status_color) = app_status(state);
     frame.render_widget(
@@ -255,7 +238,7 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
             Span::raw(" "),
             Span::styled(status, Style::default().fg(status_color)),
             Span::raw(format!(
-                "  temp:{temperature}  session:{}  tokens:{}  ${price:.2}  {}",
+                "  {}  tokens:{}  ${price:.2}  {}",
                 state.session,
                 state.total_tokens,
                 state.project.cwd.display()
@@ -265,36 +248,36 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         header,
     );
 
-    let chat = conversation_area(frame.area(), state);
-    draw_chat(frame, state, chat);
-    if chat != body {
-        draw_side(
-            frame,
-            state,
-            Rect::new(
-                chat.right(),
-                body.y,
-                body.right() - chat.right(),
-                body.height,
-            ),
-        );
-    }
+    draw_chat(frame, state, body);
 
-    let title = match &state.approval {
-        Some(call) => format!(
-            " {} · reason:{effort} · allow tool {}? y/n ",
-            config.model, call.name
-        ),
-        None => format!(" {} · reason:{effort} ", config.model),
-    };
+    let mut title = vec![
+        Span::raw(" "),
+        Span::styled(&config.model, Style::default().fg(Color::Cyan)),
+        Span::raw(" · "),
+        Span::styled(effort, Style::default().fg(Color::Magenta)),
+    ];
+    if let Some(call) = &state.approval {
+        title.push(Span::raw(format!(" · allow tool {}? y/n", call.name)));
+    }
+    title.push(Span::raw(" "));
     frame.render_widget(
-        Paragraph::new(state.input.as_str())
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(
+            state
+                .input
+                .split('\n')
+                .map(|line| Line::from(format!(" {line}")))
+                .collect::<Vec<_>>(),
+        )
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(title)),
+        ),
         input,
     );
 
-    let input_width = input.width.saturating_sub(2).max(1);
+    let input_width = input.width.saturating_sub(3).max(1);
     let last_line = state
         .input
         .rsplit_once('\n')
@@ -303,7 +286,7 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         state.input.matches('\n').count() as u16 + last_line.chars().count() as u16 / input_width;
     let column = last_line.chars().count() as u16 % input_width;
     if !state.conversation_focused() {
-        frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
+        frame.set_cursor_position((input.x + 2 + column, input.y + 1 + row));
     }
 }
 
@@ -332,6 +315,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
             ChatBlock::Message {
                 label,
                 content,
+                model,
                 kind,
                 expanded,
             } => {
@@ -342,11 +326,21 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                 };
                 if matches!(kind, MessageKind::User | MessageKind::Assistant) {
                     header_lines.push((index, lines.len()));
-                    lines.push(section_header(
-                        format!("{} {label}", if *expanded { "▾" } else { "▸" }),
-                        color,
-                        state.selected() == Some(index),
-                    ));
+                    let header = format!("{} {label}", if *expanded { "▾" } else { "▸" });
+                    if matches!(kind, MessageKind::Assistant) && !model.is_empty() {
+                        lines.push(assistant_header(
+                            header,
+                            model,
+                            color,
+                            state.selected() == Some(index),
+                        ));
+                    } else {
+                        lines.push(section_header(
+                            header,
+                            color,
+                            state.selected() == Some(index),
+                        ));
+                    }
                     if *expanded {
                         lines.extend(markdown(content).into_iter().map(pad_line));
                     }
@@ -434,6 +428,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
         }
         lines.push(Line::default());
     }
+    lines.push(Line::default());
     if let Some(notice) = &state.notice {
         lines.push(Line::styled(
             format!(" {notice}"),
@@ -505,6 +500,25 @@ fn section_header(text: String, color: Color, selected: bool) -> Line<'static> {
         style = style.bg(Color::DarkGray).fg(Color::White);
     }
     Line::styled(text, style)
+}
+
+fn assistant_header(text: String, model: &str, color: Color, selected: bool) -> Line<'static> {
+    if selected {
+        return Line::styled(
+            format!("{text}  {model}"),
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    Line::from(vec![
+        Span::styled(
+            text,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {model}"), Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn pad_line(mut line: Line<'static>) -> Line<'static> {
@@ -607,59 +621,6 @@ fn tool_color(status: ToolStatus) -> Color {
         ToolStatus::Failed => Color::Red,
         ToolStatus::Running | ToolStatus::Streaming => Color::Yellow,
         ToolStatus::Pending | ToolStatus::WaitingApproval => Color::DarkGray,
-    }
-}
-
-fn draw_side(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
-    let panes = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(if state.diff_panel {
-            [Constraint::Percentage(40), Constraint::Percentage(60)]
-        } else {
-            [Constraint::Percentage(100), Constraint::Percentage(0)]
-        })
-        .split(area);
-    let mut context = vec![Line::styled(
-        state.project.cwd.display().to_string(),
-        Style::default().fg(Color::DarkGray),
-    )];
-    context.push(Line::styled(
-        "context files",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    context.extend(state.project.context.iter().map(|path| {
-        Line::raw(format!(
-            "• {}",
-            path.strip_prefix(&state.project.cwd)
-                .unwrap_or(path)
-                .display()
-        ))
-    }));
-    context.push(Line::default());
-    context.push(Line::styled(
-        "git status",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    context.extend(
-        state
-            .project
-            .git_status
-            .lines()
-            .map(|line| Line::raw(line.to_owned())),
-    );
-    frame.render_widget(
-        Paragraph::new(context)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" context ")),
-        panes[0],
-    );
-    if state.diff_panel {
-        frame.render_widget(
-            Paragraph::new(diff_lines(&state.project.git_diff))
-                .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(" git diff ")),
-            panes[1],
-        );
     }
 }
 
@@ -998,23 +959,6 @@ fn highlight_code(line: &str) -> Line<'static> {
         }
     }
     Line::from(spans)
-}
-
-fn diff_lines(diff: &str) -> Vec<Line<'static>> {
-    diff.lines()
-        .map(|line| {
-            let color = if line.starts_with('+') && !line.starts_with("+++") {
-                Color::Green
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                Color::Red
-            } else if line.starts_with("@@") {
-                Color::Cyan
-            } else {
-                Color::Gray
-            };
-            Line::styled(line.to_owned(), Style::default().fg(color))
-        })
-        .collect()
 }
 
 struct TerminalGuard {

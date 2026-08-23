@@ -77,7 +77,7 @@ pub enum Event {
     UsageChanged(u64),
     ProjectChanged(ProjectState),
     GenerationStarted,
-    ModelRequestStarted,
+    ModelRequestStarted(String),
     ResponseStarted,
     ReasoningDelta(String),
     TextDelta(String),
@@ -286,7 +286,10 @@ async fn agent<P: Provider>(
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<Vec<Message>> {
     for _ in 0..32 {
-        events.send(Event::ModelRequestStarted).await.ok();
+        events
+            .send(Event::ModelRequestStarted(config.model.clone()))
+            .await
+            .ok();
         let mut request_messages = messages.clone();
         if let Some(prompt) = &project_prompt {
             request_messages.insert(0, Message::system(prompt.clone()));
@@ -301,7 +304,12 @@ async fn agent<P: Provider>(
         };
         let (reasoning, text, calls) =
             collect(provider.stream(request).await?, events, internal).await?;
-        messages.push(Message::assistant(text, reasoning, calls.clone()));
+        messages.push(Message::assistant(
+            text,
+            config.model.clone(),
+            reasoning,
+            calls.clone(),
+        ));
         if calls.is_empty() {
             return Ok(messages[persist_from..].to_vec());
         }
@@ -496,7 +504,7 @@ mod tests {
         ));
         assert!(matches!(
             event_rx.recv().await,
-            Some(Event::ModelRequestStarted)
+            Some(Event::ModelRequestStarted(_))
         ));
         assert!(matches!(
             event_rx.recv().await,
@@ -578,7 +586,7 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await,
-            Some(Event::ModelRequestStarted)
+            Some(Event::ModelRequestStarted(_))
         ));
         assert!(matches!(
             event_rx.recv().await,
