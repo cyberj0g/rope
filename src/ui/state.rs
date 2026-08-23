@@ -503,7 +503,16 @@ impl UiState {
                 self.assistant = None;
                 self.reasoning = None;
             }
-            Event::ResponseStarted => self.connecting = false,
+            Event::ResponseStarted => {
+                self.connecting = false;
+                if self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.starts_with("retrying in "))
+                {
+                    self.notice = None;
+                }
+            }
             Event::ReasoningDelta(delta) => {
                 let block = match self.reasoning {
                     Some(block) => block,
@@ -628,6 +637,10 @@ impl UiState {
                         ToolStatus::Failed
                     };
                 }
+            }
+            Event::Retrying { seconds } => {
+                self.connecting = true;
+                self.notice = Some(format!("retrying in {seconds}s · Esc to cancel"));
             }
             Event::GenerationFinished => {
                 self.finish_reasoning();
@@ -838,6 +851,22 @@ mod tests {
 
         state.apply(Event::GenerationFinished);
         assert!(!state.generating);
+        assert!(!state.connecting);
+    }
+
+    #[test]
+    fn retry_status_is_visible_until_response_arrives() {
+        let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
+        state.apply(Event::Retrying { seconds: 5 });
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("retrying in 5s · Esc to cancel")
+        );
+        assert!(state.connecting);
+
+        state.apply(Event::ResponseStarted);
+        assert!(state.notice.is_none());
         assert!(!state.connecting);
     }
 

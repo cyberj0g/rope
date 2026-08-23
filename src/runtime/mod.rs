@@ -105,6 +105,9 @@ pub enum Event {
         output: String,
         success: bool,
     },
+    Retrying {
+        seconds: u64,
+    },
     GenerationFinished,
     Saved,
     Error(String),
@@ -327,8 +330,8 @@ async fn agent<P: Provider>(
             stream: true,
             tools: tools.definitions(),
         };
-        let (reasoning, text, calls) =
-            collect(provider.stream(request).await?, events, internal).await?;
+        let stream = stream_with_retry(&provider, request, events).await?;
+        let (reasoning, text, calls) = collect(stream, events, internal).await?;
         messages.push(Message::assistant(
             text,
             config.model_id().to_owned(),
@@ -389,6 +392,48 @@ async fn agent<P: Provider>(
         }
     }
     bail!("tool loop exceeded 32 model turns")
+}
+
+async fn stream_with_retry<P: Provider>(
+    provider: &Arc<P>,
+    request: CompletionRequest,
+    events: &mpsc::Sender<Event>,
+) -> Result<crate::provider::ResponseStream> {
+    let mut attempt = 0;
+    loop {
+        match provider.stream(request.clone()).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) if is_retryable(&error) => {
+                let seconds = retry_delay(attempt);
+                events.send(Event::Retrying { seconds }).await.ok();
+                tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn retry_delay(attempt: usize) -> u64 {
+    [2, 5, 10, 30].get(attempt).copied().unwrap_or(30)
+}
+
+fn is_retryable(error: &anyhow::Error) -> bool {
+    let error = format!("{error:#}").to_ascii_lowercase();
+    [
+        "send completion request",
+        "connection",
+        "timed out",
+        "timeout",
+        "server returned 408",
+        "server returned 429",
+        "server returned 500",
+        "server returned 502",
+        "server returned 503",
+        "server returned 504",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
 }
 
 fn bail_tool_denied(name: &str) -> Result<crate::tool::ToolResult> {
@@ -627,5 +672,22 @@ mod tests {
             event_rx.recv().await,
             Some(Event::ToolCallFinished { .. })
         ));
+    }
+
+    #[test]
+    fn transient_errors_use_capped_backoff() {
+        assert!(is_retryable(&anyhow::anyhow!(
+            "server returned 503: unavailable"
+        )));
+        assert!(is_retryable(&anyhow::anyhow!(
+            "send completion request: connection refused"
+        )));
+        assert!(!is_retryable(&anyhow::anyhow!(
+            "server returned 400: invalid request"
+        )));
+        assert_eq!(
+            (0..6).map(retry_delay).collect::<Vec<_>>(),
+            [2, 5, 10, 30, 30, 30]
+        );
     }
 }

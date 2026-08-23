@@ -151,6 +151,11 @@ async fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
+    if key.code == KeyCode::Esc && state.generating {
+        state.approval = None;
+        commands.send(Command::Cancel).await?;
+        return Ok(false);
+    }
     if let Some(call) = &state.approval {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -399,6 +404,12 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
     ];
     if let Some(call) = &state.approval {
         title.push(Span::raw(format!(" · allow tool {}? y/n", call.name)));
+    }
+    if state.generating {
+        title.push(Span::styled(
+            " · Esc to cancel",
+            Style::default().fg(Color::Yellow),
+        ));
     }
     title.push(Span::raw(" "));
     frame.render_widget(
