@@ -46,6 +46,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
 - current directory and compact session identity on the status bar
+- asynchronously refreshed, clickable Git status and diff pane
 - filtered slash-command palette with keyboard navigation and command hotkeys
 - `/thinking` and `/tools` defaults plus clickable model and reasoning selectors
 - `/add PATH`, `/drop PATH`, and `/diff`

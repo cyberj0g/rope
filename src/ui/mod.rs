@@ -67,7 +67,7 @@ const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/diff",
-        title: "Toggle Git diff",
+        title: "Open Git diff",
         hotkey: "Ctrl+D",
         argument: false,
     },
@@ -125,9 +125,10 @@ pub async fn run(
                         TerminalEvent::Mouse(mouse) => {
                             let size = terminal.terminal.size()?;
                             let page = Rect::new(0, 0, size.width, size.height);
-                            let [_, _, input] = page_areas(page, &state);
+                            let [_, body, input] = page_areas(page, &state);
                             let area = conversation_area(page, &state);
-                            handle_mouse(mouse, &mut state, area, input, &commands).await?;
+                            let git = git_area(body, &state);
+                            handle_mouse(mouse, &mut state, area, git, input, &commands).await?;
                         }
                         TerminalEvent::Paste(text) => {
                             history.reset_navigation();
@@ -296,7 +297,10 @@ async fn dispatch(
         "/reason" if argument.is_empty() => commands.send(Command::NextReasoningEffort).await?,
         "/thinking" if argument.is_empty() => state.toggle_thinking_default(),
         "/tools" if argument.is_empty() => state.toggle_tools_default(),
-        "/diff" if argument.is_empty() => commands.send(Command::RefreshProject).await?,
+        "/diff" if argument.is_empty() => {
+            state.open_git_diff();
+            commands.send(Command::GitDiff(None)).await?;
+        }
         value if value.starts_with('/') => {
             history.reset_navigation();
             state.set_error(format!("unknown or incomplete command: {value}"))
@@ -319,6 +323,7 @@ async fn handle_mouse(
     mouse: MouseEvent,
     state: &mut UiState,
     conversation: Rect,
+    git: Option<Rect>,
     input: Rect,
     commands: &mpsc::Sender<Command>,
 ) -> Result<()> {
@@ -334,6 +339,24 @@ async fn handle_mouse(
             commands.send(Command::NextModel).await?;
         } else if (reason_start..reason_end).contains(&mouse.column) {
             commands.send(Command::NextReasoningEffort).await?;
+        }
+        return Ok(());
+    }
+    if let Some(area) = git
+        && area.contains((mouse.column, mouse.row).into())
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+    {
+        let row = mouse.row.saturating_sub(area.y + 1) as usize;
+        if state.git_diff_mode {
+            if row == 0 {
+                state.git_diff_mode = false;
+                commands.send(Command::RefreshProject).await?;
+            }
+        } else if let Some(file) = state.project.git_files.get(row) {
+            state.git_diff_mode = true;
+            commands
+                .send(Command::GitDiff(Some(file.path.clone())))
+                .await?;
         }
         return Ok(());
     }
@@ -368,7 +391,23 @@ fn page_areas(area: Rect, state: &UiState) -> [Rect; 3] {
 }
 
 fn conversation_area(area: Rect, state: &UiState) -> Rect {
-    page_areas(area, state)[1]
+    let body = page_areas(area, state)[1];
+    git_split(body, state).0
+}
+
+fn git_area(body: Rect, state: &UiState) -> Option<Rect> {
+    git_split(body, state).1
+}
+
+fn git_split(body: Rect, state: &UiState) -> (Rect, Option<Rect>) {
+    if !state.git_panel || body.width < 100 {
+        return (body, None);
+    }
+    let areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(body);
+    (areas[0], Some(areas[1]))
 }
 
 fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
@@ -394,7 +433,11 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         header,
     );
 
-    draw_chat(frame, state, body);
+    let (chat, git) = git_split(body, state);
+    draw_chat(frame, state, chat);
+    if let Some(area) = git {
+        draw_git(frame, state, area);
+    }
 
     let mut title = vec![
         Span::raw(" "),
@@ -491,6 +534,91 @@ fn draw_command_palette(frame: &mut ratatui::Frame, state: &UiState, input: Rect
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" commands ")),
         area,
     );
+}
+
+fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
+    let (title, lines) = if !state.project.git_available {
+        (
+            " git ".to_owned(),
+            vec![Line::styled(
+                " not a Git repository",
+                Style::default().fg(Color::DarkGray),
+            )],
+        )
+    } else if state.git_diff_mode {
+        let mut lines = vec![Line::styled(
+            " ← git status",
+            Style::default().fg(Color::Cyan),
+        )];
+        lines.extend(diff_lines(&state.project.git_diff));
+        let title = state.project.git_diff_path.as_ref().map_or_else(
+            || " git diff ".into(),
+            |path| format!(" {} ", path.display()),
+        );
+        (title, lines)
+    } else {
+        let lines = if state.project.git_files.is_empty() {
+            vec![Line::styled(
+                " working tree clean",
+                Style::default().fg(Color::DarkGray),
+            )]
+        } else {
+            state
+                .project
+                .git_files
+                .iter()
+                .map(|file| {
+                    Line::from(vec![
+                        Span::styled(format!(" {} ", file.status), git_status_color(&file.status)),
+                        Span::raw(file.path.display().to_string()),
+                    ])
+                })
+                .collect()
+        };
+        (" git status ".into(), lines)
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+fn git_status_color(status: &str) -> Style {
+    let color = if status.contains('?') {
+        Color::Cyan
+    } else if status.contains('D') {
+        Color::Red
+    } else if status.contains('A') {
+        Color::Green
+    } else {
+        Color::Yellow
+    };
+    Style::default().fg(color)
+}
+
+fn diff_lines(diff: &str) -> Vec<Line<'static>> {
+    if diff.is_empty() {
+        return vec![Line::styled(
+            " no changes",
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+    diff.lines()
+        .map(|line| {
+            let color = if line.starts_with('+') && !line.starts_with("+++") {
+                Color::Green
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                Color::Red
+            } else if line.starts_with("@@") {
+                Color::Cyan
+            } else {
+                Color::Gray
+            };
+            Line::styled(format!(" {line}"), Style::default().fg(color))
+        })
+        .collect()
 }
 
 fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {

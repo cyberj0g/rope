@@ -70,6 +70,7 @@ pub enum Command {
     NextModel,
     NextReasoningEffort,
     RefreshProject,
+    GitDiff(Option<std::path::PathBuf>),
     Shutdown,
 }
 
@@ -121,6 +122,7 @@ enum InternalEvent {
         call: ToolCall,
         reply: oneshot::Sender<bool>,
     },
+    ProjectChanged(ProjectState),
 }
 
 pub async fn spawn<P: Provider>(
@@ -209,6 +211,7 @@ async fn run<P: Provider>(
                         session.save().await.ok();
                         events.send(Event::History(messages.clone())).await.ok();
                         events.send(Event::GenerationFinished).await.ok();
+                        refresh_project(project.clone(), internal_tx.clone());
                     }
                 }
                 Command::Approve(approved) => {
@@ -244,15 +247,24 @@ async fn run<P: Provider>(
                     Err(error) => { events.send(Event::Error(format!("save reasoning setting: {error:#}"))).await.ok(); }
                 },
                 Command::RefreshProject => {
-                    project.refresh().await;
-                    events.send(Event::ProjectChanged(project.clone())).await.ok();
+                    refresh_project(project.clone(), internal_tx.clone());
+                }
+                Command::GitDiff(path) => {
+                    let mut changed = project.clone();
+                    let internal = internal_tx.clone();
+                    tokio::spawn(async move {
+                        changed.load_diff(path).await;
+                        internal.send(InternalEvent::ProjectChanged(changed)).await.ok();
+                    });
                 }
                 Command::Shutdown => {
                     if let Some(task) = generation.take() { task.abort(); }
                     session.save().await.ok();
                     break;
                 }
-                Command::NewSession(_) | Command::NextModel | Command::NextReasoningEffort => {}
+                Command::NewSession(_)
+                | Command::NextModel
+                | Command::NextReasoningEffort => {}
             },
             Some(event) = internal_rx.recv() => match event {
                 InternalEvent::Finished(completed) if generation.is_some() => {
@@ -266,16 +278,16 @@ async fn run<P: Provider>(
                     if let Err(error) = saved {
                         events.send(Event::Error(format!("save session: {error:#}"))).await.ok();
                     } else {
-                        project.refresh().await;
-                        events.send(Event::ProjectChanged(project.clone())).await.ok();
+                        events.send(Event::GenerationFinished).await.ok();
                     }
-                    events.send(Event::GenerationFinished).await.ok();
+                    refresh_project(project.clone(), internal_tx.clone());
                 }
                 InternalEvent::Failed(error) if generation.is_some() => {
                     generation = None; pending_approval = None; messages.pop();
                     session.save().await.ok();
                     events.send(Event::History(messages.clone())).await.ok();
                     events.send(Event::Error(error)).await.ok();
+                    refresh_project(project.clone(), internal_tx.clone());
                 }
                 InternalEvent::Usage(tokens) if generation.is_some() => {
                     session.meta.total_tokens += tokens;
@@ -285,11 +297,25 @@ async fn run<P: Provider>(
                     if generation.is_none() || pending_approval.is_some() { reply.send(false).ok(); }
                     else { pending_approval = Some(reply); events.send(Event::ApprovalRequested(call)).await.ok(); }
                 }
+                InternalEvent::ProjectChanged(changed) => {
+                    project = changed;
+                    events.send(Event::ProjectChanged(project.clone())).await.ok();
+                }
                 InternalEvent::Finished(_) | InternalEvent::Failed(_) | InternalEvent::Usage(_) => {}
             },
             else => break,
         }
     }
+}
+
+fn refresh_project(mut project: ProjectState, internal: mpsc::Sender<InternalEvent>) {
+    tokio::spawn(async move {
+        project.refresh().await;
+        internal
+            .send(InternalEvent::ProjectChanged(project))
+            .await
+            .ok();
+    });
 }
 
 async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {

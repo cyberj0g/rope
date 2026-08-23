@@ -136,6 +136,8 @@ pub struct UiState {
     pub palette_selected: usize,
     pub thinking_expanded: bool,
     pub tools_expanded: bool,
+    pub git_panel: bool,
+    pub git_diff_mode: bool,
     assistant: Option<usize>,
     reasoning: Option<usize>,
     response_model: String,
@@ -172,6 +174,8 @@ impl UiState {
             palette_selected: 0,
             thinking_expanded: false,
             tools_expanded: false,
+            git_panel: true,
+            git_diff_mode: false,
             assistant: None,
             reasoning: None,
             response_model: String::new(),
@@ -385,6 +389,11 @@ impl UiState {
                 "collapsed"
             }
         ));
+    }
+
+    pub fn open_git_diff(&mut self) {
+        self.git_panel = true;
+        self.git_diff_mode = true;
     }
 
     pub fn conversation_focused(&self) -> bool {
