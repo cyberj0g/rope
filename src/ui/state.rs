@@ -142,6 +142,15 @@ pub struct UiState {
     tool_drafts: BTreeMap<usize, usize>,
     tool_calls: BTreeMap<String, usize>,
     selected: Option<usize>,
+    input_cursor: usize,
+    pasted: Vec<PastedRange>,
+}
+
+#[derive(Clone)]
+struct PastedRange {
+    start: usize,
+    end: usize,
+    chars: usize,
 }
 
 impl UiState {
@@ -169,6 +178,8 @@ impl UiState {
             tool_drafts: BTreeMap::new(),
             tool_calls: BTreeMap::new(),
             selected: None,
+            input_cursor: 0,
+            pasted: Vec::new(),
         }
     }
 
@@ -178,10 +189,164 @@ impl UiState {
             return None;
         }
         self.input.clear();
+        self.input_cursor = 0;
+        self.pasted.clear();
         self.error = None;
         self.notice = None;
         self.scroll = 0;
         Some(input)
+    }
+
+    pub fn set_input(&mut self, input: String) {
+        self.input = input;
+        self.input_cursor = self.input.len();
+        self.pasted.clear();
+        self.palette_selected = 0;
+    }
+
+    pub fn clear_input(&mut self) {
+        self.set_input(String::new());
+    }
+
+    pub fn insert_char(&mut self, character: char) {
+        self.shift_pastes(self.input_cursor, character.len_utf8() as isize);
+        self.input.insert(self.input_cursor, character);
+        self.input_cursor += character.len_utf8();
+    }
+
+    pub fn insert_paste(&mut self, text: &str, collapse_at: usize) {
+        let chars = text.chars().count();
+        let start = self.input_cursor;
+        self.shift_pastes(start, text.len() as isize);
+        self.input.insert_str(start, text);
+        self.input_cursor += text.len();
+        if chars > collapse_at {
+            self.pasted.push(PastedRange {
+                start,
+                end: self.input_cursor,
+                chars,
+            });
+            self.pasted.sort_by_key(|range| range.start);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some(index) = self
+            .pasted
+            .iter()
+            .position(|range| range.end == self.input_cursor)
+        {
+            let range = self.pasted.remove(index);
+            self.input.replace_range(range.start..range.end, "");
+            self.input_cursor = range.start;
+            self.shift_pastes(range.end, -((range.end - range.start) as isize));
+            return;
+        }
+        let Some((start, _)) = self.input[..self.input_cursor].char_indices().next_back() else {
+            return;
+        };
+        self.input.replace_range(start..self.input_cursor, "");
+        let removed = self.input_cursor - start;
+        self.input_cursor = start;
+        self.shift_pastes(start + removed, -(removed as isize));
+    }
+
+    pub fn delete(&mut self) {
+        if let Some(index) = self
+            .pasted
+            .iter()
+            .position(|range| range.start == self.input_cursor)
+        {
+            let range = self.pasted.remove(index);
+            self.input.replace_range(range.start..range.end, "");
+            self.shift_pastes(range.end, -((range.end - range.start) as isize));
+            return;
+        }
+        let Some(character) = self.input[self.input_cursor..].chars().next() else {
+            return;
+        };
+        let end = self.input_cursor + character.len_utf8();
+        self.input.replace_range(self.input_cursor..end, "");
+        self.shift_pastes(end, -(character.len_utf8() as isize));
+    }
+
+    pub fn move_input_left(&mut self) {
+        if let Some(range) = self
+            .pasted
+            .iter()
+            .find(|range| range.end == self.input_cursor)
+        {
+            self.input_cursor = range.start;
+        } else if let Some((start, _)) = self.input[..self.input_cursor].char_indices().next_back()
+        {
+            self.input_cursor = start;
+        }
+    }
+
+    pub fn move_input_right(&mut self) {
+        if let Some(range) = self
+            .pasted
+            .iter()
+            .find(|range| range.start == self.input_cursor)
+        {
+            self.input_cursor = range.end;
+        } else if let Some(character) = self.input[self.input_cursor..].chars().next() {
+            self.input_cursor += character.len_utf8();
+        }
+    }
+
+    pub fn input_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::{
+            style::{Color, Style},
+            text::{Line, Span},
+        };
+
+        let mut lines = vec![Line::from(Span::raw(" "))];
+        let mut offset = 0;
+        for range in &self.pasted {
+            push_input_text(&mut lines, &self.input[offset..range.start]);
+            lines.last_mut().unwrap().spans.push(Span::styled(
+                format!(" Pasted {} chars ", range.chars),
+                Style::default().fg(Color::Black).bg(Color::Magenta),
+            ));
+            offset = range.end;
+        }
+        push_input_text(&mut lines, &self.input[offset..]);
+        lines
+    }
+
+    pub fn input_cursor(&self, width: u16) -> (u16, u16) {
+        let mut row = 0u16;
+        let mut column = 1u16;
+        let mut offset = 0;
+        for range in &self.pasted {
+            if range.start >= self.input_cursor {
+                break;
+            }
+            advance_cursor(
+                &self.input[offset..range.start],
+                width,
+                &mut row,
+                &mut column,
+            );
+            let label = format!(" Pasted {} chars ", range.chars);
+            advance_cursor(&label, width, &mut row, &mut column);
+            offset = range.end;
+        }
+        advance_cursor(
+            &self.input[offset..self.input_cursor],
+            width,
+            &mut row,
+            &mut column,
+        );
+        (row, column)
+    }
+
+    fn shift_pastes(&mut self, from: usize, delta: isize) {
+        for range in self.pasted.iter_mut().filter(|range| range.start >= from) {
+            range.start = range.start.checked_add_signed(delta).unwrap();
+            range.end = range.end.checked_add_signed(delta).unwrap();
+        }
     }
 
     pub fn push_user(&mut self, content: String) {
@@ -585,6 +750,39 @@ impl UiState {
     }
 }
 
+fn push_input_text(lines: &mut Vec<ratatui::text::Line<'static>>, text: &str) {
+    use ratatui::text::{Line, Span};
+
+    let mut parts = text.split('\n').peekable();
+    while let Some(part) = parts.next() {
+        if !part.is_empty() {
+            lines
+                .last_mut()
+                .unwrap()
+                .spans
+                .push(Span::raw(part.to_owned()));
+        }
+        if parts.peek().is_some() {
+            lines.push(Line::from(Span::raw(" ")));
+        }
+    }
+}
+
+fn advance_cursor(text: &str, width: u16, row: &mut u16, column: &mut u16) {
+    for character in text.chars() {
+        if character == '\n' {
+            *row += 1;
+            *column = 1;
+        } else {
+            *column += 1;
+            if *column >= width {
+                *row += 1;
+                *column = 0;
+            }
+        }
+    }
+}
+
 fn collapsible(block: &ChatBlock) -> bool {
     matches!(
         block,
@@ -599,6 +797,7 @@ fn collapsible(block: &ChatBlock) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
     use serde_json::json;
 
     #[test]
@@ -759,5 +958,33 @@ mod tests {
             state.blocks[1],
             ChatBlock::Tool { expanded: true, .. }
         ));
+    }
+
+    #[test]
+    fn large_paste_moves_and_deletes_as_one_input_item() {
+        let mut state = UiState::new();
+        state.insert_char('a');
+        state.insert_paste("long paste", 4);
+        state.insert_char('z');
+
+        assert_eq!(state.input, "along pastez");
+        assert!(state.input_lines()[0].spans.iter().any(|span| {
+            span.content == " Pasted 10 chars " && span.style.bg == Some(Color::Magenta)
+        }));
+
+        state.move_input_left();
+        state.move_input_left();
+        state.delete();
+        assert_eq!(state.input, "az");
+    }
+
+    #[test]
+    fn short_multiline_paste_remains_visible_text() {
+        let mut state = UiState::new();
+        state.insert_paste("one\ntwo", 200);
+        let lines = state.input_lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[1].content, "one");
+        assert_eq!(lines[1].spans[1].content, "two");
     }
 }

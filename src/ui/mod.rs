@@ -6,9 +6,10 @@ use std::{io, time::Duration};
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -130,7 +131,7 @@ pub async fn run(
                         }
                         TerminalEvent::Paste(text) => {
                             history.reset_navigation();
-                            state.input.push_str(&text);
+                            state.insert_paste(&text, config.paste_collapse_chars);
                             state.palette_selected = 0;
                         }
                         _ => {}
@@ -185,7 +186,7 @@ async fn handle_key(
         return Ok(false);
     }
     if key.code == KeyCode::Esc && palette_commands(&state.input).is_some() {
-        state.input.clear();
+        state.clear_input();
         state.palette_selected = 0;
         return Ok(false);
     }
@@ -198,17 +199,16 @@ async fn handle_key(
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
             history.reset_navigation();
-            state.input.push('\n');
+            state.insert_char('\n');
         }
         KeyCode::Enter => {
             if let Some(filtered) = palette_commands(&state.input)
                 && let Some(command) = filtered.get(state.palette_selected).copied()
             {
                 if command.argument {
-                    state.input = format!("{} ", command.name);
-                    state.palette_selected = 0;
+                    state.set_input(format!("{} ", command.name));
                 } else {
-                    state.input.clear();
+                    state.clear_input();
                     dispatch(command.name.into(), state, history, commands).await?;
                 }
                 return Ok(false);
@@ -219,19 +219,21 @@ async fn handle_key(
         }
         KeyCode::Backspace => {
             history.reset_navigation();
-            state.input.pop();
+            state.backspace();
             state.palette_selected = 0;
         }
         KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             history.reset_navigation();
-            state.input.push(character);
+            state.insert_char(character);
             state.palette_selected = 0;
         }
         KeyCode::Up => {
             if palette_commands(&state.input).is_some() {
                 state.palette_selected = state.palette_selected.saturating_sub(1);
             } else {
-                history.previous(&mut state.input);
+                let mut input = state.input.clone();
+                history.previous(&mut input);
+                state.set_input(input);
             }
         }
         KeyCode::Down => {
@@ -239,9 +241,14 @@ async fn handle_key(
                 state.palette_selected =
                     (state.palette_selected + 1).min(filtered.len().saturating_sub(1));
             } else {
-                history.next(&mut state.input);
+                let mut input = state.input.clone();
+                history.next(&mut input);
+                state.set_input(input);
             }
         }
+        KeyCode::Left => state.move_input_left(),
+        KeyCode::Right => state.move_input_right(),
+        KeyCode::Delete => state.delete(),
         KeyCode::Tab => state.focus_next(),
         KeyCode::BackTab => state.focus_previous(),
         KeyCode::PageUp => state.scroll = state.scroll.saturating_add(8),
@@ -343,7 +350,7 @@ async fn handle_mouse(
 }
 
 fn page_areas(area: Rect, state: &UiState) -> [Rect; 3] {
-    let input_height = (state.input.lines().count() as u16 + 2).clamp(3, 8);
+    let input_height = (state.input_lines().len() as u16 + 2).clamp(3, 8);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -395,33 +402,21 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
     }
     title.push(Span::raw(" "));
     frame.render_widget(
-        Paragraph::new(
-            state
-                .input
-                .split('\n')
-                .map(|line| Line::from(format!(" {line}")))
-                .collect::<Vec<_>>(),
-        )
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(title)),
-        ),
+        Paragraph::new(state.input_lines())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Line::from(title)),
+            ),
         input,
     );
     draw_command_palette(frame, state, input);
 
-    let input_width = input.width.saturating_sub(3).max(1);
-    let last_line = state
-        .input
-        .rsplit_once('\n')
-        .map_or(state.input.as_str(), |(_, line)| line);
-    let row =
-        state.input.matches('\n').count() as u16 + last_line.chars().count() as u16 / input_width;
-    let column = last_line.chars().count() as u16 % input_width;
+    let input_width = input.width.saturating_sub(2).max(1);
+    let (row, column) = state.input_cursor(input_width);
     if !state.conversation_focused() {
-        frame.set_cursor_position((input.x + 2 + column, input.y + 1 + row));
+        frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
     }
 }
 
@@ -1169,6 +1164,7 @@ impl TerminalGuard {
         if let Err(error) = execute!(
             stdout,
             EnterAlternateScreen,
+            EnableBracketedPaste,
             EnableMouseCapture,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         ) {
@@ -1176,6 +1172,7 @@ impl TerminalGuard {
             execute!(
                 stdout,
                 PopKeyboardEnhancementFlags,
+                DisableBracketedPaste,
                 DisableMouseCapture,
                 LeaveAlternateScreen
             )
@@ -1189,6 +1186,7 @@ impl TerminalGuard {
                 execute!(
                     io::stdout(),
                     PopKeyboardEnhancementFlags,
+                    DisableBracketedPaste,
                     DisableMouseCapture,
                     LeaveAlternateScreen
                 )
@@ -1205,6 +1203,7 @@ impl Drop for TerminalGuard {
         execute!(
             self.terminal.backend_mut(),
             PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
             DisableMouseCapture,
             LeaveAlternateScreen
         )

@@ -30,6 +30,8 @@ External tools receive their function arguments as JSON on stdin and must return
 ## Coder UI
 
 - global persistent prompt history with Bash-style Up/Down navigation and Shift+Enter newlines
+- bracketed multiline paste handling and configurable collapsed large-paste tokens
+- sequential duplicate filtering in persistent prompt history
 - CommonMark/GFM rendering with inline emphasis, links, aligned tables, and syntax-colored fenced code blocks
 - streamed tool-call arguments, results, and approval prompts
 - live tool counters that switch from characters to lines after the first literal or escaped line break

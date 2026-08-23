@@ -24,7 +24,7 @@ impl PromptHistory {
             Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error.into()),
         };
-        let entries = data
+        let mut entries = data
             .lines()
             .filter(|line| !line.trim().is_empty())
             .enumerate()
@@ -33,6 +33,7 @@ impl PromptHistory {
                     .with_context(|| format!("parse prompt history line {}", index + 1))
             })
             .collect::<Result<Vec<_>>>()?;
+        entries.dedup();
         Ok(Self {
             path,
             entries,
@@ -42,6 +43,10 @@ impl PromptHistory {
     }
 
     pub async fn record(&mut self, prompt: &str) -> Result<()> {
+        if self.entries.last().is_some_and(|entry| entry == prompt) {
+            self.reset_navigation();
+            return Ok(());
+        }
         self.entries.push(prompt.to_owned());
         self.reset_navigation();
         let mut line = serde_json::to_vec(prompt)?;
@@ -133,6 +138,22 @@ mod tests {
         reloaded.previous(&mut input);
         assert_eq!(input, "first\nsecond");
 
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skips_sequential_duplicates() {
+        let path = std::env::temp_dir().join(format!(
+            "rope-history-dedup-test-{}.jsonl",
+            std::process::id()
+        ));
+        let mut history = PromptHistory::load_path(path.clone()).await.unwrap();
+        history.record("same").await.unwrap();
+        history.record("same").await.unwrap();
+        history.record("different").await.unwrap();
+        history.record("same").await.unwrap();
+
+        assert_eq!(history.entries, ["same", "different", "same"]);
         tokio::fs::remove_file(path).await.unwrap();
     }
 }
