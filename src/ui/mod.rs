@@ -163,6 +163,19 @@ async fn handle_key(
         commands.send(Command::Cancel).await?;
         return Ok(false);
     }
+    if state.git_fullscreen_diff {
+        match key.code {
+            KeyCode::Esc => state.close_fullscreen_git_diff(),
+            KeyCode::Up | KeyCode::PageUp => {
+                state.git_diff_scroll = state.git_diff_scroll.saturating_sub(8)
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                state.git_diff_scroll = state.git_diff_scroll.saturating_add(8)
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(call) = &state.approval {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -186,8 +199,6 @@ async fn handle_key(
     if state.conversation_focused() {
         match key.code {
             KeyCode::Esc => state.focus_input(),
-            KeyCode::Tab => state.focus_next(),
-            KeyCode::BackTab => state.focus_previous(),
             KeyCode::Up => state.select_previous(),
             KeyCode::Down => state.select_next(),
             KeyCode::Enter | KeyCode::Char(' ') => state.toggle_selected(),
@@ -261,8 +272,10 @@ async fn handle_key(
         KeyCode::Left => state.move_input_left(),
         KeyCode::Right => state.move_input_right(),
         KeyCode::Delete => state.delete(),
-        KeyCode::Tab => state.focus_next(),
-        KeyCode::BackTab => state.focus_previous(),
+        KeyCode::Tab => {
+            history.reset_navigation();
+            state.insert_char('\t');
+        }
         KeyCode::PageUp => state.scroll = state.scroll.saturating_add(8),
         KeyCode::PageDown => state.scroll = state.scroll.saturating_sub(8),
         _ => {}
@@ -304,7 +317,7 @@ async fn dispatch(
         "/thinking" if argument.is_empty() => state.toggle_thinking_default(),
         "/tools" if argument.is_empty() => state.toggle_tools_default(),
         "/diff" if argument.is_empty() => {
-            state.open_git_diff();
+            state.open_fullscreen_git_diff();
             commands.send(Command::GitDiff(None)).await?;
         }
         value if value.starts_with('/') => {
@@ -333,6 +346,18 @@ async fn handle_mouse(
     input: Rect,
     commands: &mpsc::Sender<Command>,
 ) -> Result<()> {
+    if state.git_fullscreen_diff {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                state.git_diff_scroll = state.git_diff_scroll.saturating_sub(3)
+            }
+            MouseEventKind::ScrollDown => {
+                state.git_diff_scroll = state.git_diff_scroll.saturating_add(3)
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && mouse.row == input.y {
         let model_start = input.x + 2;
         let model_end = model_start + state.model.chars().count() as u16;
@@ -446,6 +471,9 @@ fn page_areas(area: Rect, state: &UiState) -> [Rect; 3] {
 }
 
 fn conversation_area(area: Rect, state: &UiState) -> Rect {
+    if state.git_fullscreen_diff {
+        return area;
+    }
     let body = page_areas(area, state)[1];
     git_split(body, state).0
 }
@@ -455,7 +483,7 @@ fn git_area(body: Rect, state: &UiState) -> Option<Rect> {
 }
 
 fn git_split(body: Rect, state: &UiState) -> (Rect, Option<Rect>) {
-    if !state.git_panel || body.width < 100 {
+    if state.git_fullscreen_diff || !state.git_panel || body.width < 100 {
         return (body, None);
     }
     let areas = Layout::default()
@@ -466,6 +494,10 @@ fn git_split(body: Rect, state: &UiState) -> (Rect, Option<Rect>) {
 }
 
 fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
+    if state.git_fullscreen_diff {
+        draw_fullscreen_git(frame, state);
+        return;
+    }
     let [header, body, input] = page_areas(frame.area(), state);
     let effort = state
         .reasoning_effort
@@ -533,6 +565,28 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
     }
     draw_toast(frame, state);
+}
+
+fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
+    let lines = if state.project.git_available {
+        diff_lines(&state.project.git_diff)
+    } else {
+        vec![Line::styled(
+            " not a Git repository",
+            Style::default().fg(Color::DarkGray),
+        )]
+    };
+    frame.render_widget(Clear, frame.area());
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((state.git_diff_scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" git diff · Esc to close "),
+            ),
+        frame.area(),
+    );
 }
 
 fn draw_toast(frame: &mut ratatui::Frame, state: &UiState) {
@@ -888,8 +942,9 @@ fn wrap_chat_lines(lines: Vec<Line<'static>>, width: u16) -> (Vec<Line<'static>>
     let mut starts = Vec::with_capacity(lines.len());
     for line in lines {
         starts.push(output.len() as u16);
+        let line_style = line.style;
         if line.spans.is_empty() {
-            output.push(Line::default());
+            output.push(Line::default().style(line_style));
             continue;
         }
         let mut current = Line::default();
@@ -901,7 +956,7 @@ fn wrap_chat_lines(lines: Vec<Line<'static>>, width: u16) -> (Vec<Line<'static>>
                     current = Line::default();
                     column = 0;
                 }
-                push_styled_char(&mut current, character, span.style);
+                push_styled_char(&mut current, character, line_style.patch(span.style));
                 column += 1;
             }
         }
@@ -1684,6 +1739,22 @@ mod tests {
 
         assert_eq!(text[0], "▾ You");
         assert_eq!(text[1], " hello");
+    }
+
+    #[test]
+    fn wrapping_preserves_section_header_colors_and_modifiers() {
+        let style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let (lines, _) = wrap_chat_lines(vec![Line::styled("▾ You", style)], 80);
+
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
     }
 
     #[test]

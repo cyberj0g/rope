@@ -50,7 +50,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
 - current directory and compact session identity on the status bar
-- asynchronously refreshed, clickable Git status and diff pane
+- asynchronously refreshed, clickable Git status pane and full-screen `/diff` view
 - drag-to-copy conversation selection with a non-blocking clipboard toast
 - filtered slash-command palette with keyboard navigation and command hotkeys
 - `/thinking` and `/tools` defaults plus clickable model and reasoning selectors

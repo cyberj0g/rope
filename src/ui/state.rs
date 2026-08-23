@@ -140,6 +140,8 @@ pub struct UiState {
     pub tools_expanded: bool,
     pub git_panel: bool,
     pub git_diff_mode: bool,
+    pub git_fullscreen_diff: bool,
+    pub git_diff_scroll: u16,
     assistant: Option<usize>,
     reasoning: Option<usize>,
     response_model: String,
@@ -200,6 +202,8 @@ impl UiState {
             tools_expanded: false,
             git_panel: true,
             git_diff_mode: false,
+            git_fullscreen_diff: false,
+            git_diff_scroll: 0,
             assistant: None,
             reasoning: None,
             response_model: String::new(),
@@ -418,9 +422,16 @@ impl UiState {
         ));
     }
 
-    pub fn open_git_diff(&mut self) {
-        self.git_panel = true;
-        self.git_diff_mode = true;
+    pub fn open_fullscreen_git_diff(&mut self) {
+        self.git_fullscreen_diff = true;
+        self.git_diff_scroll = 0;
+        self.project.git_diff_path = None;
+        self.project.git_diff.clear();
+    }
+
+    pub fn close_fullscreen_git_diff(&mut self) {
+        self.git_fullscreen_diff = false;
+        self.git_diff_scroll = 0;
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>) {
@@ -449,30 +460,6 @@ impl UiState {
     }
     pub fn selected(&self) -> Option<usize> {
         self.selected
-    }
-
-    pub fn focus_next(&mut self) {
-        let sections = self.sections();
-        self.selected = match self
-            .selected
-            .and_then(|selected| sections.iter().position(|index| *index == selected))
-        {
-            Some(position) if position + 1 < sections.len() => Some(sections[position + 1]),
-            Some(_) => None,
-            None => sections.last().copied(),
-        };
-    }
-
-    pub fn focus_previous(&mut self) {
-        let sections = self.sections();
-        self.selected = match self
-            .selected
-            .and_then(|selected| sections.iter().position(|index| *index == selected))
-        {
-            Some(position) if position > 0 => Some(sections[position - 1]),
-            Some(_) => None,
-            None => sections.last().copied(),
-        };
     }
 
     pub fn select_previous(&mut self) {
@@ -916,7 +903,7 @@ mod tests {
                 ..
             }
         ));
-        state.focus_next();
+        state.select(0);
         assert_eq!(state.selected(), Some(0));
         state.toggle_selected();
         assert!(matches!(
@@ -994,7 +981,7 @@ mod tests {
         state.push_user("hello".into());
         state.apply(Event::TextDelta("hi".into()));
 
-        state.focus_next();
+        state.select(1);
         assert_eq!(state.selected(), Some(1));
         state.toggle_selected();
         assert!(matches!(
@@ -1105,6 +1092,23 @@ mod tests {
             state.blocks[1],
             ChatBlock::Tool { expanded: true, .. }
         ));
+    }
+
+    #[test]
+    fn fullscreen_diff_has_independent_open_and_scroll_state() {
+        let mut state = UiState::new();
+        state.project.git_diff = "old file diff".into();
+        state.project.git_diff_path = Some("old.rs".into());
+        state.git_diff_scroll = 10;
+
+        state.open_fullscreen_git_diff();
+        assert!(state.git_fullscreen_diff);
+        assert_eq!(state.git_diff_scroll, 0);
+        assert!(state.project.git_diff.is_empty());
+        assert!(state.project.git_diff_path.is_none());
+
+        state.close_fullscreen_git_diff();
+        assert!(!state.git_fullscreen_diff);
     }
 
     #[test]
