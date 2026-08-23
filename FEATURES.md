@@ -6,7 +6,7 @@
 - deterministic mock provider for runtime tests
 - streamed text and OpenAI function-call assembly
 - layered `~/.config/rope/config.toml` and `./.rope/config.toml` configuration
-- named model profiles with context size, temperature, and vision capabilities
+- named model profiles with context size, temperature, and vision capabilities; omitted names use the API model ID
 - automatic global and project `AGENTS.md` instructions
 
 ## Sessions

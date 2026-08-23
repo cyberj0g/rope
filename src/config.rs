@@ -55,6 +55,7 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub struct ModelConfig {
+    #[serde(default)]
     pub name: String,
     pub id: String,
     pub max_context_tokens: u64,
@@ -388,5 +389,24 @@ write = "allow"
         let mut config = Config::default();
         config.models[0].temperature = Some(0.7);
         assert_eq!(config.effective_temperature(), Some(0.7));
+    }
+
+    #[test]
+    fn omitted_model_name_defaults_to_api_id() {
+        let mut config: Config = toml::from_str(
+            r#"
+model = "api/qwen"
+
+[[models]]
+id = "api/qwen"
+max_context_tokens = 32768
+"#,
+        )
+        .unwrap();
+        config.normalize().unwrap();
+
+        assert_eq!(config.models[0].name, "api/qwen");
+        assert_eq!(config.model_name(), "api/qwen");
+        assert_eq!(config.model_id(), "api/qwen");
     }
 }
