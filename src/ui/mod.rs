@@ -1,9 +1,13 @@
 mod history;
 mod state;
 
-use std::{io, time::Duration};
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
 
 use anyhow::Result;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -30,7 +34,7 @@ use crate::{
     runtime::{Command, Event},
 };
 use history::PromptHistory;
-use state::{ChatBlock, MessageKind, ToolStatus, UiState};
+use state::{ChatBlock, MessageKind, TextPoint, TextSelection, ToolStatus, UiState};
 
 #[derive(Clone, Copy)]
 struct SlashCommand {
@@ -107,6 +111,7 @@ pub async fn run(
     let mut state = UiState::new();
     loop {
         let size = terminal.terminal.size()?;
+        state.expire_toast();
         let chat = conversation_area(Rect::new(0, 0, size.width, size.height), &state);
         ensure_selected_visible(&mut state, chat);
         terminal
@@ -365,15 +370,64 @@ async fn handle_mouse(
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(index) = chat_hit_test(state, conversation, mouse.row) {
-                state.select(index);
-                state.toggle(index);
+            let point = chat_point(state, conversation, mouse.column, mouse.row);
+            state.selection_anchor = Some(point);
+            state.text_selection = Some(TextSelection {
+                start: point,
+                end: point,
+            });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(start) = state.selection_anchor {
+                state.text_selection = Some(TextSelection {
+                    start,
+                    end: chat_point(state, conversation, mouse.column, mouse.row),
+                });
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(start) = state.selection_anchor.take() {
+                let end = chat_point(state, conversation, mouse.column, mouse.row);
+                if start == end {
+                    state.text_selection = None;
+                    if let Some(index) = chat_hit_test(state, conversation, mouse.row) {
+                        state.select(index);
+                        state.toggle(index);
+                    }
+                } else {
+                    state.text_selection = Some(TextSelection { start, end });
+                    let layout = chat_layout(state, conversation);
+                    let selected = selected_text(&layout.lines, TextSelection { start, end });
+                    if !selected.is_empty() {
+                        copy_to_clipboard(&selected)?;
+                        state.show_toast("copied to clipboard");
+                    }
+                }
             }
         }
         MouseEventKind::ScrollUp => state.scroll = state.scroll.saturating_add(3),
         MouseEventKind::ScrollDown => state.scroll = state.scroll.saturating_sub(3),
         _ => {}
     }
+    Ok(())
+}
+
+fn chat_point(state: &UiState, area: Rect, column: u16, row: u16) -> TextPoint {
+    let layout = chat_layout(state, area);
+    TextPoint {
+        row: (layout.offset + row.saturating_sub(area.y))
+            .min(layout.lines.len().saturating_sub(1) as u16),
+        column: column
+            .saturating_sub(area.x + 1)
+            .min(area.width.saturating_sub(3)),
+    }
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let encoded = STANDARD.encode(text);
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -477,6 +531,27 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
     if !state.conversation_focused() {
         frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
     }
+    draw_toast(frame, state);
+}
+
+fn draw_toast(frame: &mut ratatui::Frame, state: &UiState) {
+    let Some(message) = state.toast() else {
+        return;
+    };
+    let width = (message.chars().count() as u16 + 4).min(frame.area().width);
+    let area = Rect::new(
+        frame.area().right().saturating_sub(width + 2),
+        frame.area().y + 1,
+        width,
+        3.min(frame.area().height),
+    );
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!(" {message}"))
+            .style(Style::default().fg(Color::Black).bg(Color::Green))
+            .block(Block::default().borders(Borders::ALL)),
+        area,
+    );
 }
 
 fn palette_commands(input: &str) -> Option<Vec<SlashCommand>> {
@@ -630,7 +705,6 @@ fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
     let layout = chat_layout(state, area);
     frame.render_widget(
         Paragraph::new(layout.lines)
-            .wrap(Wrap { trim: false })
             .scroll((layout.offset, 0))
             .block(Block::default().borders(Borders::LEFT | Borders::RIGHT)),
         area,
@@ -779,26 +853,129 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
     }
 
     let width = area.width.saturating_sub(2).max(1);
-    let heights = lines
-        .iter()
-        .map(|line| line_height(line, width))
-        .collect::<Vec<_>>();
-    let content_height = heights.iter().sum::<u16>();
+    let (mut lines, starts) = wrap_chat_lines(lines, width);
+    let content_height = lines.len() as u16;
     let offset = content_height
         .saturating_sub(area.height)
         .saturating_sub(state.scroll);
     let headers = header_lines
         .into_iter()
         .map(|(block, line)| {
-            let row = heights[..line].iter().sum();
-            (block, row, heights[line])
+            let row = starts[line];
+            let end = starts.get(line + 1).copied().unwrap_or(content_height);
+            (block, row, end.saturating_sub(row).max(1))
         })
         .collect();
+    if let Some(selection) = state.text_selection {
+        highlight_selection(&mut lines, selection);
+    }
     ChatLayout {
         lines,
         headers,
         offset,
     }
+}
+
+fn wrap_chat_lines(lines: Vec<Line<'static>>, width: u16) -> (Vec<Line<'static>>, Vec<u16>) {
+    let width = width as usize;
+    let mut output = Vec::new();
+    let mut starts = Vec::with_capacity(lines.len());
+    for line in lines {
+        starts.push(output.len() as u16);
+        if line.spans.is_empty() {
+            output.push(Line::default());
+            continue;
+        }
+        let mut current = Line::default();
+        let mut column = 0;
+        for span in line.spans {
+            for character in span.content.chars() {
+                if column == width {
+                    output.push(current);
+                    current = Line::default();
+                    column = 0;
+                }
+                push_styled_char(&mut current, character, span.style);
+                column += 1;
+            }
+        }
+        output.push(current);
+    }
+    (output, starts)
+}
+
+fn push_styled_char(line: &mut Line<'static>, character: char, style: Style) {
+    if let Some(span) = line.spans.last_mut()
+        && span.style == style
+    {
+        span.content.to_mut().push(character);
+    } else {
+        line.spans.push(Span::styled(character.to_string(), style));
+    }
+}
+
+fn selection_bounds(selection: TextSelection) -> (TextPoint, TextPoint) {
+    if (selection.start.row, selection.start.column) <= (selection.end.row, selection.end.column) {
+        (selection.start, selection.end)
+    } else {
+        (selection.end, selection.start)
+    }
+}
+
+fn highlight_selection(lines: &mut [Line<'static>], selection: TextSelection) {
+    let (start, end) = selection_bounds(selection);
+    for (row, line) in lines.iter_mut().enumerate() {
+        let row = row as u16;
+        if row < start.row || row > end.row {
+            continue;
+        }
+        let from = if row == start.row { start.column } else { 0 } as usize;
+        let to = if row == end.row {
+            end.column as usize
+        } else {
+            usize::MAX
+        };
+        let spans = std::mem::take(&mut line.spans);
+        let mut highlighted = Line::default();
+        let mut column = 0;
+        for span in spans {
+            for character in span.content.chars() {
+                let style = if column >= from && column <= to {
+                    span.style.bg(Color::Blue).fg(Color::White)
+                } else {
+                    span.style
+                };
+                push_styled_char(&mut highlighted, character, style);
+                column += 1;
+            }
+        }
+        line.spans = highlighted.spans;
+    }
+}
+
+fn selected_text(lines: &[Line<'_>], selection: TextSelection) -> String {
+    let (start, end) = selection_bounds(selection);
+    let mut selected = Vec::new();
+    for row in start.row..=end.row.min(lines.len().saturating_sub(1) as u16) {
+        let text = lines[row as usize]
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .collect::<String>();
+        let from = if row == start.row { start.column } else { 0 } as usize;
+        let to = if row == end.row {
+            end.column as usize
+        } else {
+            text.chars().count().saturating_sub(1)
+        };
+        selected.push(
+            text.chars()
+                .skip(from)
+                .take(to.saturating_sub(from) + 1)
+                .collect::<String>(),
+        );
+    }
+    selected.join("\n")
 }
 
 fn chat_hit_test(state: &UiState, area: Rect, screen_row: u16) -> Option<usize> {
@@ -882,10 +1059,6 @@ fn error_summary(error: &str) -> String {
     } else {
         summary
     }
-}
-
-fn line_height(line: &Line<'_>, width: u16) -> u16 {
-    (line.width() as u16).div_ceil(width).max(1)
 }
 
 fn size_label(chars: usize) -> String {
@@ -1492,5 +1665,19 @@ mod tests {
             ["/thinking", "/tools"]
         );
         assert!(palette_commands("/add ").is_none());
+    }
+
+    #[test]
+    fn conversation_selection_copies_across_wrapped_rows() {
+        let (mut lines, _) = wrap_chat_lines(vec![Line::raw("abcdef"), Line::raw("ghij")], 80);
+        let selection = TextSelection {
+            start: TextPoint { row: 0, column: 2 },
+            end: TextPoint { row: 1, column: 1 },
+        };
+
+        assert_eq!(selected_text(&lines, selection), "cdef\ngh");
+        highlight_selection(&mut lines, selection);
+        assert_eq!(lines[0].spans.last().unwrap().style.bg, Some(Color::Blue));
+        assert_eq!(lines[1].spans[0].style.bg, Some(Color::Blue));
     }
 }

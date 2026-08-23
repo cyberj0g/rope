@@ -148,6 +148,26 @@ pub struct UiState {
     selected: Option<usize>,
     input_cursor: usize,
     pasted: Vec<PastedRange>,
+    pub text_selection: Option<TextSelection>,
+    pub selection_anchor: Option<TextPoint>,
+    toast: Option<Toast>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextPoint {
+    pub row: u16,
+    pub column: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TextSelection {
+    pub start: TextPoint,
+    pub end: TextPoint,
+}
+
+struct Toast {
+    message: String,
+    expires: Instant,
 }
 
 #[derive(Clone)]
@@ -188,6 +208,9 @@ impl UiState {
             selected: None,
             input_cursor: 0,
             pasted: Vec::new(),
+            text_selection: None,
+            selection_anchor: None,
+            toast: None,
         }
     }
 
@@ -398,6 +421,27 @@ impl UiState {
     pub fn open_git_diff(&mut self) {
         self.git_panel = true;
         self.git_diff_mode = true;
+    }
+
+    pub fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some(Toast {
+            message: message.into(),
+            expires: Instant::now() + Duration::from_secs(3),
+        });
+    }
+
+    pub fn expire_toast(&mut self) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| Instant::now() >= toast.expires)
+        {
+            self.toast = None;
+        }
+    }
+
+    pub fn toast(&self) -> Option<&str> {
+        self.toast.as_ref().map(|toast| toast.message.as_str())
     }
 
     pub fn conversation_focused(&self) -> bool {

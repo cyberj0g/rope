@@ -50,6 +50,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - full-width conversation view with deliberate trailing whitespace
 - current directory and compact session identity on the status bar
 - asynchronously refreshed, clickable Git status and diff pane
+- drag-to-copy conversation selection with a non-blocking clipboard toast
 - filtered slash-command palette with keyboard navigation and command hotkeys
 - `/thinking` and `/tools` defaults plus clickable model and reasoning selectors
 - `/add PATH`, `/drop PATH`, and `/diff`
