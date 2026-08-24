@@ -700,9 +700,9 @@ async fn generate_session_title<P: Provider>(
             ),
             Message::user_with_images(prompt, Vec::new()),
         ],
-        temperature: Some(0.0),
-        reasoning_effort: None,
-        max_tokens: Some(3_072),
+        temperature: None,
+        reasoning_effort: Some(ReasoningEffort::Low),
+        max_tokens: Some(512),
         stream: true,
         tools: Vec::new(),
     };
@@ -1399,7 +1399,11 @@ mod tests {
         .await;
 
         assert_eq!(title, "Git Pane Scrolling");
-        assert_eq!(provider.requests()[0].max_tokens, Some(3_072));
+        let requests = provider.requests();
+        let request = &requests[0];
+        assert_eq!(request.temperature, None);
+        assert_eq!(request.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(request.max_tokens, Some(512));
         assert!(matches!(
             event_rx.recv().await,
             Some(Event::ModelRequestStarted(_))
