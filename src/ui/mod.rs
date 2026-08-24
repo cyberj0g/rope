@@ -175,11 +175,14 @@ pub async fn run(
         }
         let chat = conversation_area(page, &state);
         ensure_selected_visible(&mut state, chat);
+        let mut chat_height = 0;
         terminal
             .terminal
-            .draw(|frame| draw(frame, &config, &state))?;
+            .draw(|frame| chat_height = draw(frame, &config, &state))?;
         tokio::select! {
-            event = events.recv() => if let Some(event) = event { state.apply(event); },
+            event = events.recv() => if let Some(event) = event {
+                apply_runtime_event(&mut state, event, chat, chat_height);
+            },
             load = input_load_rx.recv() => if let Some(load) = load {
                 apply_input_load(load, &config, &mut state);
             },
@@ -222,6 +225,41 @@ pub async fn run(
                     }
                 }
             }
+        }
+    }
+}
+
+fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height: usize) {
+    let preserve_viewport = old_height > 0
+        && state.scroll > 0
+        && matches!(
+            &event,
+            Event::GenerationStarted
+                | Event::ModelRequestStarted(_)
+                | Event::ResponseHeadersReceived
+                | Event::ResponseStarted
+                | Event::ReasoningDelta(_)
+                | Event::TextDelta(_)
+                | Event::ToolCallDelta { .. }
+                | Event::ToolCallFinished { .. }
+                | Event::ToolStarted { .. }
+                | Event::ApprovalRequested(_)
+                | Event::ToolResult { .. }
+                | Event::Retrying { .. }
+                | Event::CompactionStarted
+                | Event::GenerationFinished
+                | Event::Saved
+                | Event::Error(_)
+        );
+    state.apply(event);
+    if preserve_viewport {
+        let new_height = chat_layout(state, chat).lines.len();
+        if new_height >= old_height {
+            let delta = u16::try_from(new_height - old_height).unwrap_or(u16::MAX);
+            state.scroll = state.scroll.saturating_add(delta);
+        } else {
+            let delta = u16::try_from(old_height - new_height).unwrap_or(u16::MAX);
+            state.scroll = state.scroll.saturating_sub(delta);
         }
     }
 }
@@ -921,10 +959,10 @@ fn resize_plan_panel(state: &mut UiState, side: Rect, row: u16) {
     state.plan_panel_height = Some(height);
 }
 
-fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
+fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) -> usize {
     if state.git_fullscreen_diff {
         draw_fullscreen_git(frame, state);
-        return;
+        return 0;
     }
     let [header, body, input] = page_areas(frame.area(), state);
     let effort = state
@@ -957,7 +995,7 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
     );
 
     let (chat, side) = git_split(body, state);
-    draw_chat(frame, state, chat);
+    let chat_height = draw_chat(frame, state, chat);
     if let Some(side) = side {
         let (git, plan) = side_split(side, state);
         draw_git(frame, state, git);
@@ -1000,6 +1038,7 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
     }
     draw_toast(frame, state);
+    chat_height
 }
 
 fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
@@ -1330,14 +1369,16 @@ fn diff_lines(diff: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
+fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) -> usize {
     let layout = chat_layout(state, area);
+    let height = layout.lines.len();
     frame.render_widget(
         Paragraph::new(layout.lines)
             .scroll((layout.offset, 0))
             .block(Block::default().borders(Borders::LEFT | Borders::RIGHT)),
         area,
     );
+    height
 }
 
 struct ChatLayout {
@@ -2664,6 +2705,48 @@ mod tests {
 
         state.apply(Event::Error("failed".into()));
         assert_eq!(app_status(&state), ("error", Color::Red));
+    }
+
+    #[test]
+    fn streaming_preserves_a_scrolled_chat_viewport() {
+        let mut state = UiState::new();
+        let area = Rect::new(0, 0, 24, 6);
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("old content ".repeat(30)));
+        state.scroll = 4;
+        let before = chat_layout(&state, area);
+        let old_scroll = state.scroll;
+
+        apply_runtime_event(
+            &mut state,
+            Event::TextDelta("new streamed content ".repeat(30)),
+            area,
+            before.lines.len(),
+        );
+        let after = chat_layout(&state, area);
+
+        assert_eq!(after.offset, before.offset);
+        assert!(state.scroll > old_scroll);
+    }
+
+    #[test]
+    fn streaming_follows_chat_at_the_bottom() {
+        let mut state = UiState::new();
+        let area = Rect::new(0, 0, 24, 6);
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("old content ".repeat(30)));
+        let before = chat_layout(&state, area);
+
+        apply_runtime_event(
+            &mut state,
+            Event::TextDelta("new streamed content ".repeat(30)),
+            area,
+            before.lines.len(),
+        );
+        let after = chat_layout(&state, area);
+
+        assert_eq!(state.scroll, 0);
+        assert!(after.offset > before.offset);
     }
 
     #[test]
