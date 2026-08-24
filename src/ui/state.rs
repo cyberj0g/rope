@@ -634,14 +634,6 @@ impl UiState {
                 *expanded = self.thinking_expanded;
             }
         }
-        self.notice = Some(format!(
-            "thinking blocks {}",
-            if self.thinking_expanded {
-                "expanded"
-            } else {
-                "collapsed"
-            }
-        ));
     }
 
     pub fn toggle_tools_default(&mut self) {
@@ -651,14 +643,6 @@ impl UiState {
                 *expanded = self.tools_expanded;
             }
         }
-        self.notice = Some(format!(
-            "tool blocks {}",
-            if self.tools_expanded {
-                "expanded"
-            } else {
-                "collapsed"
-            }
-        ));
     }
 
     pub fn toggle_plan_panel(&mut self) {
@@ -1398,6 +1382,7 @@ mod tests {
         });
         state.toggle_thinking_default();
         state.toggle_tools_default();
+        assert!(state.notice.is_none());
 
         assert!(matches!(
             state.blocks[0],
