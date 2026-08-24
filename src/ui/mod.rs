@@ -151,6 +151,8 @@ pub async fn run(
     let mut terminal = TerminalGuard::new()?;
     let mut state = UiState::new();
     let (input_load_tx, mut input_load_rx) = mpsc::unbounded_channel();
+    let mut chat_height = 0;
+    let mut chat_size = None;
     loop {
         let size = terminal.terminal.size()?;
         state.expire_toast();
@@ -173,15 +175,27 @@ pub async fn run(
         if let Some(area) = plan {
             state.plan_scroll = state.plan_scroll.min(plan_max_scroll(&state, area.height));
         }
-        let chat = conversation_area(page, &state);
-        ensure_selected_visible(&mut state, chat);
-        let mut chat_height = 0;
+        let chat = conversation_viewport_area(page, &state);
+        let current_chat_size = (chat.width, chat.height);
+        if state.git_fullscreen_diff && chat_size != Some(current_chat_size) {
+            chat_height = chat_layout(&state, chat).lines.len();
+        }
+        state.scroll = state.scroll.min(state.chat_scroll_max);
+        if !state.git_fullscreen_diff {
+            ensure_selected_visible(&mut state, chat);
+        }
+        let mut rendered_chat_height = 0;
         terminal
             .terminal
-            .draw(|frame| chat_height = draw(frame, &config, &state))?;
+            .draw(|frame| rendered_chat_height = draw(frame, &config, &state, chat_height))?;
+        if !state.git_fullscreen_diff {
+            chat_height = rendered_chat_height;
+        }
+        chat_size = Some(current_chat_size);
+        set_chat_scroll_max(&mut state, chat.height, chat_height);
         tokio::select! {
             event = events.recv() => if let Some(event) = event {
-                apply_runtime_event(&mut state, event, chat, chat_height);
+                chat_height = apply_runtime_event(&mut state, event, chat, chat_height);
             },
             load = input_load_rx.recv() => if let Some(load) = load {
                 apply_input_load(load, &config, &mut state);
@@ -190,7 +204,8 @@ pub async fn run(
                 while event::poll(Duration::ZERO)? {
                     match event::read()? {
                         TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                            if handle_key(key, size.height, &config, &mut state, &mut history, &commands, &input_load_tx).await? {
+                            let page = Rect::new(0, 0, size.width, size.height);
+                            if handle_key(key, page, &config, &mut state, &mut history, &commands, &input_load_tx).await? {
                                 commands.send(Command::Shutdown).await.ok(); return Ok(());
                             }
                         }
@@ -229,7 +244,7 @@ pub async fn run(
     }
 }
 
-fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height: usize) {
+fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height: usize) -> usize {
     let preserve_viewport = old_height > 0
         && state.scroll > 0
         && matches!(
@@ -252,8 +267,8 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
                 | Event::Error(_)
         );
     state.apply(event);
+    let new_height = chat_layout(state, chat).lines.len();
     if preserve_viewport {
-        let new_height = chat_layout(state, chat).lines.len();
         if new_height >= old_height {
             let delta = u16::try_from(new_height - old_height).unwrap_or(u16::MAX);
             state.scroll = state.scroll.saturating_add(delta);
@@ -262,11 +277,13 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
             state.scroll = state.scroll.saturating_sub(delta);
         }
     }
+    set_chat_scroll_max(state, chat.height, new_height);
+    new_height
 }
 
 async fn handle_key(
     key: KeyEvent,
-    screen_height: u16,
+    screen: Rect,
     config: &Config,
     state: &mut UiState,
     history: &mut PromptHistory,
@@ -276,25 +293,12 @@ async fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
+    if handle_fullscreen_diff_key(key, state, screen.height) {
+        return Ok(false);
+    }
     if key.code == KeyCode::Esc && state.generating {
         state.approval = None;
         commands.send(Command::Cancel).await?;
-        return Ok(false);
-    }
-    if state.git_fullscreen_diff {
-        match key.code {
-            KeyCode::Esc => state.close_fullscreen_git_diff(),
-            KeyCode::Up | KeyCode::PageUp => {
-                state.git_diff_scroll = state.git_diff_scroll.saturating_sub(8)
-            }
-            KeyCode::Down | KeyCode::PageDown => {
-                state.git_diff_scroll = state
-                    .git_diff_scroll
-                    .saturating_add(8)
-                    .min(git_diff_max_scroll(state, screen_height))
-            }
-            _ => {}
-        }
         return Ok(false);
     }
     if let Some(call) = &state.approval {
@@ -331,9 +335,12 @@ async fn handle_key(
             KeyCode::Esc => state.focus_input(),
             KeyCode::Up => state.select_previous(),
             KeyCode::Down => state.select_next(),
-            KeyCode::Enter | KeyCode::Char(' ') => state.toggle_selected(),
-            KeyCode::PageUp => state.scroll = state.scroll.saturating_add(8),
-            KeyCode::PageDown => state.scroll = state.scroll.saturating_sub(8),
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                state.toggle_selected();
+                clamp_chat_scroll(state, conversation_viewport_area(screen, state));
+            }
+            KeyCode::PageUp => scroll_chat_up(state, 8),
+            KeyCode::PageDown => scroll_chat_down(state, 8),
             _ => {}
         }
         return Ok(false);
@@ -455,11 +462,31 @@ async fn handle_key(
             history.reset_navigation();
             state.insert_char('\t');
         }
-        KeyCode::PageUp => state.scroll = state.scroll.saturating_add(8),
-        KeyCode::PageDown => state.scroll = state.scroll.saturating_sub(8),
+        KeyCode::PageUp => scroll_chat_up(state, 8),
+        KeyCode::PageDown => scroll_chat_down(state, 8),
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_fullscreen_diff_key(key: KeyEvent, state: &mut UiState, screen_height: u16) -> bool {
+    if !state.git_fullscreen_diff {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => state.close_fullscreen_git_diff(),
+        KeyCode::Up | KeyCode::PageUp => {
+            state.git_diff_scroll = state.git_diff_scroll.saturating_sub(8)
+        }
+        KeyCode::Down | KeyCode::PageDown => {
+            state.git_diff_scroll = state
+                .git_diff_scroll
+                .saturating_add(8)
+                .min(git_diff_max_scroll(state, screen_height))
+        }
+        _ => {}
+    }
+    true
 }
 
 async fn dispatch(
@@ -835,6 +862,7 @@ async fn handle_mouse(
                     if let Some(index) = chat_hit_test(state, conversation, mouse.row) {
                         state.focus_input();
                         state.toggle(index);
+                        clamp_chat_scroll(state, conversation);
                     }
                 } else {
                     state.text_selection = Some(TextSelection { start, end });
@@ -847,8 +875,8 @@ async fn handle_mouse(
                 }
             }
         }
-        MouseEventKind::ScrollUp => state.scroll = state.scroll.saturating_add(3),
-        MouseEventKind::ScrollDown => state.scroll = state.scroll.saturating_sub(3),
+        MouseEventKind::ScrollUp => scroll_chat_up(state, 3),
+        MouseEventKind::ScrollDown => scroll_chat_down(state, 3),
         _ => {}
     }
     Ok(())
@@ -890,6 +918,10 @@ fn conversation_area(area: Rect, state: &UiState) -> Rect {
     if state.git_fullscreen_diff {
         return area;
     }
+    conversation_viewport_area(area, state)
+}
+
+fn conversation_viewport_area(area: Rect, state: &UiState) -> Rect {
     let body = page_areas(area, state)[1];
     git_split(body, state).0
 }
@@ -903,7 +935,7 @@ fn side_areas(body: Rect, state: &UiState) -> (Option<Rect>, Option<Rect>) {
 }
 
 fn git_split(body: Rect, state: &UiState) -> (Rect, Option<Rect>) {
-    if state.git_fullscreen_diff || !state.git_panel || body.width < 100 {
+    if !state.git_panel || body.width < 100 {
         return (body, None);
     }
     let default_width = body.width.saturating_mul(30) / 100;
@@ -965,10 +997,15 @@ fn resize_plan_panel(state: &mut UiState, side: Rect, row: u16) {
     state.plan_panel_height = Some(height);
 }
 
-fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) -> usize {
+fn draw(
+    frame: &mut ratatui::Frame,
+    config: &Config,
+    state: &UiState,
+    hidden_chat_height: usize,
+) -> usize {
     if state.git_fullscreen_diff {
         draw_fullscreen_git(frame, state);
-        return 0;
+        return hidden_chat_height;
     }
     let [header, body, input] = page_areas(frame.area(), state);
     let effort = state
@@ -1388,6 +1425,39 @@ fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) -> usize {
     height
 }
 
+fn chat_max_scroll(state: &UiState, area: Rect) -> u16 {
+    max_chat_scroll(chat_layout(state, area).lines.len(), area.height)
+}
+
+fn max_chat_scroll(height: usize, visible: u16) -> u16 {
+    height
+        .saturating_sub(visible as usize)
+        .min(u16::MAX as usize) as u16
+}
+
+fn set_chat_scroll_max(state: &mut UiState, visible: u16, height: usize) {
+    state.chat_scroll_max = max_chat_scroll(height, visible);
+    state.scroll = state.scroll.min(state.chat_scroll_max);
+}
+
+fn clamp_chat_scroll(state: &mut UiState, area: Rect) {
+    let max = chat_max_scroll(state, area);
+    state.chat_scroll_max = max;
+    state.scroll = state.scroll.min(max);
+}
+
+fn scroll_chat_up(state: &mut UiState, amount: u16) {
+    state.scroll = state
+        .scroll
+        .saturating_add(amount)
+        .min(state.chat_scroll_max);
+}
+
+fn scroll_chat_down(state: &mut UiState, amount: u16) {
+    state.scroll = state.scroll.min(state.chat_scroll_max);
+    state.scroll = state.scroll.saturating_sub(amount);
+}
+
 struct ChatLayout {
     lines: Vec<Line<'static>>,
     headers: Vec<(usize, u16, u16)>,
@@ -1522,6 +1592,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                     };
                     header.spans.push(Span::styled("[diff]", button_style));
+                    header.spans.push(Span::raw(" ").style(style));
                 }
                 header.spans.push(Span::styled(
                     format!(
@@ -2412,6 +2483,7 @@ mod tests {
         let area = Rect::new(2, 3, 80, 12);
         let layout = chat_layout(&state, area);
         assert!(layout.lines[0].to_string().contains("[diff]"));
+        assert!(layout.lines[0].to_string().contains("[diff] (file.txt)"));
         let (_, row, column) = layout.diff_buttons[0];
         let diff = chat_diff_hit_test(
             &state,
@@ -2832,6 +2904,76 @@ mod tests {
 
         assert_eq!(after.offset, before.offset);
         assert!(state.scroll > old_scroll);
+    }
+
+    #[test]
+    fn collapsing_content_clamps_chat_scroll_immediately() {
+        let mut state = UiState::new();
+        let area = Rect::new(0, 0, 24, 6);
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("old content ".repeat(60)));
+        state.scroll = chat_max_scroll(&state, area);
+        assert!(state.scroll > 0);
+
+        state.toggle(0);
+        clamp_chat_scroll(&mut state, area);
+
+        assert_eq!(state.scroll, chat_max_scroll(&state, area));
+        assert_eq!(state.scroll, 0);
+        scroll_chat_down(&mut state, 3);
+        assert_eq!(state.scroll, 0);
+    }
+
+    #[test]
+    fn fullscreen_diff_keeps_streaming_chat_viewport_state() {
+        use ratatui::backend::TestBackend;
+
+        let page = Rect::new(0, 0, 40, 20);
+        let mut state = UiState::new();
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("old content ".repeat(80)));
+        let chat = conversation_viewport_area(page, &state);
+        state.scroll = 4;
+        let before = chat_layout(&state, chat);
+        state.open_fullscreen_tool_diff("--- a/file\n+++ b/file\n-old\n+new\n".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(page.width, page.height)).unwrap();
+        let mut hidden_chat_height = 0;
+        terminal
+            .draw(|frame| {
+                hidden_chat_height = draw(frame, &Config::default(), &state, before.lines.len())
+            })
+            .unwrap();
+        assert_eq!(hidden_chat_height, before.lines.len());
+
+        apply_runtime_event(
+            &mut state,
+            Event::TextDelta("new streamed content ".repeat(40)),
+            chat,
+            hidden_chat_height,
+        );
+        let after = chat_layout(&state, chat);
+        assert_eq!(after.offset, before.offset);
+
+        state.close_fullscreen_git_diff();
+        clamp_chat_scroll(&mut state, chat);
+        assert!(!chat_layout(&state, chat).lines.is_empty());
+        assert!(state.scroll <= chat_max_scroll(&state, chat));
+    }
+
+    #[test]
+    fn escape_closes_diff_without_changing_active_generation() {
+        let mut state = UiState::new();
+        state.generating = true;
+        state.open_fullscreen_tool_diff("diff".into());
+
+        assert!(handle_fullscreen_diff_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            20,
+        ));
+        assert!(!state.git_fullscreen_diff);
+        assert!(state.generating);
     }
 
     #[test]

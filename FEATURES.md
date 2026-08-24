@@ -55,7 +55,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - separately colored model and reasoning details on the padded input box; session tokens and cost on the status bar
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
-- bottom-follow chat scrolling that holds the viewport while reading earlier output
+- bounded bottom-follow chat scrolling that holds the viewport through streaming, collapses, and full-screen diff visits
 - current directory and compact session identity on the status bar
 - asynchronously refreshed Git pane with a mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
 - auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
@@ -63,5 +63,5 @@ External tools receive their function arguments as JSON on stdin and must return
 - filtered slash-command palette with keyboard navigation and command hotkeys
 - non-blocking clipboard and `/image` image attachments with an elapsed processing plate
 - bracketed paste plus direct Shift+Insert clipboard fallback
-- `/thinking` and `/tools` defaults plus clickable model and reasoning selectors
+- `/thinking` and `/tools` global visibility toggles plus clickable model and reasoning selectors
 - `/add PATH`, `/drop PATH`, and `/diff`

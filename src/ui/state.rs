@@ -134,6 +134,7 @@ pub struct UiState {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub scroll: u16,
+    pub chat_scroll_max: u16,
     pub session: String,
     pub total_tokens: u64,
     pub context_tokens: u64,
@@ -220,6 +221,7 @@ impl UiState {
             error: None,
             notice: None,
             scroll: 0,
+            chat_scroll_max: 0,
             session: String::new(),
             total_tokens: 0,
             context_tokens: 0,
@@ -627,8 +629,13 @@ impl UiState {
 
     pub fn toggle_thinking_default(&mut self) {
         self.thinking_expanded = !self.thinking_expanded;
+        for block in &mut self.blocks {
+            if let ChatBlock::Thinking { expanded, .. } = block {
+                *expanded = self.thinking_expanded;
+            }
+        }
         self.notice = Some(format!(
-            "thinking blocks default to {}",
+            "thinking blocks {}",
             if self.thinking_expanded {
                 "expanded"
             } else {
@@ -639,8 +646,13 @@ impl UiState {
 
     pub fn toggle_tools_default(&mut self) {
         self.tools_expanded = !self.tools_expanded;
+        for block in &mut self.blocks {
+            if let ChatBlock::Tool { expanded, .. } = block {
+                *expanded = self.tools_expanded;
+            }
+        }
         self.notice = Some(format!(
-            "tool blocks default to {}",
+            "tool blocks {}",
             if self.tools_expanded {
                 "expanded"
             } else {
@@ -1376,16 +1388,16 @@ mod tests {
     }
 
     #[test]
-    fn visibility_commands_change_new_block_defaults() {
+    fn visibility_commands_change_existing_and_new_blocks() {
         let mut state = UiState::new();
-        state.toggle_thinking_default();
-        state.toggle_tools_default();
-        state.apply(Event::ReasoningDelta("visible".into()));
+        state.apply(Event::ReasoningDelta("existing".into()));
         state.apply(Event::ToolCallDelta {
             index: 0,
             name: Some("read".into()),
             arguments: "{}".into(),
         });
+        state.toggle_thinking_default();
+        state.toggle_tools_default();
 
         assert!(matches!(
             state.blocks[0],
@@ -1395,6 +1407,29 @@ mod tests {
             state.blocks[1],
             ChatBlock::Tool { expanded: true, .. }
         ));
+
+        state.apply(Event::ReasoningDelta("visible".into()));
+        state.apply(Event::ToolCallDelta {
+            index: 1,
+            name: Some("read".into()),
+            arguments: "{}".into(),
+        });
+
+        assert!(matches!(
+            state.blocks[2],
+            ChatBlock::Thinking { expanded: true, .. }
+        ));
+        assert!(matches!(
+            state.blocks[3],
+            ChatBlock::Tool { expanded: true, .. }
+        ));
+
+        state.toggle_thinking_default();
+        state.toggle_tools_default();
+        assert!(state.blocks.iter().all(|block| !matches!(
+            block,
+            ChatBlock::Thinking { expanded: true, .. } | ChatBlock::Tool { expanded: true, .. }
+        )));
     }
 
     #[test]
