@@ -129,6 +129,7 @@ impl Tool for WebSearchTool {
                                 "results": results,
                             }))?,
                             image: None,
+                            diff: None,
                         });
                     }
                     errors.push(format!("{} returned no organic results", provider.name()));

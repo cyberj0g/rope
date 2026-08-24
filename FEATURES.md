@@ -26,6 +26,7 @@
 - preserved visible transcripts with persisted `Context compacted` markers
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
+- persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes
 - browser-backed `web_search` using DuckDuckGo with Bing fallback, Chromium-family browser discovery, and a `ROPE_BROWSER` override
 - text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links and no model-controlled truncation
 - automatic post-consumption `web_browser` result ejection from model context while retaining the full visible and persisted transcript

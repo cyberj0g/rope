@@ -806,6 +806,12 @@ async fn handle_mouse(
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(diff) = chat_diff_hit_test(state, conversation, mouse.column, mouse.row) {
+                state.text_selection = None;
+                state.selection_anchor = None;
+                state.open_fullscreen_tool_diff(diff);
+                return Ok(());
+            }
             let point = chat_point(state, conversation, mouse.column, mouse.row);
             state.selection_anchor = Some(point);
             state.text_selection = Some(TextSelection {
@@ -1042,8 +1048,9 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) -> usize {
 }
 
 fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
-    let lines = if state.project.git_available {
-        diff_lines(&state.project.git_diff)
+    let tool_diff = state.fullscreen_tool_diff.is_some();
+    let lines = if tool_diff || state.project.git_available {
+        diff_lines(state.fullscreen_diff())
     } else {
         vec![Line::styled(
             " not a Git repository",
@@ -1054,18 +1061,18 @@ fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
     frame.render_widget(
         Paragraph::new(lines)
             .scroll((state.git_diff_scroll, 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" git diff · Esc to close "),
-            ),
+            .block(Block::default().borders(Borders::ALL).title(if tool_diff {
+                " tool diff · Esc to close "
+            } else {
+                " git diff · Esc to close "
+            })),
         frame.area(),
     );
 }
 
 fn git_diff_max_scroll(state: &UiState, height: u16) -> u16 {
-    let line_count = if state.project.git_available {
-        state.project.git_diff.lines().count().max(1)
+    let line_count = if state.fullscreen_tool_diff.is_some() || state.project.git_available {
+        state.fullscreen_diff().lines().count().max(1)
     } else {
         1
     };
@@ -1384,12 +1391,14 @@ fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) -> usize {
 struct ChatLayout {
     lines: Vec<Line<'static>>,
     headers: Vec<(usize, u16, u16)>,
+    diff_buttons: Vec<(usize, u16, u16)>,
     offset: u16,
 }
 
 fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
     let mut lines = Vec::new();
     let mut header_lines = Vec::new();
+    let mut diff_header_lines = Vec::new();
     for (index, block) in state.blocks.iter().enumerate() {
         match block {
             ChatBlock::Message {
@@ -1481,6 +1490,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                 name,
                 arguments,
                 output,
+                diff,
                 status,
                 expanded,
                 counter,
@@ -1488,19 +1498,42 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                 ..
             } => {
                 header_lines.push((index, lines.len()));
-                lines.push(section_header(
+                let color = tool_color(*status);
+                let selected = state.selected() == Some(index);
+                let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                if selected {
+                    style = style.bg(Color::DarkGray).fg(Color::White);
+                }
+                let prefix = format!(
+                    "{} Tool: {}",
+                    if *expanded { "▾" } else { "▸" },
+                    if name.is_empty() { "…" } else { name },
+                );
+                let mut header = Line::from(Span::styled(prefix.clone(), style));
+                if diff.is_some() {
+                    let start = prefix.chars().count() as u16 + 1;
+                    diff_header_lines.push((index, lines.len(), start, start + 6));
+                    header.spans.push(Span::raw(" ").style(style));
+                    let button_style = if selected {
+                        style.add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    };
+                    header.spans.push(Span::styled("[diff]", button_style));
+                }
+                header.spans.push(Span::styled(
                     format!(
-                        "{} Tool: {}{} · {} · {}{}",
-                        if *expanded { "▾" } else { "▸" },
-                        if name.is_empty() { "…" } else { name },
+                        "{} · {} · {}{}",
                         argument_summary(arguments),
                         tool_status(*status),
                         counter.label(),
                         elapsed_label(elapsed.value()),
                     ),
-                    tool_color(*status),
-                    state.selected() == Some(index),
+                    style,
                 ));
+                lines.push(header);
                 if *expanded {
                     lines.push(Line::styled(
                         " arguments",
@@ -1553,12 +1586,20 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
             (block, row, end.saturating_sub(row).max(1))
         })
         .collect();
+    let diff_buttons = diff_header_lines
+        .into_iter()
+        .flat_map(|(block, line, start, end)| {
+            let row = starts[line];
+            (start..end).map(move |column| (block, row + column / width, column % width))
+        })
+        .collect();
     if let Some(selection) = state.text_selection {
         highlight_selection(&mut lines, selection);
     }
     ChatLayout {
         lines,
         headers,
+        diff_buttons,
         offset,
     }
 }
@@ -1673,6 +1714,30 @@ fn chat_hit_test(state: &UiState, area: Rect, screen_row: u16) -> Option<usize> 
         .headers
         .into_iter()
         .find_map(|(block, start, height)| (row >= start && row < start + height).then_some(block))
+}
+
+fn chat_diff_hit_test(
+    state: &UiState,
+    area: Rect,
+    screen_column: u16,
+    screen_row: u16,
+) -> Option<String> {
+    let layout = chat_layout(state, area);
+    let row = layout.offset + screen_row.saturating_sub(area.y);
+    let column = screen_column.saturating_sub(area.x + 1);
+    let block =
+        layout
+            .diff_buttons
+            .into_iter()
+            .find_map(|(block, button_row, button_column)| {
+                (row == button_row && column == button_column).then_some(block)
+            })?;
+    match &state.blocks[block] {
+        ChatBlock::Tool {
+            diff: Some(diff), ..
+        } => Some(diff.clone()),
+        _ => None,
+    }
 }
 
 fn ensure_selected_visible(state: &mut UiState, area: Rect) {
@@ -2323,6 +2388,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_diff_button_uses_the_persisted_call_diff() {
+        let expected = "--- a/file.txt\n+++ b/file.txt\n-old\n+new\n";
+        let mut state = UiState::new();
+        state.apply(Event::History(vec![
+            crate::runtime::Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![crate::runtime::ToolCall {
+                    id: "write-1".into(),
+                    name: "write".into(),
+                    arguments: serde_json::json!({ "path": "file.txt" }),
+                }],
+            ),
+            crate::runtime::Message::tool(
+                "write-1".into(),
+                "wrote file.txt".into(),
+                None,
+                Some(expected.into()),
+            ),
+        ]));
+        let area = Rect::new(2, 3, 80, 12);
+        let layout = chat_layout(&state, area);
+        assert!(layout.lines[0].to_string().contains("[diff]"));
+        let (_, row, column) = layout.diff_buttons[0];
+        let diff = chat_diff_hit_test(
+            &state,
+            area,
+            area.x + 1 + column,
+            area.y + row - layout.offset,
+        )
+        .unwrap();
+
+        assert_eq!(diff, expected);
+        state.open_fullscreen_tool_diff(diff);
+        assert_eq!(state.fullscreen_diff(), expected);
+    }
+
+    #[test]
     fn update_plan_tool_calls_are_rendered_in_chat() {
         let mut state = UiState::new();
         state.apply(Event::ToolCallDelta {
@@ -2700,6 +2804,7 @@ mod tests {
             call_id: "call-1".into(),
             output: "done".into(),
             success: true,
+            diff: None,
         });
         assert_eq!(app_status(&state), ("generating", Color::Green));
 

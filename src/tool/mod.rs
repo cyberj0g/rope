@@ -53,6 +53,8 @@ pub struct ToolResult {
     pub output: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

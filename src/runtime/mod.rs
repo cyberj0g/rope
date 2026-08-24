@@ -120,6 +120,7 @@ pub enum Event {
         call_id: String,
         output: String,
         success: bool,
+        diff: Option<String>,
     },
     Retrying {
         seconds: u64,
@@ -432,6 +433,7 @@ fn request_context(messages: &[Message], session: &Session) -> Vec<Message> {
     };
     eject_consumed_web_results(&mut context);
     compact_plan_history(&mut context);
+    strip_tool_diffs(&mut context);
     context
 }
 
@@ -474,6 +476,16 @@ fn compact_plan_history(messages: &mut [Message]) -> usize {
         }
     }
     compacted
+}
+
+fn strip_tool_diffs(messages: &mut [Message]) -> usize {
+    messages
+        .iter_mut()
+        .filter_map(|message| match message {
+            Message::Tool { diff, .. } => diff.take(),
+            _ => None,
+        })
+        .count()
 }
 
 fn is_compaction_marker(message: &Message) -> bool {
@@ -795,6 +807,7 @@ async fn agent<P: Provider>(
             .await
             .ok();
         let mut request_messages = messages.clone();
+        strip_tool_diffs(&mut request_messages);
         apply_plan_context(&mut request_messages, current_plan.as_ref());
         if let Some(prompt) = &project_prompt {
             request_messages.insert(0, Message::system(prompt.clone()));
@@ -854,15 +867,16 @@ async fn agent<P: Provider>(
             } else {
                 bail_tool_denied(&call.name)
             };
-            let (output, image, success) = match result {
-                Ok(result) => (result.output, result.image, true),
-                Err(error) => (format!("Error: {error:#}"), None, false),
+            let (output, image, diff, success) = match result {
+                Ok(result) => (result.output, result.image, result.diff, true),
+                Err(error) => (format!("Error: {error:#}"), None, None, false),
             };
             events
                 .send(Event::ToolResult {
                     call_id: call.id.clone(),
                     output: output.clone(),
                     success,
+                    diff: diff.clone(),
                 })
                 .await
                 .ok();
@@ -872,7 +886,7 @@ async fn agent<P: Provider>(
                 current_plan = Some(plan.clone());
                 internal.send(InternalEvent::PlanUpdated(plan)).await?;
             }
-            messages.push(Message::tool(call.id, output, image));
+            messages.push(Message::tool(call.id, output, image, diff));
         }
     }
     bail!("tool loop exceeded 32 model turns")
@@ -1030,6 +1044,7 @@ mod tests {
             Ok(ToolResult {
                 output: args["value"].as_str().unwrap().to_owned(),
                 image: None,
+                diff: None,
             })
         }
     }
@@ -1199,7 +1214,7 @@ mod tests {
                     arguments: serde_json::json!({ "url": "https://example.com/docs" }),
                 }],
             ),
-            Message::tool("browser-1".into(), output, None),
+            Message::tool("browser-1".into(), output, None, None),
             Message::assistant(
                 "I used the documentation.".into(),
                 "model".into(),
@@ -1227,6 +1242,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_diffs_stay_in_history_but_not_model_context() {
+        let transcript = vec![Message::tool(
+            "write-1".into(),
+            "wrote file.txt".into(),
+            None,
+            Some("large diff ".repeat(1_000)),
+        )];
+        let mut context = transcript.clone();
+
+        assert_eq!(strip_tool_diffs(&mut context), 1);
+        assert!(matches!(
+            &transcript[0],
+            Message::Tool { diff: Some(diff), .. } if diff.starts_with("large diff")
+        ));
+        assert!(matches!(&context[0], Message::Tool { diff: None, .. }));
+        assert!(estimate_tokens(&context) < estimate_tokens(&transcript) / 10);
+    }
+
+    #[test]
     fn model_context_contains_only_the_latest_full_plan() {
         let old_plan = serde_json::json!({
             "plan": [{ "step": "obsolete step", "status": "in_progress" }]
@@ -1242,7 +1276,7 @@ mod tests {
                     arguments: old_plan.clone(),
                 }],
             ),
-            Message::tool("plan-1".into(), old_plan.to_string(), None),
+            Message::tool("plan-1".into(), old_plan.to_string(), None, None),
         ];
         let current = ExecutionPlan {
             explanation: Some("revised".into()),
@@ -1290,6 +1324,7 @@ mod tests {
                 })
                 .to_string(),
                 None,
+                None,
             ),
             Message::assistant(
                 String::new(),
@@ -1301,7 +1336,7 @@ mod tests {
                     arguments: serde_json::json!({}),
                 }],
             ),
-            Message::tool("next-1".into(), "file".into(), None),
+            Message::tool("next-1".into(), "file".into(), None, None),
         ];
 
         assert_eq!(eject_consumed_web_results(&mut context), 0);

@@ -116,6 +116,7 @@ pub enum ChatBlock {
         name: String,
         arguments: String,
         output: Option<String>,
+        diff: Option<String>,
         status: ToolStatus,
         expanded: bool,
         counter: ToolCounter,
@@ -149,6 +150,7 @@ pub struct UiState {
     pub git_split_dragging: bool,
     pub git_diff_mode: bool,
     pub git_fullscreen_diff: bool,
+    pub fullscreen_tool_diff: Option<String>,
     pub git_status_scroll: u16,
     pub git_panel_diff_scroll: u16,
     pub git_diff_scroll: u16,
@@ -234,6 +236,7 @@ impl UiState {
             git_split_dragging: false,
             git_diff_mode: false,
             git_fullscreen_diff: false,
+            fullscreen_tool_diff: None,
             git_status_scroll: 0,
             git_panel_diff_scroll: 0,
             git_diff_scroll: 0,
@@ -654,13 +657,27 @@ impl UiState {
     pub fn open_fullscreen_git_diff(&mut self) {
         self.git_fullscreen_diff = true;
         self.git_diff_scroll = 0;
+        self.fullscreen_tool_diff = None;
         self.project.git_diff_path = None;
         self.project.git_diff.clear();
+    }
+
+    pub fn open_fullscreen_tool_diff(&mut self, diff: String) {
+        self.git_fullscreen_diff = true;
+        self.git_diff_scroll = 0;
+        self.fullscreen_tool_diff = Some(diff);
     }
 
     pub fn close_fullscreen_git_diff(&mut self) {
         self.git_fullscreen_diff = false;
         self.git_diff_scroll = 0;
+        self.fullscreen_tool_diff = None;
+    }
+
+    pub fn fullscreen_diff(&self) -> &str {
+        self.fullscreen_tool_diff
+            .as_deref()
+            .unwrap_or(&self.project.git_diff)
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>) {
@@ -868,6 +885,7 @@ impl UiState {
                             name: String::new(),
                             arguments: String::new(),
                             output: None,
+                            diff: None,
                             status: ToolStatus::Streaming,
                             expanded: self.tools_expanded,
                             counter: ToolCounter::default(),
@@ -923,11 +941,13 @@ impl UiState {
                 call_id,
                 output,
                 success,
+                diff,
             } => {
                 self.tool_running = false;
                 if let Some(block) = self.tool_calls.get(&call_id).copied()
                     && let ChatBlock::Tool {
                         output: block_output,
+                        diff: block_diff,
                         status,
                         counter,
                         elapsed,
@@ -937,6 +957,7 @@ impl UiState {
                     counter.push(&output);
                     elapsed.finish();
                     *block_output = Some(output);
+                    *block_diff = diff;
                     *status = if success {
                         ToolStatus::Done
                     } else {
@@ -1067,6 +1088,7 @@ impl UiState {
                             arguments: serde_json::to_string_pretty(&call.arguments)
                                 .unwrap_or_default(),
                             output: None,
+                            diff: None,
                             status: ToolStatus::Pending,
                             expanded: self.tools_expanded,
                             counter,
@@ -1076,11 +1098,15 @@ impl UiState {
                     }
                 }
                 Message::Tool {
-                    call_id, content, ..
+                    call_id,
+                    content,
+                    diff,
+                    ..
                 } => {
                     if let Some(block) = self.tool_calls.get(&call_id).copied()
                         && let ChatBlock::Tool {
                             output,
+                            diff: block_diff,
                             status,
                             counter,
                             ..
@@ -1093,6 +1119,7 @@ impl UiState {
                         };
                         counter.push(&content);
                         *output = Some(content);
+                        *block_diff = diff;
                     }
                 }
             }
@@ -1307,6 +1334,7 @@ mod tests {
             call_id: "call_1".into(),
             output: "contents".into(),
             success: true,
+            diff: None,
         });
 
         assert_eq!(state.blocks.len(), 1);

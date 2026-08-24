@@ -43,6 +43,8 @@ pub enum Message {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<ImageContent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
     },
 }
 
@@ -80,11 +82,17 @@ impl Message {
             tool_calls,
         }
     }
-    pub fn tool(call_id: String, content: String, image: Option<ImageContent>) -> Self {
+    pub fn tool(
+        call_id: String,
+        content: String,
+        image: Option<ImageContent>,
+        diff: Option<String>,
+    ) -> Self {
         Self::Tool {
             call_id,
             content,
             image,
+            diff,
         }
     }
 

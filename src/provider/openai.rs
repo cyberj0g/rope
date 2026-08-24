@@ -185,6 +185,7 @@ impl From<Message> for WireMessage {
                 call_id,
                 content,
                 image,
+                diff: _,
             } => Self {
                 role: "tool",
                 content: Some(match image {
@@ -356,6 +357,7 @@ mod tests {
                 width: 1,
                 height: 1,
             }),
+            None,
         ));
         let value = serde_json::to_value(message).unwrap();
 
