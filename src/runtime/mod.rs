@@ -702,7 +702,7 @@ async fn generate_session_title<P: Provider>(
         ],
         temperature: Some(0.0),
         reasoning_effort: None,
-        max_tokens: Some(256),
+        max_tokens: Some(3_072),
         stream: true,
         tools: Vec::new(),
     };
@@ -1382,7 +1382,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
         let title = generate_session_title(
-            provider,
+            provider.clone(),
             &Config::default(),
             &[
                 Message::user("make the Git pane scroll".into()),
@@ -1399,6 +1399,7 @@ mod tests {
         .await;
 
         assert_eq!(title, "Git Pane Scrolling");
+        assert_eq!(provider.requests()[0].max_tokens, Some(3_072));
         assert!(matches!(
             event_rx.recv().await,
             Some(Event::ModelRequestStarted(_))
