@@ -34,6 +34,7 @@ use tokio::sync::mpsc;
 use crate::{
     config::Config,
     runtime::{Command, Event, ImageContent, UserPrompt},
+    tool::PlanStatus,
 };
 use history::PromptHistory;
 use state::{ChatBlock, MessageKind, TextPoint, TextSelection, ToolStatus, UiState};
@@ -44,6 +45,27 @@ struct SlashCommand {
     title: &'static str,
     hotkey: &'static str,
     argument: bool,
+}
+
+enum LoadedInput {
+    Image(ImageContent),
+    Text(String),
+}
+
+struct InputLoad {
+    id: u64,
+    action: &'static str,
+    result: Result<LoadedInput>,
+}
+
+#[derive(Clone, Copy)]
+struct MouseAreas {
+    body: Rect,
+    conversation: Rect,
+    side: Option<Rect>,
+    git: Option<Rect>,
+    plan: Option<Rect>,
+    input: Rect,
 }
 
 const COMMANDS: &[SlashCommand] = &[
@@ -107,7 +129,18 @@ const COMMANDS: &[SlashCommand] = &[
         hotkey: "Alt+O",
         argument: false,
     },
+    SlashCommand {
+        name: "/plan",
+        title: "Toggle plan pane",
+        hotkey: "—",
+        argument: false,
+    },
 ];
+
+const MIN_CHAT_WIDTH: u16 = 40;
+const MIN_GIT_WIDTH: u16 = 24;
+const MIN_SIDE_PANE_HEIGHT: u16 = 4;
+const STATUS_WIDTH: usize = "connecting".len();
 
 pub async fn run(
     config: Config,
@@ -117,6 +150,7 @@ pub async fn run(
     let mut history = PromptHistory::load().await?;
     let mut terminal = TerminalGuard::new()?;
     let mut state = UiState::new();
+    let (input_load_tx, mut input_load_rx) = mpsc::unbounded_channel();
     loop {
         let size = terminal.terminal.size()?;
         state.expire_toast();
@@ -125,18 +159,35 @@ pub async fn run(
                 .git_diff_scroll
                 .min(git_diff_max_scroll(&state, size.height));
         }
-        let chat = conversation_area(Rect::new(0, 0, size.width, size.height), &state);
+        let page = Rect::new(0, 0, size.width, size.height);
+        let body = page_areas(page, &state)[1];
+        let (git, plan) = side_areas(body, &state);
+        if let Some(area) = git {
+            state.git_status_scroll = state
+                .git_status_scroll
+                .min(git_status_max_scroll(&state, area.height));
+            state.git_panel_diff_scroll = state
+                .git_panel_diff_scroll
+                .min(git_panel_diff_max_scroll(&state, area.height));
+        }
+        if let Some(area) = plan {
+            state.plan_scroll = state.plan_scroll.min(plan_max_scroll(&state, area.height));
+        }
+        let chat = conversation_area(page, &state);
         ensure_selected_visible(&mut state, chat);
         terminal
             .terminal
             .draw(|frame| draw(frame, &config, &state))?;
         tokio::select! {
             event = events.recv() => if let Some(event) = event { state.apply(event); },
+            load = input_load_rx.recv() => if let Some(load) = load {
+                apply_input_load(load, &config, &mut state);
+            },
             _ = tokio::time::sleep(Duration::from_millis(25)) => {
                 while event::poll(Duration::ZERO)? {
                     match event::read()? {
                         TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                            if handle_key(key, size.height, &config, &mut state, &mut history, &commands).await? {
+                            if handle_key(key, size.height, &config, &mut state, &mut history, &commands, &input_load_tx).await? {
                                 commands.send(Command::Shutdown).await.ok(); return Ok(());
                             }
                         }
@@ -145,8 +196,21 @@ pub async fn run(
                             let page = Rect::new(0, 0, size.width, size.height);
                             let [_, body, input] = page_areas(page, &state);
                             let area = conversation_area(page, &state);
-                            let git = git_area(body, &state);
-                            handle_mouse(mouse, &mut state, area, git, input, &commands).await?;
+                            let side = git_split(body, &state).1;
+                            let (git, plan) = side_areas(body, &state);
+                            handle_mouse(
+                                mouse,
+                                &mut state,
+                                MouseAreas {
+                                    body,
+                                    conversation: area,
+                                    side,
+                                    git,
+                                    plan,
+                                    input,
+                                },
+                                &commands,
+                            ).await?;
                         }
                         TerminalEvent::Paste(text) => {
                             history.reset_navigation();
@@ -169,6 +233,7 @@ async fn handle_key(
     state: &mut UiState,
     history: &mut PromptHistory,
     commands: &mpsc::Sender<Command>,
+    input_loads: &mpsc::UnboundedSender<InputLoad>,
 ) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
@@ -211,7 +276,16 @@ async fn handle_key(
         return Ok(false);
     }
     if let Some(command) = hotkey_command(key) {
-        dispatch(command.into(), Vec::new(), config, state, history, commands).await?;
+        dispatch(
+            command.into(),
+            Vec::new(),
+            config,
+            state,
+            history,
+            commands,
+            input_loads,
+        )
+        .await?;
         return Ok(false);
     }
     if state.conversation_focused() {
@@ -257,6 +331,7 @@ async fn handle_key(
                         state,
                         history,
                         commands,
+                        input_loads,
                     )
                     .await?;
                 }
@@ -274,6 +349,7 @@ async fn handle_key(
                     state,
                     history,
                     commands,
+                    input_loads,
                 )
                 .await?;
             }
@@ -287,11 +363,24 @@ async fn handle_key(
             if !model_supports_vision(config, state) {
                 state.set_error("the current model does not support image input");
             } else {
-                match clipboard_image() {
-                    Ok(image) => state.insert_image(image),
-                    Err(error) => state.set_error(format!("paste image: {error:#}")),
-                }
+                queue_input_load(
+                    state,
+                    input_loads,
+                    "Processing image",
+                    "paste image",
+                    || clipboard_image().map(LoadedInput::Image),
+                );
             }
+        }
+        KeyCode::Insert if is_shift_insert(key) => {
+            history.reset_navigation();
+            queue_input_load(
+                state,
+                input_loads,
+                "Reading clipboard",
+                "paste clipboard",
+                clipboard_content,
+            );
         }
         KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             history.reset_navigation();
@@ -342,6 +431,7 @@ async fn dispatch(
     state: &mut UiState,
     history: &mut PromptHistory,
     commands: &mpsc::Sender<Command>,
+    input_loads: &mpsc::UnboundedSender<InputLoad>,
 ) -> Result<()> {
     if !images.is_empty() {
         submit(input, images, state, history, commands).await?;
@@ -374,16 +464,21 @@ async fn dispatch(
             if !model_supports_vision(config, state) {
                 state.set_error("the current model does not support image input");
             } else {
-                match image_from_path(Path::new(argument.trim())).await {
-                    Ok(image) => state.insert_image(image),
-                    Err(error) => state.set_error(format!("attach image: {error:#}")),
-                }
+                let path = Path::new(argument.trim()).to_owned();
+                queue_input_load(
+                    state,
+                    input_loads,
+                    "Processing image",
+                    "attach image",
+                    move || image_from_path(&path).map(LoadedInput::Image),
+                );
             }
         }
         "/model" if argument.is_empty() => commands.send(Command::NextModel).await?,
         "/reason" if argument.is_empty() => commands.send(Command::NextReasoningEffort).await?,
         "/thinking" if argument.is_empty() => state.toggle_thinking_default(),
         "/tools" if argument.is_empty() => state.toggle_tools_default(),
+        "/plan" if argument.is_empty() => state.toggle_plan_panel(),
         "/diff" if argument.is_empty() => {
             state.open_fullscreen_git_diff();
             commands.send(Command::GitDiff(None)).await?;
@@ -435,10 +530,22 @@ fn clipboard_image() -> Result<ImageContent> {
     encode_image(image.width as u32, image.height as u32, &image.bytes)
 }
 
-async fn image_from_path(path: &Path) -> Result<ImageContent> {
-    let bytes = tokio::fs::read(path)
-        .await
-        .with_context(|| format!("read {}", path.display()))?;
+fn clipboard_content() -> Result<LoadedInput> {
+    let mut clipboard = arboard::Clipboard::new().context("open clipboard")?;
+    match clipboard.get_text() {
+        Ok(text) => Ok(LoadedInput::Text(text)),
+        Err(text_error) => {
+            let image = clipboard
+                .get_image()
+                .with_context(|| format!("clipboard has no text ({text_error}) or image"))?;
+            encode_image(image.width as u32, image.height as u32, &image.bytes)
+                .map(LoadedInput::Image)
+        }
+    }
+}
+
+fn image_from_path(path: &Path) -> Result<ImageContent> {
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let decoded = image::load_from_memory(&bytes)
         .with_context(|| format!("decode {}", path.display()))?
         .into_rgba8();
@@ -462,14 +569,60 @@ fn encode_image(width: u32, height: u32, rgba: &[u8]) -> Result<ImageContent> {
     })
 }
 
+fn queue_input_load(
+    state: &mut UiState,
+    input_loads: &mpsc::UnboundedSender<InputLoad>,
+    label: &str,
+    action: &'static str,
+    load: impl FnOnce() -> Result<LoadedInput> + Send + 'static,
+) {
+    let id = state.begin_image_load(label);
+    let input_loads = input_loads.clone();
+    tokio::task::spawn_blocking(move || {
+        input_loads.send(InputLoad {
+            id,
+            action,
+            result: load(),
+        })
+    });
+}
+
+fn apply_input_load(load: InputLoad, config: &Config, state: &mut UiState) {
+    match load.result {
+        Ok(LoadedInput::Image(_)) if !model_supports_vision(config, state) => {
+            if state.fail_image_load(load.id) {
+                state.set_error("the current model does not support image input");
+            }
+        }
+        Ok(LoadedInput::Image(image)) => {
+            state.finish_image_load(load.id, image);
+        }
+        Ok(LoadedInput::Text(text)) => {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            state.replace_image_load_with_paste(load.id, &text, config.paste_collapse_chars);
+        }
+        Err(error) => {
+            if state.fail_image_load(load.id) {
+                state.set_error(format!("{}: {error:#}", load.action));
+            }
+        }
+    }
+}
+
 async fn handle_mouse(
     mouse: MouseEvent,
     state: &mut UiState,
-    conversation: Rect,
-    git: Option<Rect>,
-    input: Rect,
+    areas: MouseAreas,
     commands: &mpsc::Sender<Command>,
 ) -> Result<()> {
+    let MouseAreas {
+        body,
+        conversation,
+        side,
+        git,
+        plan,
+        input,
+    } = areas;
     if state.git_fullscreen_diff {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -483,6 +636,54 @@ async fn handle_mouse(
             }
             _ => {}
         }
+        return Ok(());
+    }
+    if state.git_split_dragging {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                resize_git_panel(state, body, mouse.column);
+                return Ok(());
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                resize_git_panel(state, body, mouse.column);
+                state.git_split_dragging = false;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    if state.plan_split_dragging {
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(side) = side {
+                    resize_plan_panel(state, side, mouse.row);
+                }
+                return Ok(());
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(side) = side {
+                    resize_plan_panel(state, side, mouse.row);
+                }
+                state.plan_split_dragging = false;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    if let Some(area) = side
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && (mouse.column == area.x || mouse.column.saturating_add(1) == area.x)
+        && (body.y..body.bottom()).contains(&mouse.row)
+    {
+        state.git_split_dragging = true;
+        return Ok(());
+    }
+    if let (Some(side), Some(plan)) = (side, plan)
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && (mouse.row == plan.y || mouse.row.saturating_add(1) == plan.y)
+        && (side.x..side.right()).contains(&mouse.column)
+    {
+        state.plan_split_dragging = true;
         return Ok(());
     }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && mouse.row == input.y {
@@ -502,19 +703,63 @@ async fn handle_mouse(
     }
     if let Some(area) = git
         && area.contains((mouse.column, mouse.row).into())
-        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
     {
-        let row = mouse.row.saturating_sub(area.y + 1) as usize;
-        if state.git_diff_mode {
-            if row == 0 {
-                state.git_diff_mode = false;
-                commands.send(Command::RefreshProject).await?;
+        match mouse.kind {
+            MouseEventKind::ScrollUp if !state.git_diff_mode => {
+                state.git_status_scroll = state.git_status_scroll.saturating_sub(3);
             }
-        } else if let Some(file) = state.project.git_files.get(row) {
-            state.git_diff_mode = true;
-            commands
-                .send(Command::GitDiff(Some(file.path.clone())))
-                .await?;
+            MouseEventKind::ScrollDown if !state.git_diff_mode => {
+                state.git_status_scroll = state
+                    .git_status_scroll
+                    .saturating_add(3)
+                    .min(git_status_max_scroll(state, area.height));
+            }
+            MouseEventKind::ScrollUp if state.git_diff_mode => {
+                state.git_panel_diff_scroll = state.git_panel_diff_scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown if state.git_diff_mode => {
+                state.git_panel_diff_scroll = state
+                    .git_panel_diff_scroll
+                    .saturating_add(3)
+                    .min(git_panel_diff_max_scroll(state, area.height));
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let row = mouse.row.saturating_sub(area.y + 1) as usize;
+                if state.git_diff_mode {
+                    if row == 0 {
+                        state.git_diff_mode = false;
+                        state.git_panel_diff_scroll = 0;
+                        commands.send(Command::RefreshProject).await?;
+                    }
+                } else {
+                    let row = row + state.git_status_scroll as usize;
+                    if let Some(file) = state.project.git_files.get(row) {
+                        state.git_diff_mode = true;
+                        state.git_panel_diff_scroll = 0;
+                        commands
+                            .send(Command::GitDiff(Some(file.path.clone())))
+                            .await?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if let Some(area) = plan
+        && area.contains((mouse.column, mouse.row).into())
+    {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                state.plan_scroll = state.plan_scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollDown => {
+                state.plan_scroll = state
+                    .plan_scroll
+                    .saturating_add(3)
+                    .min(plan_max_scroll(state, area.height));
+            }
+            _ => {}
         }
         return Ok(());
     }
@@ -605,19 +850,75 @@ fn conversation_area(area: Rect, state: &UiState) -> Rect {
     git_split(body, state).0
 }
 
-fn git_area(body: Rect, state: &UiState) -> Option<Rect> {
-    git_split(body, state).1
+fn side_areas(body: Rect, state: &UiState) -> (Option<Rect>, Option<Rect>) {
+    let Some(side) = git_split(body, state).1 else {
+        return (None, None);
+    };
+    let (git, plan) = side_split(side, state);
+    (Some(git), plan)
 }
 
 fn git_split(body: Rect, state: &UiState) -> (Rect, Option<Rect>) {
     if state.git_fullscreen_diff || !state.git_panel || body.width < 100 {
         return (body, None);
     }
+    let default_width = body.width.saturating_mul(30) / 100;
+    let max_width = body.width.saturating_sub(MIN_CHAT_WIDTH);
+    let width = state
+        .git_panel_width
+        .unwrap_or(default_width)
+        .clamp(MIN_GIT_WIDTH, max_width);
     let areas = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([Constraint::Min(MIN_CHAT_WIDTH), Constraint::Length(width)])
         .split(body);
     (areas[0], Some(areas[1]))
+}
+
+fn side_split(side: Rect, state: &UiState) -> (Rect, Option<Rect>) {
+    if !state.plan_panel || side.height < MIN_SIDE_PANE_HEIGHT * 2 {
+        return (side, None);
+    }
+    let default_height = side.height / 2;
+    let max_height = side.height.saturating_sub(MIN_SIDE_PANE_HEIGHT);
+    let height = state
+        .plan_panel_height
+        .unwrap_or(default_height)
+        .clamp(MIN_SIDE_PANE_HEIGHT, max_height);
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(MIN_SIDE_PANE_HEIGHT),
+            Constraint::Length(height),
+        ])
+        .split(side);
+    (areas[0], Some(areas[1]))
+}
+
+fn resize_git_panel(state: &mut UiState, body: Rect, column: u16) {
+    if body.width < MIN_CHAT_WIDTH + MIN_GIT_WIDTH {
+        state.git_split_dragging = false;
+        return;
+    }
+    let max_width = body.width.saturating_sub(MIN_CHAT_WIDTH);
+    let width = body
+        .right()
+        .saturating_sub(column)
+        .clamp(MIN_GIT_WIDTH, max_width);
+    state.git_panel_width = Some(width);
+}
+
+fn resize_plan_panel(state: &mut UiState, side: Rect, row: u16) {
+    if side.height < MIN_SIDE_PANE_HEIGHT * 2 {
+        state.plan_split_dragging = false;
+        return;
+    }
+    let max_height = side.height.saturating_sub(MIN_SIDE_PANE_HEIGHT);
+    let height = side
+        .bottom()
+        .saturating_sub(row)
+        .clamp(MIN_SIDE_PANE_HEIGHT, max_height);
+    state.plan_panel_height = Some(height);
 }
 
 fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
@@ -640,7 +941,10 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
-            Span::styled(status, Style::default().fg(status_color)),
+            Span::styled(
+                format!("{status:<STATUS_WIDTH$}"),
+                Style::default().fg(status_color),
+            ),
             Span::raw(format!(
                 "  {}  tokens:{}  context:{context_percent}%  ${price:.2}  {}",
                 state.session,
@@ -652,10 +956,14 @@ fn draw(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
         header,
     );
 
-    let (chat, git) = git_split(body, state);
+    let (chat, side) = git_split(body, state);
     draw_chat(frame, state, chat);
-    if let Some(area) = git {
-        draw_git(frame, state, area);
+    if let Some(side) = side {
+        let (git, plan) = side_split(side, state);
+        draw_git(frame, state, git);
+        if let Some(plan) = plan {
+            draw_plan(frame, state, plan);
+        }
     }
 
     let mut title = vec![
@@ -726,6 +1034,49 @@ fn git_diff_max_scroll(state: &UiState, height: u16) -> u16 {
     line_count.saturating_sub(visible).min(u16::MAX as usize) as u16
 }
 
+fn git_status_max_scroll(state: &UiState, height: u16) -> u16 {
+    let visible = height.saturating_sub(2).max(1) as usize;
+    state
+        .project
+        .git_files
+        .len()
+        .saturating_sub(visible)
+        .min(u16::MAX as usize) as u16
+}
+
+fn git_status_title(state: &UiState, height: u16) -> String {
+    let total = state.project.git_files.len().max(1);
+    let visible = height.saturating_sub(2).max(1) as usize;
+    let offset = (state.git_status_scroll as usize).min(total.saturating_sub(visible));
+    let end = (offset + visible).min(total);
+    format!(" git status · {}-{end}/{total} ", offset + 1)
+}
+
+fn git_panel_diff_max_scroll(state: &UiState, height: u16) -> u16 {
+    let visible = height.saturating_sub(3).max(1) as usize;
+    state
+        .project
+        .git_diff
+        .lines()
+        .count()
+        .max(1)
+        .saturating_sub(visible)
+        .min(u16::MAX as usize) as u16
+}
+
+fn git_panel_diff_title(state: &UiState, height: u16) -> String {
+    let total = state.project.git_diff.lines().count().max(1);
+    let visible = height.saturating_sub(3).max(1) as usize;
+    let offset = (state.git_panel_diff_scroll as usize).min(total.saturating_sub(visible));
+    let end = (offset + visible).min(total);
+    let path = state
+        .project
+        .git_diff_path
+        .as_ref()
+        .map_or_else(|| "git diff".into(), |path| path.display().to_string());
+    format!(" {}-{end}/{total} · {path} ", offset + 1)
+}
+
 fn draw_toast(frame: &mut ratatui::Frame, state: &UiState) {
     let Some(message) = state.toast() else {
         return;
@@ -776,6 +1127,10 @@ fn hotkey_command(key: KeyEvent) -> Option<&'static str> {
     }
 }
 
+fn is_shift_insert(key: KeyEvent) -> bool {
+    key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
 fn draw_command_palette(frame: &mut ratatui::Frame, state: &UiState, input: Rect) {
     let Some(commands) = palette_commands(&state.input) else {
         return;
@@ -809,25 +1164,43 @@ fn draw_command_palette(frame: &mut ratatui::Frame, state: &UiState, input: Rect
 }
 
 fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
-    let (title, lines) = if !state.project.git_available {
+    if state.git_diff_mode {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(git_panel_diff_title(state, area.height));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                " ← git status",
+                Style::default().fg(Color::Cyan),
+            )),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        if inner.height > 1 {
+            frame.render_widget(
+                Paragraph::new(diff_lines(&state.project.git_diff))
+                    .scroll((state.git_panel_diff_scroll, 0))
+                    .wrap(Wrap { trim: false }),
+                Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1),
+            );
+        }
+        return;
+    }
+
+    let (title, lines, scroll, wrap) = if !state.project.git_available {
         (
             " git ".to_owned(),
             vec![Line::styled(
                 " not a Git repository",
                 Style::default().fg(Color::DarkGray),
             )],
+            0,
+            true,
         )
-    } else if state.git_diff_mode {
-        let mut lines = vec![Line::styled(
-            " ← git status",
-            Style::default().fg(Color::Cyan),
-        )];
-        lines.extend(diff_lines(&state.project.git_diff));
-        let title = state.project.git_diff_path.as_ref().map_or_else(
-            || " git diff ".into(),
-            |path| format!(" {} ", path.display()),
-        );
-        (title, lines)
     } else {
         let lines = if state.project.git_files.is_empty() {
             vec![Line::styled(
@@ -847,11 +1220,75 @@ fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
                 })
                 .collect()
         };
-        (" git status ".into(), lines)
+        (
+            git_status_title(state, area.height),
+            lines,
+            state.git_status_scroll,
+            false,
+        )
     };
+    let paragraph = Paragraph::new(lines)
+        .scroll((scroll, 0))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    if wrap {
+        frame.render_widget(paragraph.wrap(Wrap { trim: false }), area);
+    } else {
+        frame.render_widget(paragraph, area);
+    }
+}
+
+fn plan_max_scroll(state: &UiState, height: u16) -> u16 {
+    let lines = state.plan.as_ref().map_or(1, |plan| {
+        plan.plan.len() + usize::from(plan.explanation.is_some())
+    });
+    let visible = height.saturating_sub(2).max(1) as usize;
+    lines.saturating_sub(visible).min(u16::MAX as usize) as u16
+}
+
+fn draw_plan(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
+    let (title, lines) = state.plan.as_ref().map_or_else(
+        || {
+            (
+                " plan ".into(),
+                vec![Line::styled(
+                    " no plan yet",
+                    Style::default().fg(Color::DarkGray),
+                )],
+            )
+        },
+        |plan| {
+            let completed = plan
+                .plan
+                .iter()
+                .filter(|step| step.status == PlanStatus::Completed)
+                .count();
+            let mut lines =
+                Vec::with_capacity(plan.plan.len() + usize::from(plan.explanation.is_some()));
+            if let Some(explanation) = &plan.explanation {
+                lines.push(Line::styled(
+                    format!(" {explanation}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.extend(plan.plan.iter().map(|step| {
+                let (marker, style) = match step.status {
+                    PlanStatus::Completed => ("✓", Style::default().fg(Color::DarkGray)),
+                    PlanStatus::InProgress => (
+                        "●",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    PlanStatus::Pending => ("○", Style::default().fg(Color::Gray)),
+                };
+                Line::styled(format!(" {marker} {}", step.step), style)
+            }));
+            (format!(" plan · {completed}/{} ", plan.plan.len()), lines)
+        },
+    );
     frame.render_widget(
         Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
+            .scroll((state.plan_scroll, 0))
             .block(Block::default().borders(Borders::ALL).title(title)),
         area,
     );
@@ -1254,6 +1691,10 @@ fn app_status(state: &UiState) -> (&'static str, Color) {
         ("error", Color::Red)
     } else if state.connecting {
         ("connecting", Color::Yellow)
+    } else if state.waiting {
+        ("waiting", Color::Yellow)
+    } else if state.tool_running {
+        ("tool", Color::Cyan)
     } else if state.generating {
         ("generating", Color::Green)
     } else {
@@ -1840,6 +2281,25 @@ mod tests {
         assert_eq!(chat_hit_test(&state, area, area.y), Some(0));
     }
 
+    #[test]
+    fn update_plan_tool_calls_are_rendered_in_chat() {
+        let mut state = UiState::new();
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("update_plan".into()),
+            arguments: r#"{"plan":[]}"#.into(),
+        });
+
+        let layout = chat_layout(&state, Rect::new(0, 3, 80, 12));
+        let text = layout.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Tool: update_plan"));
+    }
+
     #[tokio::test]
     async fn clicking_a_section_keeps_focus_in_the_composer() {
         let mut state = UiState::new();
@@ -1858,9 +2318,14 @@ mod tests {
         handle_mouse(
             mouse(MouseEventKind::Down(MouseButton::Left)),
             &mut state,
-            area,
-            None,
-            input,
+            MouseAreas {
+                body: area,
+                conversation: area,
+                side: None,
+                git: None,
+                plan: None,
+                input,
+            },
             &commands,
         )
         .await
@@ -1868,9 +2333,14 @@ mod tests {
         handle_mouse(
             mouse(MouseEventKind::Up(MouseButton::Left)),
             &mut state,
-            area,
-            None,
-            input,
+            MouseAreas {
+                body: area,
+                conversation: area,
+                side: None,
+                git: None,
+                plan: None,
+                input,
+            },
             &commands,
         )
         .await
@@ -1884,6 +2354,289 @@ mod tests {
     }
 
     #[test]
+    fn git_status_viewport_reports_and_clamps_position() {
+        let mut state = UiState::new();
+        state.project.git_files = (0..8)
+            .map(|index| crate::project::GitFile {
+                status: " M".into(),
+                path: format!("file-{index}").into(),
+            })
+            .collect();
+
+        state.git_status_scroll = 3;
+        assert_eq!(git_status_max_scroll(&state, 5), 5);
+        assert_eq!(git_status_title(&state, 5), " git status · 4-6/8 ");
+
+        state.git_status_scroll = 20;
+        assert_eq!(git_status_title(&state, 5), " git status · 6-8/8 ");
+    }
+
+    #[test]
+    fn git_panel_diff_viewport_accounts_for_fixed_back_row() {
+        let mut state = UiState::new();
+        state.project.git_diff = (1..=8)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.project.git_diff_path = Some("src/main.rs".into());
+        state.git_panel_diff_scroll = 3;
+
+        assert_eq!(git_panel_diff_max_scroll(&state, 5), 6);
+        assert_eq!(git_panel_diff_title(&state, 5), " 4-5/8 · src/main.rs ");
+    }
+
+    #[tokio::test]
+    async fn git_status_mouse_scroll_preserves_file_hit_testing() {
+        let mut state = UiState::new();
+        state.project.git_available = true;
+        state.project.git_files = (0..8)
+            .map(|index| crate::project::GitFile {
+                status: " M".into(),
+                path: format!("file-{index}").into(),
+            })
+            .collect();
+        let conversation = Rect::new(0, 3, 60, 5);
+        let git = Rect::new(60, 3, 20, 5);
+        let body = Rect::new(0, 3, 80, 5);
+        let input = Rect::new(0, 8, 80, 3);
+        let (commands, mut events) = mpsc::channel(1);
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            column: git.x + 1,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(
+            mouse(MouseEventKind::ScrollDown, git.y + 1),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(git),
+                git: Some(git),
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.git_status_scroll, 3);
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), git.y + 1),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(git),
+                git: Some(git),
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+
+        assert!(state.git_diff_mode);
+        match events.recv().await.unwrap() {
+            Command::GitDiff(Some(path)) => assert_eq!(path, Path::new("file-3")),
+            _ => panic!("expected a file diff command"),
+        }
+
+        state.project.git_diff = (1..=8)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        handle_mouse(
+            mouse(MouseEventKind::ScrollDown, git.y + 2),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(git),
+                git: Some(git),
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.git_panel_diff_scroll, 3);
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), git.y + 1),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(git),
+                git: Some(git),
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        assert!(!state.git_diff_mode);
+        assert_eq!(state.git_panel_diff_scroll, 0);
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            Command::RefreshProject
+        ));
+    }
+
+    #[tokio::test]
+    async fn dragging_git_splitter_changes_panel_width() {
+        let mut state = UiState::new();
+        state.project.git_available = true;
+        let body = Rect::new(0, 3, 120, 20);
+        let (conversation, git) = git_split(body, &state);
+        let git = git.unwrap();
+        let input = Rect::new(0, 23, 120, 3);
+        let (commands, _events) = mpsc::channel(1);
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column,
+            row: body.y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), git.x),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(git),
+                git: Some(git),
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        assert!(state.git_split_dragging);
+
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 70),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(git),
+                git: Some(git),
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.git_panel_width, Some(50));
+
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 70),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(git),
+                git: Some(git),
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        assert!(!state.git_split_dragging);
+        let (conversation, git) = git_split(body, &state);
+        assert_eq!(conversation.width, 70);
+        assert_eq!(git.unwrap().width, 50);
+    }
+
+    #[tokio::test]
+    async fn plan_pane_defaults_to_half_height_and_has_a_draggable_split() {
+        let mut state = UiState::new();
+        state.plan_panel = true;
+        let body = Rect::new(0, 3, 120, 20);
+        let (conversation, side) = git_split(body, &state);
+        let side = side.unwrap();
+        let (git, plan) = side_split(side, &state);
+        let plan = plan.unwrap();
+        assert_eq!(git.height, 10);
+        assert_eq!(plan.height, 10);
+        let input = Rect::new(0, 23, 120, 3);
+        let (commands, _events) = mpsc::channel(1);
+        let mouse = |kind, row| MouseEvent {
+            kind,
+            column: side.x + 2,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), plan.y),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(side),
+                git: Some(git),
+                plan: Some(plan),
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        assert!(state.plan_split_dragging);
+
+        handle_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), side.y + 6),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(side),
+                git: Some(git),
+                plan: Some(plan),
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), side.y + 6),
+            &mut state,
+            MouseAreas {
+                body,
+                conversation,
+                side: Some(side),
+                git: Some(git),
+                plan: Some(plan),
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+
+        assert!(!state.plan_split_dragging);
+        assert_eq!(state.plan_panel_height, Some(14));
+        let (git, plan) = side_split(side, &state);
+        assert_eq!(git.height, 6);
+        assert_eq!(plan.unwrap().height, 14);
+    }
+
+    #[test]
     fn status_uses_phase_colors_and_error_priority() {
         let mut state = UiState::new();
         assert_eq!(app_status(&state), ("idle", Color::DarkGray));
@@ -1891,7 +2644,22 @@ mod tests {
         state.apply(Event::GenerationStarted);
         assert_eq!(app_status(&state), ("connecting", Color::Yellow));
 
+        state.apply(Event::ResponseHeadersReceived);
+        assert_eq!(app_status(&state), ("waiting", Color::Yellow));
+
         state.apply(Event::ResponseStarted);
+        assert_eq!(app_status(&state), ("generating", Color::Green));
+
+        state.apply(Event::ToolStarted {
+            call_id: "call-1".into(),
+        });
+        assert_eq!(app_status(&state), ("tool", Color::Cyan));
+
+        state.apply(Event::ToolResult {
+            call_id: "call-1".into(),
+            output: "done".into(),
+            success: true,
+        });
         assert_eq!(app_status(&state), ("generating", Color::Green));
 
         state.apply(Event::Error("failed".into()));
@@ -2002,6 +2770,57 @@ mod tests {
             ["/thinking", "/tools"]
         );
         assert!(palette_commands("/add ").is_none());
+    }
+
+    #[test]
+    fn shift_insert_is_recognized_as_direct_clipboard_paste() {
+        assert!(is_shift_insert(KeyEvent::new(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_shift_insert(KeyEvent::new(
+            KeyCode::Insert,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[tokio::test]
+    async fn image_processing_does_not_block_composer_updates() {
+        let mut config = Config::default();
+        config.models[0].vision = true;
+        let mut state = UiState::new();
+        state.model = config.models[0].name.clone();
+        let (loads, mut loaded) = mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+
+        queue_input_load(
+            &mut state,
+            &loads,
+            "Processing image",
+            "test image",
+            move || {
+                wait.recv().unwrap();
+                Ok(LoadedInput::Image(ImageContent {
+                    mime_type: "image/png".into(),
+                    data: "aW1hZ2U=".into(),
+                    path: None,
+                    width: 10,
+                    height: 20,
+                }))
+            },
+        );
+
+        assert!(state.image_loading());
+        state.insert_char('x');
+        release.send(()).unwrap();
+        let load = tokio::time::timeout(Duration::from_secs(1), loaded.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        apply_input_load(load, &config, &mut state);
+
+        assert!(!state.image_loading());
+        assert_eq!(state.take_input().unwrap().content, "x");
     }
 
     #[test]

@@ -12,6 +12,7 @@
 ## Sessions
 
 - automatic sessions under `~/.local/share/harness/sessions`
+- persisted 2-3 word model-generated titles for automatically named sessions, created after the first completed response
 - JSONL conversation persistence after completed turns
 - persisted session token totals and configurable per-token cost estimates
 - `--continue [NAME]`, `--session NAME`, `/new [NAME]`, and `/save`
@@ -23,7 +24,11 @@
 - automatic 2/5/10/30-second retry backoff for transient model failures
 - configurable context fill tracking and automatic continuation compaction
 - preserved visible transcripts with persisted `Context compacted` markers
+- model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
+- browser-backed `web_search` using DuckDuckGo with Bing fallback, Chromium-family browser discovery, and a `ROPE_BROWSER` override
+- text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links and no model-controlled truncation
+- automatic post-consumption `web_browser` result ejection from model context while retaining the full visible and persisted transcript
 - multimodal `view_image` tool advertised only by vision-enabled model profiles
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
 - executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`
@@ -45,14 +50,16 @@ External tools receive their function arguments as JSON on stdin and must return
 - collapsible messages plus collapsed-by-default thinking and tool sections
 - live elapsed time on thinking and tool calls with compact duration units
 - one-space conversation content padding with flush section headers
-- color-coded connecting, generating, idle, and error status with compact chat errors
+- fixed-width, color-coded connecting, waiting-for-first-response, generating, tool-running, idle, and error status with compact chat errors
 - separately colored model and reasoning details on the padded input box; session tokens and cost on the status bar
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
 - current directory and compact session identity on the status bar
-- asynchronously refreshed, clickable Git status pane and bounded full-screen `/diff` view
+- asynchronously refreshed Git pane with a mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
+- auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
 - drag-to-copy conversation selection with a non-blocking clipboard toast
 - filtered slash-command palette with keyboard navigation and command hotkeys
-- clipboard and `/image` image attachments for vision-capable models
+- non-blocking clipboard and `/image` image attachments with an elapsed processing plate
+- bracketed paste plus direct Shift+Insert clipboard fallback
 - `/thinking` and `/tools` defaults plus clickable model and reasoning selectors
 - `/add PATH`, `/drop PATH`, and `/diff`

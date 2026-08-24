@@ -8,11 +8,15 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use crate::{config::Startup, runtime::Message};
+use crate::{config::Startup, runtime::Message, tool::ExecutionPlan};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionMeta {
     pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub plan: Option<ExecutionPlan>,
     pub created_at: u64,
     #[serde(default)]
     pub total_tokens: u64,
@@ -70,6 +74,8 @@ impl Session {
             root,
             meta: SessionMeta {
                 name,
+                title: None,
+                plan: None,
                 created_at: now(),
                 total_tokens: 0,
                 context_tokens: 0,
@@ -125,6 +131,18 @@ impl Session {
         )
         .await?;
         Ok(())
+    }
+
+    pub fn display_name(&self) -> &str {
+        self.meta.title.as_deref().unwrap_or(&self.meta.name)
+    }
+
+    pub fn needs_title(&self) -> bool {
+        self.meta.title.is_none() && is_auto_name(&self.meta.name)
+    }
+
+    pub fn set_title(&mut self, title: String) {
+        self.meta.title = Some(title);
     }
 
     fn directory(&self) -> PathBuf {
@@ -220,6 +238,12 @@ fn auto_name() -> String {
     format!("session-{}", now())
 }
 
+fn is_auto_name(name: &str) -> bool {
+    name.strip_prefix("session-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.chars().all(|char| char.is_ascii_digit())
+    })
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -264,6 +288,35 @@ mod tests {
     fn old_session_metadata_defaults_token_usage() {
         let meta: SessionMeta = serde_json::from_str(r#"{"name":"old","created_at":1}"#).unwrap();
         assert_eq!(meta.total_tokens, 0);
+        assert!(meta.title.is_none());
+        assert!(meta.plan.is_none());
+    }
+
+    #[test]
+    fn generated_titles_replace_only_automatic_names_for_display() {
+        let mut session = Session {
+            root: PathBuf::new(),
+            meta: SessionMeta {
+                name: "session-123".into(),
+                title: None,
+                plan: None,
+                created_at: 1,
+                total_tokens: 0,
+                context_tokens: 0,
+                compaction_summary: None,
+                compacted_through: 0,
+            },
+        };
+        assert!(session.needs_title());
+        assert_eq!(session.display_name(), "session-123");
+
+        session.set_title("Git Pane Scrolling".into());
+        assert!(!session.needs_title());
+        assert_eq!(session.display_name(), "Git Pane Scrolling");
+
+        session.meta.name = "named-session".into();
+        session.meta.title = None;
+        assert!(!session.needs_title());
     }
 
     #[tokio::test]

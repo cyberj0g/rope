@@ -1,6 +1,6 @@
 mod message;
 
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashSet, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -15,7 +15,7 @@ use crate::{
     project::ProjectState,
     provider::{Provider, ResponseDelta, Usage},
     session::Session,
-    tool::{Approval, ToolDefinition, ToolRegistry},
+    tool::{Approval, ExecutionPlan, ToolDefinition, ToolRegistry},
 };
 pub use message::{ImageContent, Message, ToolCall};
 
@@ -96,8 +96,10 @@ pub enum Event {
         reasoning_effort: Option<ReasoningEffort>,
     },
     ProjectChanged(ProjectState),
+    PlanChanged(Option<ExecutionPlan>),
     GenerationStarted,
     ModelRequestStarted(String),
+    ResponseHeadersReceived,
     ResponseStarted,
     ReasoningDelta(String),
     TextDelta(String),
@@ -133,6 +135,8 @@ enum InternalEvent {
     Finished(TurnResult),
     Failed(String),
     Usage(Usage),
+    AuxiliaryUsage(Usage),
+    PlanUpdated(ExecutionPlan),
     Approval {
         call: ToolCall,
         reply: oneshot::Sender<bool>,
@@ -143,6 +147,7 @@ enum InternalEvent {
 struct TurnResult {
     completed: Vec<Message>,
     compaction: Option<Compaction>,
+    title: Option<String>,
 }
 
 struct Compaction {
@@ -190,7 +195,7 @@ async fn run<P: Provider>(
 
     events.send(Event::History(messages.clone())).await.ok();
     events
-        .send(Event::SessionChanged(session.meta.name.clone()))
+        .send(Event::SessionChanged(session.display_name().to_owned()))
         .await
         .ok();
     events
@@ -203,6 +208,10 @@ async fn run<P: Provider>(
         .send(Event::ProjectChanged(project.clone()))
         .await
         .ok();
+    events
+        .send(Event::PlanChanged(session.meta.plan.clone()))
+        .await
+        .ok();
 
     loop {
         tokio::select! {
@@ -212,6 +221,8 @@ async fn run<P: Provider>(
                     messages.push(Message::user_with_images(prompt.content, prompt.images));
                     let request_messages = request_context(&messages, &session);
                     let context_tokens = session.meta.context_tokens;
+                    let generate_title = session.needs_title();
+                    let current_plan = session.meta.plan.clone();
                     let provider = provider.clone();
                     let tools = tools.clone();
                     let config = config.clone();
@@ -221,7 +232,7 @@ async fn run<P: Provider>(
                     events.send(Event::GenerationStarted).await.ok();
                     generation = Some(tokio::spawn(async move {
                         let result = match project_prompt {
-                            Ok(prompt) => turn(provider, &tools, &config, request_messages, persist_from, context_tokens, prompt, &events, &internal).await,
+                            Ok(prompt) => turn(provider, &tools, &config, request_messages, persist_from, context_tokens, prompt, generate_title, current_plan, &events, &internal).await,
                             Err(error) => Err(error),
                         };
                         let event = match result {
@@ -248,8 +259,9 @@ async fn run<P: Provider>(
                     Ok(new_session) => {
                         session = new_session; messages.clear();
                         events.send(Event::History(Vec::new())).await.ok();
-                        events.send(Event::SessionChanged(session.meta.name.clone())).await.ok();
+                        events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
                         events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
+                        events.send(Event::PlanChanged(None)).await.ok();
                         send_context(&events, &session, &config).await;
                     }
                     Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
@@ -301,16 +313,26 @@ async fn run<P: Provider>(
                 InternalEvent::Finished(result) if generation.is_some() => {
                     generation = None; pending_approval = None;
                     messages.truncate(messages.len().saturating_sub(1));
+                    let TurnResult { completed, compaction, title } = result;
+                    if let Some(title) = title {
+                        session.set_title(title);
+                        events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
+                    }
                     let mut persisted = Vec::new();
-                    if let Some(compaction) = result.compaction {
+                    if let Some(compaction) = compaction {
                         session.meta.compaction_summary = Some(compaction.summary);
                         session.meta.compacted_through = compaction.through;
                         let marker = Message::system("Context compacted".into());
                         messages.push(marker.clone());
                         persisted.push(marker);
                     }
-                    messages.extend(result.completed.clone());
-                    persisted.extend(result.completed);
+                    messages.extend(completed.clone());
+                    persisted.extend(completed);
+                    let projected = request_context(&messages, &session);
+                    if projected.iter().any(is_ejected_web_result) {
+                        session.meta.context_tokens = estimate_tokens(&projected);
+                        send_context(&events, &session, &config).await;
+                    }
                     let saved = async {
                         session.append(&persisted).await?;
                         session.save().await
@@ -335,6 +357,15 @@ async fn run<P: Provider>(
                     events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
                     send_context(&events, &session, &config).await;
                 }
+                InternalEvent::AuxiliaryUsage(usage) if generation.is_some() => {
+                    session.meta.total_tokens += usage.total_tokens;
+                    events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
+                }
+                InternalEvent::PlanUpdated(plan) if generation.is_some() => {
+                    session.meta.plan = Some(plan.clone());
+                    session.save().await.ok();
+                    events.send(Event::PlanChanged(Some(plan))).await.ok();
+                }
                 InternalEvent::Approval { call, reply } => {
                     if generation.is_none() || pending_approval.is_some() { reply.send(false).ok(); }
                     else { pending_approval = Some(reply); events.send(Event::ApprovalRequested(call)).await.ok(); }
@@ -343,7 +374,11 @@ async fn run<P: Provider>(
                     project = changed;
                     events.send(Event::ProjectChanged(project.clone())).await.ok();
                 }
-                InternalEvent::Finished(_) | InternalEvent::Failed(_) | InternalEvent::Usage(_) => {}
+                InternalEvent::Finished(_)
+                | InternalEvent::Failed(_)
+                | InternalEvent::Usage(_)
+                | InternalEvent::AuxiliaryUsage(_)
+                | InternalEvent::PlanUpdated(_) => {}
             },
             else => break,
         }
@@ -381,23 +416,127 @@ async fn send_context(events: &mpsc::Sender<Event>, session: &Session, config: &
 }
 
 fn request_context(messages: &[Message], session: &Session) -> Vec<Message> {
-    let Some(summary) = &session.meta.compaction_summary else {
-        return messages.to_vec();
+    let mut context = if let Some(summary) = &session.meta.compaction_summary {
+        let mut context = vec![Message::system(format!(
+            "Conversation summary for continuation:\n{summary}"
+        ))];
+        context.extend(
+            messages[session.meta.compacted_through.min(messages.len())..]
+                .iter()
+                .filter(|message| !is_compaction_marker(message))
+                .cloned(),
+        );
+        context
+    } else {
+        messages.to_vec()
     };
-    let mut context = vec![Message::system(format!(
-        "Conversation summary for continuation:\n{summary}"
-    ))];
-    context.extend(
-        messages[session.meta.compacted_through.min(messages.len())..]
-            .iter()
-            .filter(|message| !is_compaction_marker(message))
-            .cloned(),
-    );
+    eject_consumed_web_results(&mut context);
+    compact_plan_history(&mut context);
     context
+}
+
+const PLAN_CONTEXT_PREFIX: &str = "Current execution plan (keep it updated with update_plan):\n";
+
+fn apply_plan_context(messages: &mut Vec<Message>, plan: Option<&ExecutionPlan>) {
+    compact_plan_history(messages);
+    if let Some(plan) = plan {
+        messages.insert(
+            0,
+            Message::system(format!(
+                "{PLAN_CONTEXT_PREFIX}{}",
+                serde_json::to_string_pretty(plan).unwrap()
+            )),
+        );
+    }
+}
+
+fn compact_plan_history(messages: &mut [Message]) -> usize {
+    let mut call_ids = HashSet::new();
+    let mut compacted = 0;
+    for message in messages {
+        match message {
+            Message::Assistant { tool_calls, .. } => {
+                for call in tool_calls
+                    .iter_mut()
+                    .filter(|call| call.name == "update_plan")
+                {
+                    call_ids.insert(call.id.clone());
+                    call.arguments = serde_json::json!({ "stored": true });
+                }
+            }
+            Message::Tool {
+                call_id, content, ..
+            } if call_ids.remove(call_id) => {
+                *content = r#"{"stored":true,"note":"Latest plan is provided separately."}"#.into();
+                compacted += 1;
+            }
+            _ => {}
+        }
+    }
+    compacted
 }
 
 fn is_compaction_marker(message: &Message) -> bool {
     matches!(message, Message::System { content } if content == "Context compacted")
+}
+
+fn eject_consumed_web_results(messages: &mut [Message]) -> usize {
+    let mut browser_calls = HashSet::new();
+    let mut pending = Vec::new();
+    let mut consumed = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        match message {
+            Message::Assistant { tool_calls, .. } => {
+                if tool_calls.is_empty() {
+                    consumed.append(&mut pending);
+                }
+                browser_calls.extend(
+                    tool_calls
+                        .iter()
+                        .filter(|call| call.name == "web_browser")
+                        .map(|call| call.id.clone()),
+                );
+            }
+            Message::Tool { call_id, .. } if browser_calls.remove(call_id) => pending.push(index),
+            _ => {}
+        }
+    }
+
+    let mut ejected = 0;
+    for index in consumed {
+        let Message::Tool { content, .. } = &mut messages[index] else {
+            continue;
+        };
+        if let Some(marker) = web_result_marker(content) {
+            *content = marker;
+            ejected += 1;
+        }
+    }
+    ejected
+}
+
+fn web_result_marker(content: &str) -> Option<String> {
+    let result: serde_json::Value = serde_json::from_str(content).ok()?;
+    let page = result.get("content")?.as_str()?;
+    serde_json::to_string_pretty(&serde_json::json!({
+        "ejected": true,
+        "tool": "web_browser",
+        "url": result.get("url").and_then(serde_json::Value::as_str).unwrap_or_default(),
+        "title": result.get("title").and_then(serde_json::Value::as_str).unwrap_or_default(),
+        "original_chars": page.chars().count(),
+        "note": "The full page was consumed by the previous assistant response. Call web_browser again if it is needed."
+    }))
+    .ok()
+}
+
+fn is_ejected_web_result(message: &Message) -> bool {
+    let Message::Tool { content, .. } = message else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.get("ejected").and_then(serde_json::Value::as_bool))
+        == Some(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -409,6 +548,8 @@ async fn turn<P: Provider>(
     visible_through: usize,
     context_tokens: u64,
     project_prompt: Option<String>,
+    generate_title: bool,
+    current_plan: Option<ExecutionPlan>,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<TurnResult> {
@@ -429,19 +570,26 @@ async fn turn<P: Provider>(
     }
     let persist_from = messages.len().saturating_sub(1);
     let completed = agent(
-        provider,
+        provider.clone(),
         tools,
         config,
         messages,
         persist_from,
         project_prompt,
+        current_plan,
         events,
         internal,
     )
     .await?;
+    let title = if generate_title {
+        Some(generate_session_title(provider, config, &completed, events, internal).await)
+    } else {
+        None
+    };
     Ok(TurnResult {
         completed,
         compaction,
+        title,
     })
 }
 
@@ -500,6 +648,127 @@ async fn compact<P: Provider>(
     Ok(summary.trim().to_owned())
 }
 
+async fn generate_session_title<P: Provider>(
+    provider: Arc<P>,
+    config: &Config,
+    messages: &[Message],
+    events: &mpsc::Sender<Event>,
+    internal: &mpsc::Sender<InternalEvent>,
+) -> String {
+    let fallback = fallback_session_title(messages);
+    let Some(user) = messages.iter().find_map(|message| match message {
+        Message::User { content, .. } => Some(content.as_str()),
+        _ => None,
+    }) else {
+        return fallback;
+    };
+    let assistant = messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Assistant { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let prompt = format!(
+        "User:\n{}\n\nAssistant:\n{}",
+        user.chars().take(1200).collect::<String>(),
+        assistant.chars().take(1200).collect::<String>()
+    );
+    events
+        .send(Event::ModelRequestStarted(config.model_id().to_owned()))
+        .await
+        .ok();
+    let request = CompletionRequest {
+        model: config.model_id().to_owned(),
+        messages: vec![
+            Message::system(
+                "Create a concise 2-3 word title for this conversation. Return only the title without quotes, markdown, punctuation, or explanation."
+                    .into(),
+            ),
+            Message::user_with_images(prompt, Vec::new()),
+        ],
+        temperature: Some(0.0),
+        reasoning_effort: None,
+        max_tokens: Some(256),
+        stream: true,
+        tools: Vec::new(),
+    };
+    let result: Result<(String, String)> = async {
+        let mut stream = stream_with_retry(&provider, request, events).await?;
+        let mut reasoning = String::new();
+        let mut text = String::new();
+        let mut started = false;
+        while let Some(delta) = stream.next().await {
+            let delta = delta?;
+            if !started {
+                events.send(Event::ResponseStarted).await.ok();
+                started = true;
+            }
+            match delta {
+                ResponseDelta::Reasoning(delta) => reasoning.push_str(&delta),
+                ResponseDelta::Text(delta) => text.push_str(&delta),
+                ResponseDelta::Usage(usage) => {
+                    internal.send(InternalEvent::AuxiliaryUsage(usage)).await?;
+                }
+                ResponseDelta::ToolCall { .. } => {}
+            }
+        }
+        Ok((text, reasoning))
+    }
+    .await;
+    result
+        .ok()
+        .and_then(|(text, reasoning)| {
+            clean_session_title(&text).or_else(|| clean_session_title(&reasoning))
+        })
+        .unwrap_or(fallback)
+}
+
+fn clean_session_title(raw: &str) -> Option<String> {
+    let raw = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| value.get("title")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| raw.to_owned());
+    let mut line = raw
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim();
+    line = line.trim_matches(|char: char| {
+        char.is_whitespace() || matches!(char, '"' | '\'' | '`' | '#' | '*' | '.')
+    });
+    if line
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("title:"))
+    {
+        line = line[6..].trim();
+    }
+    let mut title = line
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|char: char| !char.is_alphanumeric() && !matches!(char, '-' | '\''))
+        })
+        .filter(|word| !word.is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !title.is_empty() && !title.contains(char::is_whitespace) {
+        title.push_str(" Conversation");
+    }
+    (!title.is_empty()).then_some(title)
+}
+
+fn fallback_session_title(messages: &[Message]) -> String {
+    let content = messages.iter().find_map(|message| match message {
+        Message::User { content, .. } => Some(content.as_str()),
+        _ => None,
+    });
+    content
+        .and_then(clean_session_title)
+        .unwrap_or_else(|| "New Conversation".into())
+}
+
 fn estimate_tokens(messages: &[Message]) -> u64 {
     let bytes = messages
         .iter()
@@ -516,6 +785,7 @@ async fn agent<P: Provider>(
     mut messages: Vec<Message>,
     persist_from: usize,
     project_prompt: Option<String>,
+    mut current_plan: Option<ExecutionPlan>,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<Vec<Message>> {
@@ -525,6 +795,7 @@ async fn agent<P: Provider>(
             .await
             .ok();
         let mut request_messages = messages.clone();
+        apply_plan_context(&mut request_messages, current_plan.as_ref());
         if let Some(prompt) = &project_prompt {
             request_messages.insert(0, Message::system(prompt.clone()));
         }
@@ -595,6 +866,12 @@ async fn agent<P: Provider>(
                 })
                 .await
                 .ok();
+            if success && call.name == "update_plan" {
+                let plan: ExecutionPlan =
+                    serde_json::from_str(&output).context("decode normalized execution plan")?;
+                current_plan = Some(plan.clone());
+                internal.send(InternalEvent::PlanUpdated(plan)).await?;
+            }
             messages.push(Message::tool(call.id, output, image));
         }
     }
@@ -609,7 +886,10 @@ async fn stream_with_retry<P: Provider>(
     let mut attempt = 0;
     loop {
         match provider.stream(request.clone()).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                events.send(Event::ResponseHeadersReceived).await.ok();
+                return Ok(stream);
+            }
             Err(error) if is_retryable(&error) => {
                 let seconds = retry_delay(attempt);
                 events.send(Event::Retrying { seconds }).await.ok();
@@ -770,6 +1050,7 @@ mod tests {
             vec![Message::user("hi".into())],
             0,
             None,
+            None,
             &event_tx,
             &internal_tx,
         )
@@ -783,6 +1064,10 @@ mod tests {
         assert!(matches!(
             event_rx.recv().await,
             Some(Event::ModelRequestStarted(_))
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(Event::ResponseHeadersReceived)
         ));
         assert!(matches!(
             event_rx.recv().await,
@@ -812,6 +1097,7 @@ mod tests {
             &Config::default(),
             vec![Message::user("hi".into())],
             0,
+            None,
             None,
             &event_tx,
             &internal_tx,
@@ -858,6 +1144,7 @@ mod tests {
             vec![Message::user("run it".into())],
             0,
             None,
+            None,
             &event_tx,
             &internal_tx,
         )
@@ -871,6 +1158,10 @@ mod tests {
         assert!(matches!(
             event_rx.recv().await,
             Some(Event::ModelRequestStarted(_))
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(Event::ResponseHeadersReceived)
         ));
         assert!(matches!(
             event_rx.recv().await,
@@ -889,6 +1180,145 @@ mod tests {
     }
 
     #[test]
+    fn consumed_web_browser_results_are_ejected_only_from_model_context() {
+        let output = serde_json::json!({
+            "url": "https://example.com/docs",
+            "title": "Documentation",
+            "content": "page content ".repeat(2_000),
+            "links": []
+        })
+        .to_string();
+        let mut context = vec![
+            Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "browser-1".into(),
+                    name: "web_browser".into(),
+                    arguments: serde_json::json!({ "url": "https://example.com/docs" }),
+                }],
+            ),
+            Message::tool("browser-1".into(), output, None),
+            Message::assistant(
+                "I used the documentation.".into(),
+                "model".into(),
+                String::new(),
+                Vec::new(),
+            ),
+            Message::user("continue".into()),
+        ];
+        let transcript = context.clone();
+        let full_tokens = estimate_tokens(&context);
+
+        assert_eq!(eject_consumed_web_results(&mut context), 1);
+        let Message::Tool { content, .. } = &context[1] else {
+            panic!("expected tool result");
+        };
+        let marker: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(marker["ejected"], true);
+        assert_eq!(marker["url"], "https://example.com/docs");
+        assert_eq!(marker["original_chars"], 26_000);
+        assert!(estimate_tokens(&context) < full_tokens / 10);
+        assert!(matches!(
+            &transcript[1],
+            Message::Tool { content, .. } if content.contains("page content")
+        ));
+    }
+
+    #[test]
+    fn model_context_contains_only_the_latest_full_plan() {
+        let old_plan = serde_json::json!({
+            "plan": [{ "step": "obsolete step", "status": "in_progress" }]
+        });
+        let mut messages = vec![
+            Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "plan-1".into(),
+                    name: "update_plan".into(),
+                    arguments: old_plan.clone(),
+                }],
+            ),
+            Message::tool("plan-1".into(), old_plan.to_string(), None),
+        ];
+        let current = ExecutionPlan {
+            explanation: Some("revised".into()),
+            plan: vec![crate::tool::PlanStep {
+                step: "current step".into(),
+                status: crate::tool::PlanStatus::InProgress,
+            }],
+        };
+
+        apply_plan_context(&mut messages, Some(&current));
+        let encoded = serde_json::to_string(&messages).unwrap();
+
+        assert!(!encoded.contains("obsolete step"));
+        assert_eq!(encoded.matches("current step").count(), 1);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| matches!(message, Message::System { content } if content.starts_with(PLAN_CONTEXT_PREFIX)))
+                .count(),
+            1
+        );
+        assert!(encoded.contains("Latest plan is provided separately"));
+    }
+
+    #[test]
+    fn web_browser_result_stays_until_the_tool_loop_finishes() {
+        let mut context = vec![
+            Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "browser-1".into(),
+                    name: "web_browser".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            Message::tool(
+                "browser-1".into(),
+                serde_json::json!({
+                    "url": "https://example.com",
+                    "title": "Example",
+                    "content": "full page",
+                    "links": []
+                })
+                .to_string(),
+                None,
+            ),
+            Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "next-1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            Message::tool("next-1".into(), "file".into(), None),
+        ];
+
+        assert_eq!(eject_consumed_web_results(&mut context), 0);
+        assert!(matches!(
+            &context[1],
+            Message::Tool { content, .. } if content.contains("full page")
+        ));
+        context.push(Message::assistant(
+            "done".into(),
+            "model".into(),
+            String::new(),
+            Vec::new(),
+        ));
+        assert_eq!(eject_consumed_web_results(&mut context), 1);
+    }
+
+    #[test]
     fn transient_errors_use_capped_backoff() {
         assert!(is_retryable(&anyhow::anyhow!(
             "server returned 503: unavailable"
@@ -902,6 +1332,72 @@ mod tests {
         assert_eq!(
             (0..6).map(retry_delay).collect::<Vec<_>>(),
             [2, 5, 10, 30, 30, 30]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_title_uses_visible_text_or_reasoning_fallback() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::Reasoning("considering options\nGit Pane Scrolling".into()),
+            ResponseDelta::Usage(Usage {
+                prompt_tokens: 20,
+                total_tokens: 24,
+            }),
+        ]]));
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (internal_tx, mut internal_rx) = mpsc::channel(2);
+        let title = generate_session_title(
+            provider,
+            &Config::default(),
+            &[
+                Message::user("make the Git pane scroll".into()),
+                Message::assistant(
+                    "Implemented scrolling".into(),
+                    "model".into(),
+                    String::new(),
+                    Vec::new(),
+                ),
+            ],
+            &event_tx,
+            &internal_tx,
+        )
+        .await;
+
+        assert_eq!(title, "Git Pane Scrolling");
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(Event::ModelRequestStarted(_))
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(Event::ResponseHeadersReceived)
+        ));
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(Event::ResponseStarted)
+        ));
+        assert!(matches!(
+            internal_rx.recv().await,
+            Some(InternalEvent::AuxiliaryUsage(Usage {
+                total_tokens: 24,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn session_title_cleanup_handles_json_and_empty_model_output() {
+        assert_eq!(
+            clean_session_title(r#"{"title":"Mouse Resizable Panes"}"#).as_deref(),
+            Some("Mouse Resizable Panes")
+        );
+        assert_eq!(
+            fallback_session_title(&[Message::user("single".into())]),
+            "single Conversation"
+        );
+        assert_eq!(
+            clean_session_title("Ржавчина Tools").as_deref(),
+            Some("Ржавчина Tools")
         );
     }
 
@@ -939,6 +1435,8 @@ mod tests {
             ],
             1,
             80,
+            None,
+            false,
             None,
             &event_tx,
             &internal_tx,

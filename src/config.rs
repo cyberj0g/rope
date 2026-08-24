@@ -84,6 +84,8 @@ pub struct ToolPolicies {
     pub shell: Approval,
     pub grep: Approval,
     pub glob: Approval,
+    pub web_browser: Approval,
+    pub web_search: Approval,
     pub external: Approval,
 }
 
@@ -96,6 +98,8 @@ impl Default for ToolPolicies {
             shell: Approval::Ask,
             grep: Approval::Allow,
             glob: Approval::Allow,
+            web_browser: Approval::Ask,
+            web_search: Approval::Ask,
             external: Approval::Ask,
         }
     }

@@ -6,6 +6,7 @@ use std::{
 use crate::{
     project::ProjectState,
     runtime::{Event, ImageContent, Message, ToolCall, UserPrompt},
+    tool::ExecutionPlan,
 };
 
 const IMAGE_SENTINEL: char = '\u{fffc}';
@@ -127,6 +128,8 @@ pub struct UiState {
     pub blocks: Vec<ChatBlock>,
     pub generating: bool,
     pub connecting: bool,
+    pub waiting: bool,
+    pub tool_running: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
     pub scroll: u16,
@@ -142,9 +145,18 @@ pub struct UiState {
     pub thinking_expanded: bool,
     pub tools_expanded: bool,
     pub git_panel: bool,
+    pub git_panel_width: Option<u16>,
+    pub git_split_dragging: bool,
     pub git_diff_mode: bool,
     pub git_fullscreen_diff: bool,
+    pub git_status_scroll: u16,
+    pub git_panel_diff_scroll: u16,
     pub git_diff_scroll: u16,
+    pub plan: Option<ExecutionPlan>,
+    pub plan_panel: bool,
+    pub plan_panel_height: Option<u16>,
+    pub plan_split_dragging: bool,
+    pub plan_scroll: u16,
     assistant: Option<usize>,
     reasoning: Option<usize>,
     response_model: String,
@@ -154,6 +166,7 @@ pub struct UiState {
     input_cursor: usize,
     pasted: Vec<PastedRange>,
     input_images: Vec<InputImage>,
+    next_input_image_id: u64,
     pub text_selection: Option<TextSelection>,
     pub selection_anchor: Option<TextPoint>,
     toast: Option<Toast>,
@@ -185,9 +198,12 @@ struct PastedRange {
 
 #[derive(Clone)]
 struct InputImage {
+    id: u64,
     start: usize,
     end: usize,
-    image: ImageContent,
+    label: String,
+    started: Instant,
+    image: Option<ImageContent>,
 }
 
 impl UiState {
@@ -197,6 +213,8 @@ impl UiState {
             blocks: Vec::new(),
             generating: false,
             connecting: false,
+            waiting: false,
+            tool_running: false,
             error: None,
             notice: None,
             scroll: 0,
@@ -212,9 +230,18 @@ impl UiState {
             thinking_expanded: false,
             tools_expanded: false,
             git_panel: true,
+            git_panel_width: None,
+            git_split_dragging: false,
             git_diff_mode: false,
             git_fullscreen_diff: false,
+            git_status_scroll: 0,
+            git_panel_diff_scroll: 0,
             git_diff_scroll: 0,
+            plan: None,
+            plan_panel: false,
+            plan_panel_height: None,
+            plan_split_dragging: false,
+            plan_scroll: 0,
             assistant: None,
             reasoning: None,
             response_model: String::new(),
@@ -224,6 +251,7 @@ impl UiState {
             input_cursor: 0,
             pasted: Vec::new(),
             input_images: Vec::new(),
+            next_input_image_id: 0,
             text_selection: None,
             selection_anchor: None,
             toast: None,
@@ -232,12 +260,15 @@ impl UiState {
 
     pub fn take_input(&mut self) -> Option<UserPrompt> {
         let content = self.input.replace(IMAGE_SENTINEL, "").trim().to_owned();
-        if (content.is_empty() && self.input_images.is_empty()) || self.generating {
+        if (content.is_empty() && self.input_images.is_empty())
+            || self.generating
+            || self.image_loading()
+        {
             return None;
         }
         let images = std::mem::take(&mut self.input_images)
             .into_iter()
-            .map(|item| item.image)
+            .map(|item| item.image.unwrap())
             .collect();
         self.input.clear();
         self.input_cursor = 0;
@@ -282,22 +313,90 @@ impl UiState {
         }
     }
 
+    #[cfg(test)]
     pub fn insert_image(&mut self, image: ImageContent) {
+        let id = self.begin_image_load("Processing image");
+        self.finish_image_load(id, image);
+    }
+
+    pub fn begin_image_load(&mut self, label: impl Into<String>) -> u64 {
+        let id = self.next_input_image_id;
+        self.next_input_image_id += 1;
         let start = self.input_cursor;
         let width = IMAGE_SENTINEL.len_utf8();
         self.shift_input_items(start, width as isize);
         self.input.insert(start, IMAGE_SENTINEL);
         self.input_cursor += width;
         self.input_images.push(InputImage {
+            id,
             start,
             end: self.input_cursor,
-            image,
+            label: label.into(),
+            started: Instant::now(),
+            image: None,
         });
         self.input_images.sort_by_key(|item| item.start);
+        id
+    }
+
+    pub fn finish_image_load(&mut self, id: u64, image: ImageContent) -> bool {
+        let Some(item) = self.input_images.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        item.image = Some(image);
+        true
+    }
+
+    pub fn fail_image_load(&mut self, id: u64) -> bool {
+        let Some(index) = self
+            .input_images
+            .iter()
+            .position(|item| item.id == id && item.image.is_none())
+        else {
+            return false;
+        };
+        self.remove_input_image(index);
+        true
+    }
+
+    pub fn replace_image_load_with_paste(
+        &mut self,
+        id: u64,
+        text: &str,
+        collapse_at: usize,
+    ) -> bool {
+        let Some(index) = self
+            .input_images
+            .iter()
+            .position(|item| item.id == id && item.image.is_none())
+        else {
+            return false;
+        };
+        let cursor_after = self.input_cursor > self.input_images[index].start;
+        let start = self.remove_input_image(index);
+        self.shift_input_items(start, text.len() as isize);
+        self.input.insert_str(start, text);
+        if cursor_after {
+            self.input_cursor += text.len();
+        }
+        let chars = text.chars().count();
+        if chars > collapse_at {
+            self.pasted.push(PastedRange {
+                start,
+                end: start + text.len(),
+                chars,
+            });
+            self.pasted.sort_by_key(|range| range.start);
+        }
+        true
     }
 
     pub fn has_input_images(&self) -> bool {
         !self.input_images.is_empty()
+    }
+
+    pub fn image_loading(&self) -> bool {
+        self.input_images.iter().any(|item| item.image.is_none())
     }
 
     pub fn backspace(&mut self) {
@@ -306,10 +405,7 @@ impl UiState {
             .iter()
             .position(|item| item.end == self.input_cursor)
         {
-            let item = self.input_images.remove(index);
-            self.input.replace_range(item.start..item.end, "");
-            self.input_cursor = item.start;
-            self.shift_input_items(item.end, -((item.end - item.start) as isize));
+            self.remove_input_image(index);
             return;
         }
         if let Some(index) = self
@@ -338,9 +434,7 @@ impl UiState {
             .iter()
             .position(|item| item.start == self.input_cursor)
         {
-            let item = self.input_images.remove(index);
-            self.input.replace_range(item.start..item.end, "");
-            self.shift_input_items(item.end, -((item.end - item.start) as isize));
+            self.remove_input_image(index);
             return;
         }
         if let Some(index) = self
@@ -402,12 +496,15 @@ impl UiState {
 
         let mut lines = vec![Line::from(Span::raw(" "))];
         let mut offset = 0;
-        for (start, end, label, color) in self.input_plates() {
+        for (start, end, label, color, gap) in self.input_plates() {
             push_input_text(&mut lines, &self.input[offset..start]);
             lines.last_mut().unwrap().spans.push(Span::styled(
                 label,
                 Style::default().fg(Color::Black).bg(color),
             ));
+            if gap && end < self.input.len() {
+                lines.last_mut().unwrap().spans.push(Span::raw(" "));
+            }
             offset = end;
         }
         push_input_text(&mut lines, &self.input[offset..]);
@@ -418,12 +515,15 @@ impl UiState {
         let mut row = 0u16;
         let mut column = 1u16;
         let mut offset = 0;
-        for (start, end, label, _) in self.input_plates() {
+        for (start, end, label, _, gap) in self.input_plates() {
             if start >= self.input_cursor {
                 break;
             }
             advance_cursor(&self.input[offset..start], width, &mut row, &mut column);
             advance_cursor(&label, width, &mut row, &mut column);
+            if gap && end < self.input.len() {
+                advance_cursor(" ", width, &mut row, &mut column);
+            }
             offset = end;
         }
         advance_cursor(
@@ -435,7 +535,7 @@ impl UiState {
         (row, column)
     }
 
-    fn input_plates(&self) -> Vec<(usize, usize, String, ratatui::style::Color)> {
+    fn input_plates(&self) -> Vec<(usize, usize, String, ratatui::style::Color, bool)> {
         use ratatui::style::Color;
 
         let mut plates = self
@@ -447,24 +547,44 @@ impl UiState {
                     range.end,
                     format!(" Pasted {} chars ", range.chars),
                     Color::Magenta,
+                    false,
                 )
             })
             .chain(self.input_images.iter().map(|item| {
-                let dimensions = if item.image.width == 0 || item.image.height == 0 {
-                    String::new()
+                let (label, color) = if let Some(image) = &item.image {
+                    let dimensions = if image.width == 0 || image.height == 0 {
+                        String::new()
+                    } else {
+                        format!(" · {}×{}", image.width, image.height)
+                    };
+                    (format!(" Image{dimensions} "), Color::Cyan)
                 } else {
-                    format!(" · {}×{}", item.image.width, item.image.height)
+                    (
+                        format!(
+                            " {} · {:.1}s ",
+                            item.label,
+                            item.started.elapsed().as_secs_f32()
+                        ),
+                        Color::Yellow,
+                    )
                 };
-                (
-                    item.start,
-                    item.end,
-                    format!(" Image{dimensions} "),
-                    Color::Cyan,
-                )
+                (item.start, item.end, label, color, true)
             }))
             .collect::<Vec<_>>();
         plates.sort_by_key(|plate| plate.0);
         plates
+    }
+
+    fn remove_input_image(&mut self, index: usize) -> usize {
+        let item = self.input_images.remove(index);
+        self.input.replace_range(item.start..item.end, "");
+        if self.input_cursor >= item.end {
+            self.input_cursor -= item.end - item.start;
+        } else if self.input_cursor > item.start {
+            self.input_cursor = item.start;
+        }
+        self.shift_input_items(item.end, -((item.end - item.start) as isize));
+        item.start
     }
 
     fn shift_input_items(&mut self, from: usize, delta: isize) {
@@ -524,6 +644,11 @@ impl UiState {
                 "collapsed"
             }
         ));
+    }
+
+    pub fn toggle_plan_panel(&mut self) {
+        self.plan_panel = !self.plan_panel;
+        self.plan_split_dragging = false;
     }
 
     pub fn open_fullscreen_git_diff(&mut self) {
@@ -643,21 +768,44 @@ impl UiState {
                 self.reasoning_effort = reasoning_effort;
             }
             Event::ProjectChanged(project) => self.project = project,
+            Event::PlanChanged(plan) => {
+                if plan.is_some() {
+                    self.plan_panel = true;
+                }
+                self.plan = plan;
+                self.plan_scroll = 0;
+            }
             Event::GenerationStarted => {
                 self.generating = true;
                 self.connecting = true;
+                self.waiting = false;
+                self.tool_running = false;
                 self.error = None;
             }
             Event::ModelRequestStarted(model) => {
                 self.finish_reasoning();
                 self.connecting = true;
+                self.waiting = false;
+                self.tool_running = false;
                 self.response_model = model;
                 self.tool_drafts.clear();
                 self.assistant = None;
                 self.reasoning = None;
             }
+            Event::ResponseHeadersReceived => {
+                self.connecting = false;
+                self.waiting = true;
+                if self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|notice| notice.starts_with("retrying in "))
+                {
+                    self.notice = None;
+                }
+            }
             Event::ResponseStarted => {
                 self.connecting = false;
+                self.waiting = false;
                 if self
                     .notice
                     .as_ref()
@@ -767,12 +915,16 @@ impl UiState {
                 self.set_tool_status(&call.id, ToolStatus::WaitingApproval);
                 self.approval = Some(call);
             }
-            Event::ToolStarted { call_id } => self.set_tool_status(&call_id, ToolStatus::Running),
+            Event::ToolStarted { call_id } => {
+                self.tool_running = true;
+                self.set_tool_status(&call_id, ToolStatus::Running);
+            }
             Event::ToolResult {
                 call_id,
                 output,
                 success,
             } => {
+                self.tool_running = false;
                 if let Some(block) = self.tool_calls.get(&call_id).copied()
                     && let ChatBlock::Tool {
                         output: block_output,
@@ -794,6 +946,7 @@ impl UiState {
             }
             Event::Retrying { seconds } => {
                 self.connecting = true;
+                self.waiting = false;
                 self.notice = Some(format!("retrying in {seconds}s · Esc to cancel"));
             }
             Event::CompactionStarted => {
@@ -828,6 +981,8 @@ impl UiState {
                 self.finish_reasoning();
                 self.generating = false;
                 self.connecting = false;
+                self.waiting = false;
+                self.tool_running = false;
                 self.approval = None;
             }
             Event::Saved => self.notice = Some("session saved".into()),
@@ -835,6 +990,8 @@ impl UiState {
                 self.finish_reasoning();
                 self.generating = false;
                 self.connecting = false;
+                self.waiting = false;
+                self.tool_running = false;
                 self.approval = None;
                 self.error = Some(error);
             }
@@ -1023,26 +1180,33 @@ mod tests {
     }
 
     #[test]
-    fn generation_is_connecting_until_the_response_starts() {
+    fn generation_moves_from_connecting_to_waiting_to_streaming() {
         let mut state = UiState::new();
         state.apply(Event::GenerationStarted);
         assert!(state.generating);
         assert!(state.connecting);
+        assert!(!state.waiting);
 
         state.apply(Event::ModelRequestStarted("test-model".into()));
         assert!(state.connecting);
 
+        state.apply(Event::ResponseHeadersReceived);
+        assert!(!state.connecting);
+        assert!(state.waiting);
+
         state.apply(Event::ResponseStarted);
         assert!(state.generating);
         assert!(!state.connecting);
+        assert!(!state.waiting);
 
         state.apply(Event::GenerationFinished);
         assert!(!state.generating);
         assert!(!state.connecting);
+        assert!(!state.waiting);
     }
 
     #[test]
-    fn retry_status_is_visible_until_response_arrives() {
+    fn retry_status_is_visible_until_response_headers_arrive() {
         let mut state = UiState::new();
         state.apply(Event::GenerationStarted);
         state.apply(Event::Retrying { seconds: 5 });
@@ -1052,9 +1216,10 @@ mod tests {
         );
         assert!(state.connecting);
 
-        state.apply(Event::ResponseStarted);
+        state.apply(Event::ResponseHeadersReceived);
         assert!(state.notice.is_none());
         assert!(!state.connecting);
+        assert!(state.waiting);
     }
 
     #[test]
@@ -1205,6 +1370,32 @@ mod tests {
     }
 
     #[test]
+    fn plan_updates_open_the_pane_and_plan_tools_stay_in_chat() {
+        let mut state = UiState::new();
+        state.apply(Event::PlanChanged(Some(ExecutionPlan {
+            explanation: None,
+            plan: vec![crate::tool::PlanStep {
+                step: "implement pane".into(),
+                status: crate::tool::PlanStatus::InProgress,
+            }],
+        })));
+        assert!(state.plan_panel);
+        assert_eq!(state.plan.as_ref().unwrap().plan[0].step, "implement pane");
+
+        state.toggle_plan_panel();
+        assert!(!state.plan_panel);
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("update_plan".into()),
+            arguments: "{}".into(),
+        });
+        assert!(matches!(
+            state.blocks[0],
+            ChatBlock::Tool { ref name, .. } if name == "update_plan"
+        ));
+    }
+
+    #[test]
     fn fullscreen_diff_has_independent_open_and_scroll_state() {
         let mut state = UiState::new();
         state.project.git_diff = "old file diff".into();
@@ -1279,11 +1470,57 @@ mod tests {
                 .iter()
                 .any(|span| span.content == " Image · 10×20 ")
         );
+        let plate = state.input_lines();
+        let image = plate[0]
+            .spans
+            .iter()
+            .position(|span| span.content == " Image · 10×20 ")
+            .unwrap();
+        assert_eq!(plate[0].spans[image + 1].content, " ");
 
         state.move_input_left();
         state.backspace();
         let prompt = state.take_input().unwrap();
         assert_eq!(prompt.content, "az");
+        assert!(prompt.images.is_empty());
+    }
+
+    #[test]
+    fn pending_image_load_is_visible_and_blocks_submission() {
+        let mut state = UiState::new();
+        let id = state.begin_image_load("Processing image");
+        state.insert_char('x');
+
+        assert!(state.image_loading());
+        assert!(state.take_input().is_none());
+        assert!(state.input_lines()[0].spans.iter().any(|span| {
+            span.content.starts_with(" Processing image · ") && span.style.bg == Some(Color::Yellow)
+        }));
+
+        assert!(state.finish_image_load(
+            id,
+            ImageContent {
+                mime_type: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+                path: None,
+                width: 10,
+                height: 20,
+            }
+        ));
+        assert!(!state.image_loading());
+        assert_eq!(state.take_input().unwrap().content, "x");
+    }
+
+    #[test]
+    fn clipboard_text_replaces_pending_plate_at_its_original_position() {
+        let mut state = UiState::new();
+        state.insert_char('a');
+        let id = state.begin_image_load("Reading clipboard");
+        state.insert_char('z');
+
+        assert!(state.replace_image_load_with_paste(id, "one\ntwo", 200));
+        let prompt = state.take_input().unwrap();
+        assert_eq!(prompt.content, "aone\ntwoz");
         assert!(prompt.images.is_empty());
     }
 

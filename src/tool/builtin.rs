@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{Tool, ToolResult};
+use super::{ExecutionPlan, PlanStatus, Tool, ToolResult};
 
 pub struct ReadTool(pub PathBuf);
 pub struct WriteTool(pub PathBuf);
@@ -16,6 +16,7 @@ pub struct ShellTool(pub PathBuf);
 pub struct GrepTool(pub PathBuf);
 pub struct GlobTool(pub PathBuf);
 pub struct ViewImageTool(pub PathBuf);
+pub struct UpdatePlanTool;
 
 fn path(root: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
@@ -288,6 +289,72 @@ impl Tool for ViewImageTool {
                 width: 0,
                 height: 0,
             }),
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for UpdatePlanTool {
+    fn name(&self) -> &str {
+        "update_plan"
+    }
+    fn description(&self) -> &str {
+        "Create or replace the execution plan for substantial multi-step work. Use it for tasks with at least three dependent steps or meaningful uncertainty; skip simple answers and single edits. Send the complete plan on every update, keep steps concise and verifiable, and have at most one in_progress step."
+    }
+    fn schema(&self) -> Value {
+        object(
+            json!({
+                "explanation": {
+                    "type": "string",
+                    "description": "Optional concise reason why the plan changed"
+                },
+                "plan": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": { "type": "string" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            &["plan"],
+        )
+    }
+    async fn run(&self, args: Value) -> Result<ToolResult> {
+        let mut plan: ExecutionPlan = serde_json::from_value(args)?;
+        if plan.plan.is_empty() {
+            bail!("plan must contain at least one step");
+        }
+        if plan
+            .plan
+            .iter()
+            .filter(|step| step.status == PlanStatus::InProgress)
+            .count()
+            > 1
+        {
+            bail!("plan may contain at most one in_progress step");
+        }
+        for step in &mut plan.plan {
+            step.step = step.step.trim().to_owned();
+            if step.step.is_empty() {
+                bail!("plan steps must not be empty");
+            }
+        }
+        plan.explanation = plan
+            .explanation
+            .map(|explanation| explanation.trim().to_owned())
+            .filter(|explanation| !explanation.is_empty());
+        Ok(ToolResult {
+            output: serde_json::to_string_pretty(&plan)?,
+            image: None,
         })
     }
 }

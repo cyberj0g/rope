@@ -1,5 +1,8 @@
 mod builtin;
 mod external;
+mod headless;
+mod web_browser;
+mod web_search;
 
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
@@ -9,8 +12,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{config::Config, runtime::ImageContent};
-use builtin::{EditTool, GlobTool, GrepTool, ReadTool, ShellTool, ViewImageTool, WriteTool};
+use builtin::{
+    EditTool, GlobTool, GrepTool, ReadTool, ShellTool, UpdatePlanTool, ViewImageTool, WriteTool,
+};
 use external::ExternalTool;
+use web_browser::WebBrowserTool;
+use web_search::WebSearchTool;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +25,27 @@ pub enum Approval {
     Allow,
     Ask,
     Deny,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ExecutionPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    pub plan: Vec<PlanStep>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PlanStep {
+    pub step: String,
+    pub status: PlanStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -105,6 +133,12 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     registry.insert(GrepTool(cwd.clone()), config.tools.grep);
     registry.insert(GlobTool(cwd.clone()), config.tools.glob);
     registry.insert(ViewImageTool(cwd.clone()), config.tools.read);
+    if let Some(tool) = WebBrowserTool::discover() {
+        registry.insert(tool, config.tools.web_browser);
+    }
+    if let Some(tool) = WebSearchTool::discover() {
+        registry.insert(tool, config.tools.web_search);
+    }
 
     if let Some(global) =
         directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("rope/tools"))
@@ -117,6 +151,7 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
         config.tools.external,
     )
     .await?;
+    registry.insert(UpdatePlanTool, Approval::Allow);
     Ok(registry)
 }
 
@@ -170,5 +205,33 @@ mod tests {
             tools.definitions(true)[0].function.name,
             "view_image".to_owned()
         );
+    }
+
+    #[tokio::test]
+    async fn update_plan_normalizes_and_validates_steps() {
+        let result = UpdatePlanTool
+            .run(serde_json::json!({
+                "explanation": "  starting work  ",
+                "plan": [
+                    { "step": " inspect code ", "status": "completed" },
+                    { "step": " implement pane ", "status": "in_progress" }
+                ]
+            }))
+            .await
+            .unwrap();
+        let plan: ExecutionPlan = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(plan.explanation.as_deref(), Some("starting work"));
+        assert_eq!(plan.plan[0].step, "inspect code");
+
+        let error = UpdatePlanTool
+            .run(serde_json::json!({
+                "plan": [
+                    { "step": "one", "status": "in_progress" },
+                    { "step": "two", "status": "in_progress" }
+                ]
+            }))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at most one"));
     }
 }
