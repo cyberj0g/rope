@@ -1012,28 +1012,8 @@ fn draw(
         .reasoning_effort
         .map(|value| value.to_string())
         .unwrap_or_else(|| "off".into());
-    let price = state.total_tokens as f64 * config.price_per_token;
-    let context_percent = if state.max_context_tokens == 0 {
-        0
-    } else {
-        (state.context_tokens.saturating_mul(100) / state.max_context_tokens).min(100)
-    };
-    let (status, status_color) = app_status(state);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                format!("{status:<STATUS_WIDTH$}"),
-                Style::default().fg(status_color),
-            ),
-            Span::raw(format!(
-                "  {}  tokens:{}  context:{context_percent}%  ${price:.2}  {}",
-                state.session,
-                state.total_tokens,
-                state.project.cwd.display()
-            )),
-        ]))
-        .block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(status_bar(state, config)).block(Block::default().borders(Borders::ALL)),
         header,
     );
 
@@ -1877,6 +1857,49 @@ fn app_status(state: &UiState) -> (&'static str, Color) {
     } else {
         ("idle", Color::DarkGray)
     }
+}
+
+fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
+    let (status, status_color) = app_status(state);
+    let context_percent = if state.max_context_tokens == 0 {
+        0
+    } else {
+        (state.context_tokens.saturating_mul(100) / state.max_context_tokens).min(100)
+    };
+    let context_color = match context_percent {
+        0..=74 => Color::Green,
+        75..=89 => Color::Yellow,
+        _ => Color::Red,
+    };
+    let price = state.total_tokens as f64 * config.price_per_token;
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{status:<STATUS_WIDTH$}"),
+            Style::default().fg(status_color),
+        ),
+        Span::raw("  "),
+        Span::styled(state.session.clone(), Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("tokens:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            state.total_tokens.to_string(),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw("  "),
+        Span::styled("context:", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{context_percent}%"),
+            Style::default().fg(context_color),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("${price:.2}"), Style::default().fg(Color::Green)),
+        Span::raw("  "),
+        Span::styled(
+            state.project.cwd.display().to_string(),
+            Style::default().fg(Color::Magenta),
+        ),
+    ])
 }
 
 fn error_summary(error: &str) -> String {
@@ -2882,6 +2905,31 @@ mod tests {
 
         state.apply(Event::Error("failed".into()));
         assert_eq!(app_status(&state), ("error", Color::Red));
+    }
+
+    #[test]
+    fn status_bar_fields_have_distinct_colors() {
+        let mut state = UiState::new();
+        state.session = "Colorful Session".into();
+        state.total_tokens = 42;
+        state.context_tokens = 80;
+        state.max_context_tokens = 100;
+        state.project.cwd = "/project".into();
+        let mut config = Config::default();
+        config.price_per_token = 0.01;
+        let line = status_bar(&state, &config);
+        let color = |text: &str| {
+            line.spans
+                .iter()
+                .find(|span| span.content == text)
+                .and_then(|span| span.style.fg)
+        };
+
+        assert_eq!(color("Colorful Session"), Some(Color::Cyan));
+        assert_eq!(color("42"), Some(Color::Yellow));
+        assert_eq!(color("80%"), Some(Color::Yellow));
+        assert_eq!(color("$0.42"), Some(Color::Green));
+        assert_eq!(color("/project"), Some(Color::Magenta));
     }
 
     #[test]
