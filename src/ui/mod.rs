@@ -2,6 +2,8 @@ mod history;
 mod state;
 
 use std::{
+    collections::{HashMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     io::{self, Write},
     path::Path,
     time::Duration,
@@ -24,16 +26,21 @@ use pulldown_cmark::{Alignment, Event as MarkdownEvent, Options, Parser, Tag, Ta
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+use ratatui_image::{
+    Resize,
+    picker::{Picker, ProtocolType},
+    sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 use tokio::sync::mpsc;
 
 use crate::{
     config::Config,
-    runtime::{Command, Event, ImageContent, UserPrompt},
+    runtime::{Command, Event, ImageContent, SessionSummary, UserPrompt},
     tool::PlanStatus,
 };
 use history::PromptHistory;
@@ -56,6 +63,73 @@ struct InputLoad {
     id: u64,
     action: &'static str,
     result: Result<LoadedInput>,
+}
+
+struct ImageRenderer {
+    picker: Option<Picker>,
+    protocols: HashMap<u64, Option<SlicedProtocol>>,
+    detected: bool,
+}
+
+impl ImageRenderer {
+    fn new() -> Self {
+        Self {
+            picker: None,
+            protocols: HashMap::new(),
+            detected: false,
+        }
+    }
+
+    fn detect(&mut self) {
+        self.detected = true;
+        let Ok(picker) = Picker::from_query_stdio() else {
+            return;
+        };
+        if picker.protocol_type() != ProtocolType::Halfblocks {
+            self.picker = Some(picker);
+        }
+    }
+
+    fn font_size(&self) -> Option<(u16, u16)> {
+        self.picker
+            .as_ref()
+            .map(Picker::font_size)
+            .map(|size| (size.width, size.height))
+    }
+
+    fn render(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        image: &ImageContent,
+        size: Size,
+        area: Rect,
+        position: SignedPosition,
+    ) -> bool {
+        let Some(picker) = &self.picker else {
+            return false;
+        };
+        let mut hasher = DefaultHasher::new();
+        image.data.hash(&mut hasher);
+        size.width.hash(&mut hasher);
+        size.height.hash(&mut hasher);
+        let key = hasher.finish();
+        let protocol = self.protocols.entry(key).or_insert_with(|| {
+            let bytes = STANDARD.decode(&image.data).ok()?;
+            let image = image::load_from_memory(&bytes).ok()?;
+            SlicedProtocol::new_with_resize(
+                picker,
+                image,
+                size,
+                Resize::Fit(Some(image::imageops::FilterType::Triangle)),
+            )
+            .ok()
+        });
+        let Some(protocol) = protocol else {
+            return false;
+        };
+        frame.render_widget(SlicedImage::new(protocol, position), area);
+        true
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -146,14 +220,21 @@ pub async fn run(
     config: Config,
     commands: mpsc::Sender<Command>,
     mut events: mpsc::Receiver<Event>,
-) -> Result<()> {
+    request: Option<String>,
+) -> Result<SessionSummary> {
     let mut history = PromptHistory::load().await?;
     let mut terminal = TerminalGuard::new()?;
+    let mut images = ImageRenderer::new();
     let mut state = UiState::new();
+    let mut request = request;
     let (input_load_tx, mut input_load_rx) = mpsc::unbounded_channel();
     let mut chat_height = 0;
     let mut chat_size = None;
     loop {
+        if !images.detected && state.has_chat_images() {
+            images.detect();
+            state.image_cell_size = images.font_size();
+        }
         let size = terminal.terminal.size()?;
         state.expire_toast();
         if state.git_fullscreen_diff {
@@ -185,9 +266,9 @@ pub async fn run(
             ensure_selected_visible(&mut state, chat);
         }
         let mut rendered_chat_height = 0;
-        terminal
-            .terminal
-            .draw(|frame| rendered_chat_height = draw(frame, &config, &state, chat_height))?;
+        terminal.terminal.draw(|frame| {
+            rendered_chat_height = draw(frame, &config, &state, chat_height, &mut images)
+        })?;
         if !state.git_fullscreen_diff {
             chat_height = rendered_chat_height;
         }
@@ -195,7 +276,11 @@ pub async fn run(
         set_chat_scroll_max(&mut state, chat.height, chat_height);
         tokio::select! {
             event = events.recv() => if let Some(event) = event {
+                let history_loaded = matches!(&event, Event::History(_));
                 chat_height = apply_runtime_event(&mut state, event, chat, chat_height);
+                if history_loaded && let Some(request) = request.take() {
+                    submit(request, Vec::new(), &mut state, &mut history, &commands).await?;
+                }
             },
             load = input_load_rx.recv() => if let Some(load) = load {
                 apply_input_load(load, &config, &mut state);
@@ -206,7 +291,9 @@ pub async fn run(
                         TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
                             let page = Rect::new(0, 0, size.width, size.height);
                             if handle_key(key, page, &config, &mut state, &mut history, &commands, &input_load_tx).await? {
-                                commands.send(Command::Shutdown).await.ok(); return Ok(());
+                                let (reply, summary) = tokio::sync::oneshot::channel();
+                                commands.send(Command::Shutdown(reply)).await?;
+                                return summary.await.context("runtime stopped before shutdown");
                             }
                         }
                         TerminalEvent::Mouse(mouse) => {
@@ -231,10 +318,19 @@ pub async fn run(
                             ).await?;
                         }
                         TerminalEvent::Paste(text) => {
-                            history.reset_navigation();
                             let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                            state.insert_paste(&text, config.paste_collapse_chars);
-                            state.palette_selected = 0;
+                            if let Some(search) = &mut state.search {
+                                let text = text.replace('\n', " ");
+                                search.query.insert_str(search.cursor, &text);
+                                search.cursor += text.len();
+                                search.current = 0;
+                                let area = conversation_viewport_area(page, &state);
+                                search_chat(&mut state, area, false);
+                            } else {
+                                history.reset_navigation();
+                                state.insert_paste(&text, config.paste_collapse_chars);
+                                state.palette_selected = 0;
+                            }
                         }
                         _ => {}
                     }
@@ -312,6 +408,45 @@ async fn handle_key(
                 state.notice = Some(format!("denied {}", call.name));
                 state.approval = None;
                 commands.send(Command::Approve(false)).await?;
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
+        state.start_search();
+        return Ok(false);
+    }
+    if state.search.is_some() {
+        let area = conversation_viewport_area(screen, state);
+        match key.code {
+            KeyCode::Esc => state.search = None,
+            KeyCode::F(3) | KeyCode::Enter => search_chat(state, area, true),
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                let search = state.search.as_mut().unwrap();
+                search.delete_word_back();
+                search.current = 0;
+                search_chat(state, area, false);
+            }
+            KeyCode::Backspace => {
+                let search = state.search.as_mut().unwrap();
+                search.backspace();
+                search.current = 0;
+                search_chat(state, area, false);
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                state.search.as_mut().unwrap().move_word_left();
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                state.search.as_mut().unwrap().move_word_right();
+            }
+            KeyCode::Left => state.search.as_mut().unwrap().move_left(),
+            KeyCode::Right => state.search.as_mut().unwrap().move_right(),
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let search = state.search.as_mut().unwrap();
+                search.insert_char(character);
+                search.current = 0;
+                search_chat(state, area, false);
             }
             _ => {}
         }
@@ -399,6 +534,11 @@ async fn handle_key(
                 .await?;
             }
         }
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+            history.reset_navigation();
+            state.delete_input_word_back();
+            state.palette_selected = 0;
+        }
         KeyCode::Backspace => {
             history.reset_navigation();
             state.backspace();
@@ -452,6 +592,10 @@ async fn handle_key(
                 history.next(&mut input);
                 state.set_input(input);
             }
+        }
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => state.move_input_word_left(),
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+            state.move_input_word_right()
         }
         KeyCode::Left => state.move_input_left(),
         KeyCode::Right => state.move_input_right(),
@@ -903,7 +1047,11 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 
 fn page_areas(area: Rect, state: &UiState) -> [Rect; 3] {
     let input_width = area.width.saturating_sub(2).max(1);
-    let input_height = (wrapped_input_lines(state, input_width).len() as u16 + 2).clamp(3, 8);
+    let input_height = if state.search.is_some() {
+        3
+    } else {
+        (wrapped_input_lines(state, input_width).len() as u16 + 2).clamp(3, 8)
+    };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1003,6 +1151,7 @@ fn draw(
     config: &Config,
     state: &UiState,
     hidden_chat_height: usize,
+    images: &mut ImageRenderer,
 ) -> usize {
     if state.git_fullscreen_diff {
         draw_fullscreen_git(frame, state);
@@ -1019,7 +1168,7 @@ fn draw(
     );
 
     let (chat, side) = git_split(body, state);
-    let chat_height = draw_chat(frame, state, chat);
+    let chat_height = draw_chat(frame, state, chat, images);
     if let Some(side) = side {
         let (git, plan) = side_split(side, state);
         draw_git(frame, state, git);
@@ -1045,19 +1194,46 @@ fn draw(
     }
     title.push(Span::raw(" "));
     let input_width = input.width.saturating_sub(2).max(1);
-    frame.render_widget(
-        Paragraph::new(wrapped_input_lines(state, input_width)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(title)),
-        ),
-        input,
-    );
-    draw_command_palette(frame, state, input);
+    if let Some(search) = &state.search {
+        let count = if search.query.is_empty() {
+            String::new()
+        } else if search.total == 0 {
+            " · no matches".into()
+        } else {
+            format!(" · {}/{}", search.current + 1, search.total)
+        };
+        frame.render_widget(
+            Paragraph::new(search.query.clone()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Search{count} · F3 next · Esc close ")),
+            ),
+            input,
+        );
+        frame.set_cursor_position((
+            input.x
+                + 1
+                + search.query[..search.cursor]
+                    .chars()
+                    .count()
+                    .min(input_width.saturating_sub(1) as usize) as u16,
+            input.y + 1,
+        ));
+    } else {
+        frame.render_widget(
+            Paragraph::new(wrapped_input_lines(state, input_width)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Line::from(title)),
+            ),
+            input,
+        );
+        draw_command_palette(frame, state, input);
 
-    let (row, column) = state.input_cursor(input_width);
-    if !state.conversation_focused() {
-        frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
+        let (row, column) = state.input_cursor(input_width);
+        if !state.conversation_focused() {
+            frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
+        }
     }
     draw_toast(frame, state);
     chat_height
@@ -1392,7 +1568,12 @@ fn diff_lines(diff: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) -> usize {
+fn draw_chat(
+    frame: &mut ratatui::Frame,
+    state: &UiState,
+    area: Rect,
+    renderer: &mut ImageRenderer,
+) -> usize {
     let layout = chat_layout(state, area);
     let height = layout.lines.len();
     frame.render_widget(
@@ -1401,6 +1582,40 @@ fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) -> usize {
             .block(Block::default().borders(Borders::LEFT | Borders::RIGHT)),
         area,
     );
+    let image_viewport = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    );
+    for image in layout.images {
+        let top = image.row as i32 - layout.offset as i32;
+        if top >= image_viewport.height as i32 || top + image.height as i32 <= 0 {
+            continue;
+        }
+        let Some(ChatBlock::Message { images, .. }) = state.blocks.get(image.block) else {
+            continue;
+        };
+        let Some(content) = images.get(image.index) else {
+            continue;
+        };
+        let position =
+            SignedPosition::from((0, top.clamp(i16::MIN as i32, i16::MAX as i32) as i16));
+        if !renderer.render(
+            frame,
+            content,
+            Size::new(image.width, image.height),
+            image_viewport,
+            position,
+        ) {
+            let fallback_y = area.y + top.max(0) as u16;
+            frame.render_widget(
+                Paragraph::new(format!(" Image · {}×{}", content.width, content.height))
+                    .style(Style::default().fg(Color::Cyan)),
+                Rect::new(image_viewport.x, fallback_y, image.width, 1),
+            );
+        }
+    }
     height
 }
 
@@ -1441,17 +1656,61 @@ fn scroll_chat_down(state: &mut UiState, amount: u16) {
     state.scroll = state.scroll.saturating_sub(amount);
 }
 
+fn search_chat(state: &mut UiState, area: Rect, next: bool) {
+    let layout = chat_layout(state, area);
+    let total = layout.search_matches.len();
+    let Some(search) = &mut state.search else {
+        return;
+    };
+    if total == 0 {
+        search.current = 0;
+        search.total = 0;
+        return;
+    }
+    search.current = if next {
+        (search.current + 1) % total
+    } else {
+        0
+    };
+    search.total = total;
+
+    let row = layout.search_matches[search.current].row;
+    let max_scroll = max_chat_scroll(layout.lines.len(), area.height);
+    let offset = row.saturating_sub(1).min(max_scroll);
+    state.chat_scroll_max = max_scroll;
+    state.scroll = max_scroll - offset;
+}
+
 struct ChatLayout {
     lines: Vec<Line<'static>>,
     headers: Vec<(usize, u16, u16)>,
     diff_buttons: Vec<(usize, u16, u16)>,
+    search_matches: Vec<SearchMatch>,
+    images: Vec<ChatImagePlacement>,
     offset: u16,
+}
+
+#[derive(Clone, Copy)]
+struct ChatImagePlacement {
+    block: usize,
+    index: usize,
+    row: u16,
+    width: u16,
+    height: u16,
+}
+
+#[derive(Clone, Copy)]
+struct SearchMatch {
+    row: u16,
+    start: u16,
+    end: u16,
 }
 
 fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
     let mut lines = Vec::new();
     let mut header_lines = Vec::new();
     let mut diff_header_lines = Vec::new();
+    let mut image_lines = Vec::new();
     for (index, block) in state.blocks.iter().enumerate() {
         match block {
             ChatBlock::Message {
@@ -1466,6 +1725,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                     MessageKind::User => Color::Cyan,
                     MessageKind::Assistant => Color::Blue,
                     MessageKind::System => Color::Magenta,
+                    MessageKind::Error => Color::Red,
                 };
                 if matches!(kind, MessageKind::User | MessageKind::Assistant) {
                     header_lines.push((index, lines.len()));
@@ -1491,17 +1751,26 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                             markdown(content)
                         };
                         lines.extend(rendered.into_iter().map(pad_line));
-                        lines.extend(images.iter().map(|image| {
-                            let dimensions = if image.width == 0 || image.height == 0 {
-                                String::new()
+                        for (image_index, image) in images.iter().enumerate() {
+                            if let Some(font_size) = state.image_cell_size
+                                && image.width > 0
+                                && image.height > 0
+                            {
+                                let (width, height) = image_cell_area(image, area, font_size);
+                                image_lines.push((index, image_index, lines.len(), width, height));
+                                lines.extend((0..height).map(|_| Line::default()));
                             } else {
-                                format!(" · {}×{}", image.width, image.height)
-                            };
-                            Line::styled(
-                                format!(" Image{dimensions}"),
-                                Style::default().fg(Color::Cyan),
-                            )
-                        }));
+                                let dimensions = if image.width == 0 || image.height == 0 {
+                                    String::new()
+                                } else {
+                                    format!(" · {}×{}", image.width, image.height)
+                                };
+                                lines.push(Line::styled(
+                                    format!(" Image{dimensions}"),
+                                    Style::default().fg(Color::Cyan),
+                                ));
+                            }
+                        }
                     }
                 } else {
                     lines.push(Line::styled(
@@ -1619,13 +1888,6 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
             Style::default().fg(Color::Green),
         ));
     }
-    if let Some(error) = &state.error {
-        lines.push(Line::styled(
-            format!(" Error: {}", error_summary(error)),
-            Style::default().fg(Color::Red),
-        ));
-    }
-
     let width = area.width.saturating_sub(2).max(1);
     let (mut lines, starts) = wrap_chat_lines(lines, width);
     let content_height = lines.len() as u16;
@@ -1647,15 +1909,98 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
             (start..end).map(move |column| (block, row + column / width, column % width))
         })
         .collect();
+    let images = image_lines
+        .into_iter()
+        .map(|(block, index, line, width, height)| ChatImagePlacement {
+            block,
+            index,
+            row: starts[line],
+            width,
+            height,
+        })
+        .collect();
+    let search_matches = state
+        .search
+        .as_ref()
+        .filter(|search| !search.query.is_empty())
+        .map_or_else(Vec::new, |search| {
+            find_search_matches(&lines, &search.query)
+        });
     if let Some(selection) = state.text_selection {
         highlight_selection(&mut lines, selection);
+    }
+    if let Some(search) = &state.search
+        && let Some(found) = search_matches.get(search.current)
+    {
+        highlight_search_match(&mut lines[found.row as usize], *found);
     }
     ChatLayout {
         lines,
         headers,
         diff_buttons,
+        search_matches,
+        images,
         offset,
     }
+}
+
+fn image_cell_area(image: &ImageContent, area: Rect, font_size: (u16, u16)) -> (u16, u16) {
+    let max_width = area.width.saturating_sub(2).max(1);
+    let max_height = area.height.saturating_sub(2).clamp(1, 16);
+    let mut width = image.width.div_ceil(font_size.0.max(1) as u32).max(1);
+    let mut height = image.height.div_ceil(font_size.1.max(1) as u32).max(1);
+    if width > max_width as u32 {
+        height = height.saturating_mul(max_width as u32).div_ceil(width);
+        width = max_width as u32;
+    }
+    if height > max_height as u32 {
+        width = width.saturating_mul(max_height as u32).div_ceil(height);
+        height = max_height as u32;
+    }
+    (width.max(1) as u16, height.max(1) as u16)
+}
+
+fn find_search_matches(lines: &[Line<'static>], query: &str) -> Vec<SearchMatch> {
+    let needle = query.to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for (row, line) in lines.iter().enumerate() {
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let haystack = text.to_ascii_lowercase();
+        for (start, found) in haystack.match_indices(&needle) {
+            let column = haystack[..start].chars().count();
+            matches.push(SearchMatch {
+                row: row as u16,
+                start: column as u16,
+                end: (column + found.chars().count()) as u16,
+            });
+        }
+    }
+    matches
+}
+
+fn highlight_search_match(line: &mut Line<'static>, found: SearchMatch) {
+    let spans = std::mem::take(&mut line.spans);
+    let mut highlighted = Line::default();
+    let mut column = 0;
+    for span in spans {
+        for character in span.content.chars() {
+            let style = if column >= found.start && column < found.end {
+                span.style.bg(Color::Yellow).fg(Color::Black)
+            } else {
+                span.style
+            };
+            push_styled_char(&mut highlighted, character, style);
+            column += 1;
+        }
+    }
+    line.spans = highlighted.spans;
 }
 
 fn wrap_chat_lines(lines: Vec<Line<'static>>, width: u16) -> (Vec<Line<'static>>, Vec<u16>) {
@@ -1903,16 +2248,6 @@ fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
             Style::default().fg(Color::Magenta),
         ),
     ])
-}
-
-fn error_summary(error: &str) -> String {
-    let mut characters = error.chars();
-    let summary = characters.by_ref().take(100).collect::<String>();
-    if characters.next().is_some() {
-        format!("{summary}...")
-    } else {
-        summary
-    }
 }
 
 fn size_label(chars: usize) -> String {
@@ -2908,6 +3243,15 @@ mod tests {
 
         state.apply(Event::Error("failed".into()));
         assert_eq!(app_status(&state), ("error", Color::Red));
+        assert!(matches!(
+            state.blocks.last(),
+            Some(ChatBlock::Message {
+                label,
+                content,
+                kind: MessageKind::Error,
+                ..
+            }) if label == "Error" && content == "failed"
+        ));
     }
 
     #[test]
@@ -2933,6 +3277,36 @@ mod tests {
         assert_eq!(color("80%"), Some(Color::Yellow));
         assert_eq!(color("$0.42"), Some(Color::Green));
         assert_eq!(color("/project"), Some(Color::Magenta));
+    }
+
+    #[test]
+    fn chat_search_starts_at_the_first_match_and_wraps() {
+        let mut state = UiState::new();
+        state.push_user("Needle one".into());
+        state.push_user("two needle needle".into());
+        state.start_search();
+        state.search.as_mut().unwrap().query = "needle".into();
+        let area = Rect::new(0, 0, 40, 5);
+
+        search_chat(&mut state, area, false);
+        assert_eq!(state.search.as_ref().unwrap().total, 3);
+        assert_eq!(state.search.as_ref().unwrap().current, 0);
+
+        search_chat(&mut state, area, true);
+        assert_eq!(state.search.as_ref().unwrap().current, 1);
+        search_chat(&mut state, area, true);
+        assert_eq!(state.search.as_ref().unwrap().current, 2);
+        search_chat(&mut state, area, true);
+        assert_eq!(state.search.as_ref().unwrap().current, 0);
+
+        let layout = chat_layout(&state, area);
+        let found = layout.search_matches[0];
+        assert!(
+            layout.lines[found.row as usize]
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::Yellow))
+        );
     }
 
     #[test]
@@ -2990,9 +3364,16 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(page.width, page.height)).unwrap();
         let mut hidden_chat_height = 0;
+        let mut images = ImageRenderer::new();
         terminal
             .draw(|frame| {
-                hidden_chat_height = draw(frame, &Config::default(), &state, before.lines.len())
+                hidden_chat_height = draw(
+                    frame,
+                    &Config::default(),
+                    &state,
+                    before.lines.len(),
+                    &mut images,
+                )
             })
             .unwrap();
         assert_eq!(hidden_chat_height, before.lines.len());
@@ -3048,13 +3429,6 @@ mod tests {
     }
 
     #[test]
-    fn long_errors_are_collapsed_without_losing_unicode_boundaries() {
-        let error = "é".repeat(101);
-        assert_eq!(error_summary(&error), format!("{}...", "é".repeat(100)));
-        assert_eq!(error_summary(&"é".repeat(100)), "é".repeat(100));
-    }
-
-    #[test]
     fn elapsed_time_uses_compact_units() {
         assert_eq!(format_elapsed(Duration::from_millis(999)), "999ms");
         assert_eq!(format_elapsed(Duration::from_millis(1_500)), "1.5s");
@@ -3104,6 +3478,71 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Image · 640×480"));
+    }
+
+    #[test]
+    fn terminal_images_reserve_scaled_chat_rows() {
+        let mut state = UiState::new();
+        state.image_cell_size = Some((10, 20));
+        state.push_user_with_images(
+            String::new(),
+            vec![ImageContent {
+                mime_type: "image/png".into(),
+                data: String::new(),
+                path: Some("attachments/image.png".into()),
+                width: 640,
+                height: 480,
+            }],
+        );
+
+        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10));
+        assert_eq!(layout.images.len(), 1);
+        assert_eq!(layout.images[0].width, 22);
+        assert_eq!(layout.images[0].height, 8);
+    }
+
+    #[test]
+    fn image_renderer_encodes_partially_visible_native_protocols() {
+        use ratatui::backend::TestBackend;
+
+        let image = encode_image(
+            2,
+            2,
+            &[
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        )
+        .unwrap();
+        for protocol_type in [ProtocolType::Sixel, ProtocolType::Iterm2] {
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(protocol_type);
+            let mut renderer = ImageRenderer {
+                picker: Some(picker),
+                protocols: HashMap::new(),
+                detected: true,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(10, 4)).unwrap();
+            let mut rendered = false;
+
+            terminal
+                .draw(|frame| {
+                    rendered = renderer.render(
+                        frame,
+                        &image,
+                        Size::new(2, 2),
+                        Rect::new(0, 0, 10, 4),
+                        SignedPosition::from((0, -1)),
+                    );
+                })
+                .unwrap();
+
+            assert!(rendered);
+            assert!(match (protocol_type, renderer.protocols.values().next()) {
+                (ProtocolType::Sixel, Some(Some(SlicedProtocol::Sixel(_)))) => true,
+                (ProtocolType::Iterm2, Some(Some(SlicedProtocol::Sliced(_)))) => true,
+                _ => false,
+            });
+        }
     }
 
     #[test]

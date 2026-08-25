@@ -9,7 +9,6 @@ use crate::{runtime::ReasoningEffort, tool::Approval};
 
 #[derive(Clone, Debug, Default)]
 pub struct Startup {
-    pub continue_session: Option<String>,
     pub session: Option<String>,
 }
 
@@ -17,21 +16,8 @@ pub struct Startup {
 #[command(version, about = "Minimal OpenAI-compatible terminal chat")]
 pub struct Args {
     #[arg(long)]
-    config: Option<PathBuf>,
-    #[arg(long)]
-    base_url: Option<String>,
-    #[arg(long)]
-    api_key: Option<String>,
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(long)]
-    temperature: Option<f32>,
-    #[arg(long)]
-    reasoning_effort: Option<ReasoningEffort>,
-    #[arg(long = "continue", num_args = 0..=1, default_missing_value = "latest")]
-    continue_session: Option<String>,
-    #[arg(long, conflicts_with = "continue_session")]
-    session: Option<String>,
+    pub session: Option<String>,
+    pub request: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -133,14 +119,13 @@ impl Default for Config {
 impl Args {
     pub fn startup(&self) -> Startup {
         Startup {
-            continue_session: self.continue_session.clone(),
             session: self.session.clone(),
         }
     }
 }
 
 impl Config {
-    pub fn load(args: Args) -> Result<Self> {
+    pub fn load() -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let global = config_root()?.join("config.toml");
         let local_root = cwd.join(".rope");
@@ -152,16 +137,9 @@ impl Config {
         };
 
         let mut value = toml::Value::try_from(Self::default())?;
-        if let Some(path) = args.config.as_ref() {
-            if !path.exists() {
-                bail!("config file not found: {}", path.display());
-            }
-            merge(&mut value, read_toml(path)?);
-        } else {
-            for path in [&global, &local] {
-                if path.exists() {
-                    merge(&mut value, read_toml(path)?);
-                }
+        for path in [&global, &local] {
+            if path.exists() {
+                merge(&mut value, read_toml(path)?);
             }
         }
         let mut config: Self = value.try_into().context("decode merged config")?;
@@ -169,21 +147,6 @@ impl Config {
         config.normalize()?;
         config.load_settings()?;
 
-        if let Some(value) = args.base_url {
-            config.base_url = value;
-        }
-        if let Some(value) = args.api_key {
-            config.api_key = value;
-        }
-        if let Some(value) = args.model {
-            config.select_model(&value)?;
-        }
-        if let Some(value) = args.temperature {
-            config.temperature = Some(value);
-        }
-        if let Some(value) = args.reasoning_effort {
-            config.reasoning_effort = Some(value);
-        }
         Ok(config)
     }
 
@@ -347,6 +310,16 @@ fn merge(base: &mut toml::Value, overlay: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_accepts_only_session_and_one_request() {
+        let args = Args::try_parse_from(["rope", "--session", "work", "fix the tests"]).unwrap();
+        assert_eq!(args.session.as_deref(), Some("work"));
+        assert_eq!(args.request.as_deref(), Some("fix the tests"));
+        assert!(Args::try_parse_from(["rope", "one", "two"]).is_err());
+        assert!(Args::try_parse_from(["rope", "--model", "qwen"]).is_err());
+    }
 
     #[test]
     fn cli_values_override_defaults() {

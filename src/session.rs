@@ -37,19 +37,14 @@ impl Session {
     pub async fn open(startup: Startup) -> Result<(Self, Vec<Message>)> {
         let root = sessions_root()?;
         tokio::fs::create_dir_all(&root).await?;
-        if let Some(name) = startup.continue_session {
-            let name = if name == "latest" {
-                latest(&root).await?
-            } else {
-                clean_name(&name)?
-            };
+        let Some(name) = startup.session else {
+            let session = Self::create(root, auto_name()).await?;
+            return Ok((session, Vec::new()));
+        };
+        let name = clean_name(&name)?;
+        if root.join(&name).is_dir() {
             return Self::load(root, name).await;
         }
-        let name = startup
-            .session
-            .map(|name| clean_name(&name))
-            .transpose()?
-            .unwrap_or_else(auto_name);
         let session = Self::create(root, name).await?;
         Ok((session, Vec::new()))
     }
@@ -249,29 +244,6 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-}
-
-async fn latest(root: &Path) -> Result<String> {
-    let mut entries = tokio::fs::read_dir(root).await?;
-    let mut latest = None;
-    while let Some(entry) = entries.next_entry().await? {
-        if !entry.metadata().await?.is_dir() {
-            continue;
-        }
-        let directory = entry.path();
-        let mut modified = entry.metadata().await?.modified().unwrap_or(UNIX_EPOCH);
-        for file in ["session.json", "messages.jsonl"] {
-            if let Ok(metadata) = tokio::fs::metadata(directory.join(file)).await {
-                modified = modified.max(metadata.modified().unwrap_or(UNIX_EPOCH));
-            }
-        }
-        if latest.as_ref().is_none_or(|(_, time)| modified > *time) {
-            latest = Some((entry.file_name().to_string_lossy().into_owned(), modified));
-        }
-    }
-    latest
-        .map(|(name, _)| name)
-        .context("no sessions to continue")
 }
 
 #[cfg(test)]

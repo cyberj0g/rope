@@ -16,6 +16,7 @@ pub enum MessageKind {
     User,
     Assistant,
     System,
+    Error,
 }
 
 #[derive(Clone, Copy)]
@@ -160,6 +161,8 @@ pub struct UiState {
     pub plan_panel_height: Option<u16>,
     pub plan_split_dragging: bool,
     pub plan_scroll: u16,
+    pub search: Option<ChatSearch>,
+    pub image_cell_size: Option<(u16, u16)>,
     assistant: Option<usize>,
     reasoning: Option<usize>,
     response_model: String,
@@ -173,6 +176,54 @@ pub struct UiState {
     pub text_selection: Option<TextSelection>,
     pub selection_anchor: Option<TextPoint>,
     toast: Option<Toast>,
+}
+
+pub struct ChatSearch {
+    pub query: String,
+    pub cursor: usize,
+    pub current: usize,
+    pub total: usize,
+}
+
+impl ChatSearch {
+    pub fn insert_char(&mut self, character: char) {
+        self.query.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+    }
+
+    pub fn backspace(&mut self) {
+        let Some((start, _)) = self.query[..self.cursor].char_indices().next_back() else {
+            return;
+        };
+        self.query.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    pub fn move_left(&mut self) {
+        if let Some((start, _)) = self.query[..self.cursor].char_indices().next_back() {
+            self.cursor = start;
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        if let Some(character) = self.query[self.cursor..].chars().next() {
+            self.cursor += character.len_utf8();
+        }
+    }
+
+    pub fn move_word_left(&mut self) {
+        self.cursor = previous_word_start(&self.query, self.cursor);
+    }
+
+    pub fn move_word_right(&mut self) {
+        self.cursor = next_word_start(&self.query, self.cursor);
+    }
+
+    pub fn delete_word_back(&mut self) {
+        let start = previous_word_start(&self.query, self.cursor);
+        self.query.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +298,8 @@ impl UiState {
             plan_panel_height: None,
             plan_split_dragging: false,
             plan_scroll: 0,
+            search: None,
+            image_cell_size: None,
             assistant: None,
             reasoning: None,
             response_model: String::new(),
@@ -485,6 +538,59 @@ impl UiState {
         }
     }
 
+    pub fn move_input_word_left(&mut self) {
+        if let Some((start, _)) = self
+            .input_items()
+            .into_iter()
+            .find(|(_, end)| *end == self.input_cursor)
+        {
+            self.input_cursor = start;
+            return;
+        }
+        let target = previous_word_start(&self.input, self.input_cursor);
+        self.input_cursor = self
+            .input_items()
+            .into_iter()
+            .filter(|(start, end)| *start < self.input_cursor && *end > target)
+            .map(|(_, end)| end)
+            .max()
+            .unwrap_or(target);
+    }
+
+    pub fn move_input_word_right(&mut self) {
+        if let Some((_, end)) = self
+            .input_items()
+            .into_iter()
+            .find(|(start, _)| *start == self.input_cursor)
+        {
+            self.input_cursor = end;
+            return;
+        }
+        let target = next_word_start(&self.input, self.input_cursor);
+        self.input_cursor = self
+            .input_items()
+            .into_iter()
+            .filter(|(start, end)| *start < target && *end > self.input_cursor)
+            .map(|(start, _)| start)
+            .min()
+            .unwrap_or(target);
+    }
+
+    pub fn delete_input_word_back(&mut self) {
+        let end = self.input_cursor;
+        self.move_input_word_left();
+        let start = self.input_cursor;
+        if start == end {
+            return;
+        }
+        self.pasted
+            .retain(|range| range.start < start || range.end > end);
+        self.input_images
+            .retain(|item| item.start < start || item.end > end);
+        self.input.replace_range(start..end, "");
+        self.shift_input_items(end, -((end - start) as isize));
+    }
+
     pub fn move_input_home(&mut self) {
         self.input_cursor = 0;
     }
@@ -580,6 +686,14 @@ impl UiState {
         plates
     }
 
+    fn input_items(&self) -> Vec<(usize, usize)> {
+        self.pasted
+            .iter()
+            .map(|range| (range.start, range.end))
+            .chain(self.input_images.iter().map(|item| (item.start, item.end)))
+            .collect()
+    }
+
     fn remove_input_image(&mut self, index: usize) -> usize {
         let item = self.input_images.remove(index);
         self.input.replace_range(item.start..item.end, "");
@@ -624,7 +738,16 @@ impl UiState {
     }
 
     pub fn set_error(&mut self, error: impl Into<String>) {
-        self.error = Some(error.into());
+        let error = error.into();
+        self.error = Some(error.clone());
+        self.blocks.push(ChatBlock::Message {
+            label: "Error".into(),
+            content: error,
+            images: Vec::new(),
+            model: String::new(),
+            kind: MessageKind::Error,
+            expanded: true,
+        });
     }
 
     pub fn toggle_thinking_default(&mut self) {
@@ -726,6 +849,25 @@ impl UiState {
 
     pub fn focus_input(&mut self) {
         self.selected = None;
+    }
+
+    pub fn start_search(&mut self) {
+        self.focus_input();
+        self.search = Some(ChatSearch {
+            query: String::new(),
+            cursor: 0,
+            current: 0,
+            total: 0,
+        });
+    }
+
+    pub fn has_chat_images(&self) -> bool {
+        self.blocks.iter().any(|block| {
+            matches!(
+                block,
+                ChatBlock::Message { images, .. } if !images.is_empty()
+            )
+        })
     }
 
     #[cfg(test)]
@@ -1010,7 +1152,7 @@ impl UiState {
                 self.waiting = false;
                 self.tool_running = false;
                 self.approval = None;
-                self.error = Some(error);
+                self.set_error(error);
             }
         }
     }
@@ -1174,6 +1316,46 @@ fn collapsible(block: &ChatBlock) -> bool {
     )
 }
 
+fn previous_word_start(text: &str, cursor: usize) -> usize {
+    let mut start = cursor;
+    let mut characters = text[..cursor].char_indices().rev().peekable();
+    while let Some(&(index, character)) = characters.peek() {
+        if character.is_alphanumeric() {
+            break;
+        }
+        start = index;
+        characters.next();
+    }
+    while let Some(&(index, character)) = characters.peek() {
+        if !character.is_alphanumeric() {
+            break;
+        }
+        start = index;
+        characters.next();
+    }
+    start
+}
+
+fn next_word_start(text: &str, cursor: usize) -> usize {
+    let mut end = cursor;
+    let mut characters = text[cursor..].char_indices().peekable();
+    while let Some(&(index, character)) = characters.peek() {
+        if !character.is_alphanumeric() {
+            break;
+        }
+        end = cursor + index + character.len_utf8();
+        characters.next();
+    }
+    while let Some(&(index, character)) = characters.peek() {
+        if character.is_alphanumeric() {
+            break;
+        }
+        end = cursor + index + character.len_utf8();
+        characters.next();
+    }
+    end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1481,32 @@ mod tests {
         let mut state = UiState::new();
         state.apply(Event::UsageChanged(12_345));
         assert_eq!(state.total_tokens, 12_345);
+    }
+
+    #[test]
+    fn errors_append_without_erasing_the_transcript() {
+        let mut state = UiState::new();
+        state.push_user("keep this".into());
+        state.apply(Event::TextDelta("partial response".into()));
+        state.apply(Event::Error("model turn limit reached".into()));
+
+        assert_eq!(state.blocks.len(), 3);
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                content,
+                kind: MessageKind::User,
+                ..
+            } if content == "keep this"
+        ));
+        assert!(matches!(
+            state.blocks.last(),
+            Some(ChatBlock::Message {
+                content,
+                kind: MessageKind::Error,
+                ..
+            }) if content == "model turn limit reached"
+        ));
     }
 
     #[test]
@@ -1497,6 +1705,64 @@ mod tests {
                 .iter()
                 .any(|span| span.content == " Pasted 10 chars ")
         );
+    }
+
+    #[test]
+    fn word_navigation_uses_non_alphanumeric_boundaries() {
+        let mut state = UiState::new();
+        state.set_input("alpha-beta gamma".into());
+
+        state.move_input_word_left();
+        state.insert_char('|');
+        assert_eq!(state.input, "alpha-beta |gamma");
+
+        state.move_input_word_left();
+        state.insert_char('|');
+        assert_eq!(state.input, "alpha-|beta |gamma");
+
+        state.move_input_word_right();
+        state.insert_char('|');
+        assert_eq!(state.input, "alpha-|beta ||gamma");
+    }
+
+    #[test]
+    fn word_backspace_deletes_words_but_keeps_punctuation_boundaries() {
+        let mut state = UiState::new();
+        state.set_input("alpha-beta gamma".into());
+
+        state.delete_input_word_back();
+        assert_eq!(state.input, "alpha-beta ");
+        state.delete_input_word_back();
+        assert_eq!(state.input, "alpha-");
+    }
+
+    #[test]
+    fn word_navigation_keeps_collapsed_pastes_atomic() {
+        let mut state = UiState::new();
+        state.insert_char('a');
+        state.insert_paste("long paste", 4);
+        state.insert_char('z');
+
+        state.move_input_word_left();
+        assert_eq!(state.input_cursor, "along paste".len());
+        state.move_input_word_left();
+        assert_eq!(state.input_cursor, 1);
+    }
+
+    #[test]
+    fn search_word_editing_uses_the_same_boundaries() {
+        let mut search = ChatSearch {
+            query: "alpha-beta gamma".into(),
+            cursor: "alpha-beta gamma".len(),
+            current: 0,
+            total: 0,
+        };
+
+        search.move_word_left();
+        assert_eq!(search.cursor, "alpha-beta ".len());
+        search.delete_word_back();
+        assert_eq!(search.query, "alpha-gamma");
+        assert_eq!(search.cursor, "alpha-".len());
     }
 
     #[test]

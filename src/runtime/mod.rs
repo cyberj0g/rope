@@ -80,7 +80,12 @@ pub enum Command {
     NextReasoningEffort,
     RefreshProject,
     GitDiff(Option<std::path::PathBuf>),
-    Shutdown,
+    Shutdown(oneshot::Sender<SessionSummary>),
+}
+
+pub struct SessionSummary {
+    pub name: String,
+    pub total_tokens: u64,
 }
 
 pub enum Event {
@@ -301,9 +306,13 @@ async fn run<P: Provider>(
                         internal.send(InternalEvent::ProjectChanged(changed)).await.ok();
                     });
                 }
-                Command::Shutdown => {
+                Command::Shutdown(reply) => {
                     if let Some(task) = generation.take() { task.abort(); }
                     session.save().await.ok();
+                    reply.send(SessionSummary {
+                        name: session.meta.name.clone(),
+                        total_tokens: session.meta.total_tokens,
+                    }).ok();
                     break;
                 }
                 Command::NewSession(_)
@@ -348,7 +357,6 @@ async fn run<P: Provider>(
                 InternalEvent::Failed(error) if generation.is_some() => {
                     generation = None; pending_approval = None; messages.pop();
                     session.save().await.ok();
-                    events.send(Event::History(messages.clone())).await.ok();
                     events.send(Event::Error(error)).await.ok();
                     refresh_project(project.clone(), internal_tx.clone());
                 }
@@ -801,7 +809,7 @@ async fn agent<P: Provider>(
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<Vec<Message>> {
-    for _ in 0..32 {
+    for _ in 0..64 {
         events
             .send(Event::ModelRequestStarted(config.model_id().to_owned()))
             .await
@@ -889,7 +897,7 @@ async fn agent<P: Provider>(
             messages.push(Message::tool(call.id, output, image, diff));
         }
     }
-    bail!("tool loop exceeded 32 model turns")
+    bail!("tool loop exceeded 64 model turns")
 }
 
 async fn stream_with_retry<P: Provider>(

@@ -15,7 +15,9 @@
 - persisted 2-3 word model-generated titles for automatically named sessions, created after the first completed response
 - JSONL conversation persistence after completed turns
 - persisted session token totals and configurable per-token cost estimates
-- `--continue [NAME]`, `--session NAME`, `/new [NAME]`, and `/save`
+- `--session NAME` to create or resume a session, plus `/new [NAME]` and `/save`
+- optional positional startup request submitted as soon as the terminal UI opens
+- exit summary with tokens used, estimated cost, and the exact session resume command
 
 ## Tools
 
@@ -41,6 +43,7 @@ External tools receive their function arguments as JSON on stdin and must return
 ## Coder UI
 
 - global persistent prompt history with Bash-style Up/Down navigation and Shift+Enter newlines
+- Fish-style `Alt+Left/Right` word jumps and `Alt+Backspace` word deletion on non-alphanumeric boundaries
 - bracketed multiline paste handling, width-aware growing composer, and configurable collapsed large-paste tokens
 - original soft line breaks preserved when rendering user messages
 - sequential duplicate filtering in persistent prompt history
@@ -51,7 +54,9 @@ External tools receive their function arguments as JSON on stdin and must return
 - collapsible messages plus collapsed-by-default thinking and tool sections
 - live elapsed time on thinking and tool calls with compact duration units
 - one-space conversation content padding with flush section headers
-- fixed-width, color-coded connecting, waiting-for-first-response, generating, tool-running, idle, and error status with compact chat errors
+- fixed-width, color-coded connecting, waiting-for-first-response, generating, tool-running, idle, and error status
+- failed turns preserve the visible transcript and append the error to the conversation
+- case-insensitive `Ctrl+F` chat search with highlighted, wrapping `F3` navigation
 - separately colored model and reasoning details on the padded input box; session tokens and cost on the status bar
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
@@ -62,6 +67,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - drag-to-copy conversation selection with a non-blocking clipboard toast
 - filtered slash-command palette with keyboard navigation and command hotkeys
 - non-blocking clipboard and `/image` image attachments with an elapsed processing plate
+- inline, vertically sliced Sixel, iTerm2, and Kitty image rendering that follows chat scrolling when supported by the terminal, with text fallback
 - bracketed paste plus direct Shift+Insert clipboard fallback
 - `/thinking` and `/tools` global visibility toggles plus clickable model and reasoning selectors
 - `/add PATH`, `/drop PATH`, and `/diff`
