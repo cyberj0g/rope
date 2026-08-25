@@ -902,7 +902,8 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 }
 
 fn page_areas(area: Rect, state: &UiState) -> [Rect; 3] {
-    let input_height = (state.input_lines().len() as u16 + 2).clamp(3, 8);
+    let input_width = area.width.saturating_sub(2).max(1);
+    let input_height = (wrapped_input_lines(state, input_width).len() as u16 + 2).clamp(3, 8);
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1043,19 +1044,17 @@ fn draw(
         ));
     }
     title.push(Span::raw(" "));
+    let input_width = input.width.saturating_sub(2).max(1);
     frame.render_widget(
-        Paragraph::new(state.input_lines())
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Line::from(title)),
-            ),
+        Paragraph::new(wrapped_input_lines(state, input_width)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(title)),
+        ),
         input,
     );
     draw_command_palette(frame, state, input);
 
-    let input_width = input.width.saturating_sub(2).max(1);
     let (row, column) = state.input_cursor(input_width);
     if !state.conversation_focused() {
         frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
@@ -1403,6 +1402,10 @@ fn draw_chat(frame: &mut ratatui::Frame, state: &UiState, area: Rect) -> usize {
         area,
     );
     height
+}
+
+fn wrapped_input_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
+    wrap_chat_lines(state.input_lines(), width).0
 }
 
 fn chat_max_scroll(state: &UiState, area: Rect) -> u16 {
@@ -3148,6 +3151,26 @@ mod tests {
             ["/thinking", "/tools"]
         );
         assert!(palette_commands("/add ").is_none());
+    }
+
+    #[test]
+    fn pasted_text_wraps_and_grows_the_composer() {
+        let mut state = UiState::new();
+        state.insert_paste("abcdefghij", 200);
+        let lines = wrapped_input_lines(&state, 8);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(text, [" abcdefg", "hij"]);
+        assert_eq!(page_areas(Rect::new(0, 0, 10, 12), &state)[2].height, 4);
+        assert_eq!(state.input_cursor(8), (1, 3));
     }
 
     #[test]

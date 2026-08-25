@@ -41,7 +41,7 @@ External tools receive their function arguments as JSON on stdin and must return
 ## Coder UI
 
 - global persistent prompt history with Bash-style Up/Down navigation and Shift+Enter newlines
-- bracketed multiline paste handling and configurable collapsed large-paste tokens
+- bracketed multiline paste handling, width-aware growing composer, and configurable collapsed large-paste tokens
 - original soft line breaks preserved when rendering user messages
 - sequential duplicate filtering in persistent prompt history
 - CommonMark/GFM rendering with inline emphasis, links, aligned tables, and syntax-colored fenced code blocks
