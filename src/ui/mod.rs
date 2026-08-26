@@ -215,6 +215,7 @@ const MIN_CHAT_WIDTH: u16 = 40;
 const MIN_GIT_WIDTH: u16 = 24;
 const MIN_SIDE_PANE_HEIGHT: u16 = 4;
 const STATUS_WIDTH: usize = "connecting".len();
+const SPEED_WIDTH: usize = "~9999.9 tokens/s".len();
 
 pub async fn run(
     config: Config,
@@ -359,6 +360,7 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
                 | Event::Retrying { .. }
                 | Event::CompactionStarted
                 | Event::GenerationFinished
+                | Event::GenerationCancelled
                 | Event::Saved
                 | Event::Error(_)
         );
@@ -976,6 +978,12 @@ async fn handle_mouse(
         return Ok(());
     }
     match mouse.kind {
+        MouseEventKind::Down(MouseButton::Right) => {
+            if let Some(index) = chat_section_hit_test(state, conversation, mouse.row) {
+                state.collapse(index);
+                clamp_chat_scroll(state, conversation);
+            }
+        }
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(diff) = chat_diff_hit_test(state, conversation, mouse.column, mouse.row) {
                 state.text_selection = None;
@@ -1684,6 +1692,7 @@ fn search_chat(state: &mut UiState, area: Rect, next: bool) {
 struct ChatLayout {
     lines: Vec<Line<'static>>,
     headers: Vec<(usize, u16, u16)>,
+    sections: Vec<(usize, u16, u16)>,
     diff_buttons: Vec<(usize, u16, u16)>,
     search_matches: Vec<SearchMatch>,
     images: Vec<ChatImagePlacement>,
@@ -1709,9 +1718,12 @@ struct SearchMatch {
 fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
     let mut lines = Vec::new();
     let mut header_lines = Vec::new();
+    let mut section_lines = Vec::new();
     let mut diff_header_lines = Vec::new();
     let mut image_lines = Vec::new();
     for (index, block) in state.blocks.iter().enumerate() {
+        let start = lines.len();
+        let header_count = header_lines.len();
         match block {
             ChatBlock::Message {
                 label,
@@ -1879,6 +1891,9 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                 }
             }
         }
+        if header_lines.len() > header_count {
+            section_lines.push((index, start, lines.len()));
+        }
         lines.push(Line::default());
     }
     lines.push(Line::default());
@@ -1900,6 +1915,14 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
             let row = starts[line];
             let end = starts.get(line + 1).copied().unwrap_or(content_height);
             (block, row, end.saturating_sub(row).max(1))
+        })
+        .collect();
+    let sections = section_lines
+        .into_iter()
+        .map(|(block, start, end)| {
+            let start = starts[start];
+            let end = starts.get(end).copied().unwrap_or(content_height);
+            (block, start, end)
         })
         .collect();
     let diff_buttons = diff_header_lines
@@ -1937,6 +1960,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
     ChatLayout {
         lines,
         headers,
+        sections,
         diff_buttons,
         search_matches,
         images,
@@ -2115,6 +2139,15 @@ fn chat_hit_test(state: &UiState, area: Rect, screen_row: u16) -> Option<usize> 
         .find_map(|(block, start, height)| (row >= start && row < start + height).then_some(block))
 }
 
+fn chat_section_hit_test(state: &UiState, area: Rect, screen_row: u16) -> Option<usize> {
+    let layout = chat_layout(state, area);
+    let row = layout.offset + screen_row.saturating_sub(area.y);
+    layout
+        .sections
+        .into_iter()
+        .find_map(|(block, start, end)| (row >= start && row < end).then_some(block))
+}
+
 fn chat_diff_hit_test(
     state: &UiState,
     area: Rect,
@@ -2220,12 +2253,27 @@ fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
         _ => Color::Red,
     };
     let price = state.total_tokens as f64 * config.price_per_token;
-    Line::from(vec![
+    let speed = if status == "generating" {
+        state
+            .generation_speed()
+            .map(|speed| format!("~{:.1} tokens/s", speed.min(9999.9)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled(
             format!("{status:<STATUS_WIDTH$}"),
             Style::default().fg(status_color),
         ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{speed:<SPEED_WIDTH$}"),
+            Style::default().fg(Color::Green),
+        ),
+    ];
+    spans.extend([
         Span::raw("  "),
         Span::styled(state.session.clone(), Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -2247,7 +2295,8 @@ fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
             state.project.cwd.display().to_string(),
             Style::default().fg(Color::Magenta),
         ),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn size_label(chars: usize) -> String {
@@ -2931,6 +2980,43 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn right_clicking_section_content_collapses_it() {
+        let mut state = UiState::new();
+        state.push_user("first line\nsecond line".into());
+        let area = Rect::new(0, 3, 80, 12);
+        let (commands, _events) = mpsc::channel(1);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: area.x + 20,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut state,
+            MouseAreas {
+                body: area,
+                conversation: area,
+                side: None,
+                git: None,
+                plan: None,
+                input: Rect::new(0, 20, 80, 3),
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            state.blocks[0],
+            ChatBlock::Message {
+                expanded: false,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn git_status_viewport_reports_and_clamps_position() {
         let mut state = UiState::new();
@@ -3280,6 +3366,35 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_shows_speed_only_while_generating() {
+        let mut state = UiState::new();
+        state.session = "session".into();
+        let config = Config::default();
+        let rendered = |state: &UiState| {
+            status_bar(state, &config)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        let idle = rendered(&state);
+        assert!(!idle.contains("tokens/s"));
+        let session_column = idle.find("session").unwrap();
+        state.apply(Event::GenerationStarted);
+        assert!(!rendered(&state).contains("tokens/s"));
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("streamed response".into()));
+        let generating = rendered(&state);
+        assert!(generating.contains('~'));
+        assert!(generating.contains(" tokens/s"));
+        assert_eq!(generating.find("session"), Some(session_column));
+        state.apply(Event::GenerationFinished);
+        assert!(!rendered(&state).contains("tokens/s"));
+        assert_eq!(rendered(&state).find("session"), Some(session_column));
+    }
+
+    #[test]
     fn chat_search_starts_at_the_first_match_and_wraps() {
         let mut state = UiState::new();
         state.push_user("Needle one".into());
@@ -3391,6 +3506,58 @@ mod tests {
         clamp_chat_scroll(&mut state, chat);
         assert!(!chat_layout(&state, chat).lines.is_empty());
         assert!(state.scroll <= chat_max_scroll(&state, chat));
+    }
+
+    #[test]
+    fn headless_cancelled_turn_renders() {
+        use ratatui::backend::TestBackend;
+
+        let page = Rect::new(0, 0, 100, 28);
+        let mut state = UiState::new();
+        state.git_panel = false;
+        state.session = "Headless QA".into();
+        state.model = "test-model".into();
+        state.push_user("Inspect cancellation behavior".into());
+        state.toggle_thinking_default();
+        state.toggle_tools_default();
+        state.apply(Event::GenerationStarted);
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::ReasoningDelta(
+            "I should preserve this partial reasoning.".into(),
+        ));
+        state.apply(Event::TextDelta(
+            "This partial response remains visible.".into(),
+        ));
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("read".into()),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+        });
+        state.apply(Event::GenerationCancelled);
+
+        let mut terminal = Terminal::new(TestBackend::new(page.width, page.height)).unwrap();
+        let mut images = ImageRenderer::new();
+        terminal
+            .draw(|frame| {
+                draw(frame, &Config::default(), &state, 0, &mut images);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..page.height)
+            .map(|row| {
+                (0..page.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("{screen}");
+
+        assert!(screen.contains("This partial response remains visible."));
+        assert!(screen.contains("Tool: read"));
+        assert!(screen.contains("failed"));
+        assert!(screen.contains(crate::runtime::CANCELLED_BY_USER));
+        assert!(screen.contains("idle"));
     }
 
     #[test]

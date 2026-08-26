@@ -22,7 +22,7 @@
 ## Tools
 
 - iterative model → tool → model execution
-- immediate Escape cancellation with force-killed child processes
+- immediate Escape cancellation with force-killed child processes, preserved partial output, failed in-flight tools, and a persisted cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
 - configurable context fill tracking and automatic continuation compaction
 - preserved visible transcripts with persisted `Context compacted` markers
@@ -32,6 +32,7 @@
 - browser-backed `web_search` using DuckDuckGo with Bing fallback, Chromium-family browser discovery, and a `ROPE_BROWSER` override
 - text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links and no model-controlled truncation
 - automatic post-consumption `web_browser` result ejection from model context while retaining the full visible and persisted transcript
+- per-call tool output capped at roughly one fifth of the available model context with an explicit truncation marker
 - multimodal `view_image` tool advertised only by vision-enabled model profiles
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
 - executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`
@@ -51,7 +52,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - streamed tool-call arguments, results, and approval prompts
 - live tool counters that switch from characters to lines after the first literal or escaped line break
 - streamed and persisted reasoning blocks (`reasoning` and legacy `reasoning_content`)
-- collapsible messages plus collapsed-by-default thinking and tool sections
+- collapsible messages plus collapsed-by-default thinking and tool sections; right-clicking anywhere in an expanded section collapses it
 - live elapsed time on thinking and tool calls with compact duration units
 - one-space conversation content padding with flush section headers
 - fixed-width, color-coded connecting, waiting-for-first-response, generating, tool-running, idle, and error status
@@ -61,7 +62,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
 - bounded bottom-follow chat scrolling that holds the viewport through streaming, collapses, and full-screen diff visits
-- distinctly colored session, token, context, price, and current-directory fields on the status bar
+- distinctly colored session, token, context, price, and current-directory fields on the status bar, plus live generation speed while streaming
 - asynchronously refreshed Git pane with a mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
 - auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
 - drag-to-copy conversation selection with a non-blocking clipboard toast

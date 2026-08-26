@@ -19,6 +19,9 @@ use crate::{
 };
 pub use message::{ImageContent, Message, ToolCall};
 
+pub const CANCELLED_BY_USER: &str = "cancelled by user";
+const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -133,6 +136,7 @@ pub enum Event {
     CompactionStarted,
     ContextCompacted,
     GenerationFinished,
+    GenerationCancelled,
     Saved,
     Error(String),
 }
@@ -251,10 +255,17 @@ async fn run<P: Provider>(
                 Command::Submit(_) => {}
                 Command::Cancel => {
                     if let Some(task) = generation.take() {
-                        task.abort(); messages.pop(); pending_approval = None;
-                        session.save().await.ok();
-                        events.send(Event::History(messages.clone())).await.ok();
-                        events.send(Event::GenerationFinished).await.ok();
+                        task.abort(); pending_approval = None;
+                        let pending_from = messages.len().saturating_sub(1);
+                        messages.push(Message::system(CANCELLED_BY_USER.into()));
+                        let saved = async {
+                            session.append(&messages[pending_from..]).await?;
+                            session.save().await
+                        }.await;
+                        events.send(Event::GenerationCancelled).await.ok();
+                        if let Err(error) = saved {
+                            events.send(Event::Error(format!("save cancelled turn: {error:#}"))).await.ok();
+                        }
                         refresh_project(project.clone(), internal_tx.clone());
                     }
                 }
@@ -830,13 +841,27 @@ async fn agent<P: Provider>(
             tools: tools.definitions(config.active_model().vision),
         };
         let stream = stream_with_retry(&provider, request, events).await?;
-        let (reasoning, text, calls) = collect(stream, events, internal).await?;
+        let (reasoning, text, calls, usage) = collect(stream, events, internal).await?;
         messages.push(Message::assistant(
             text,
             config.model_id().to_owned(),
             reasoning,
             calls.clone(),
         ));
+        let mut used_context_tokens = usage.map_or_else(
+            || {
+                config
+                    .active_model()
+                    .max_context_tokens
+                    .saturating_sub(available_context_tokens(
+                        &messages,
+                        config,
+                        project_prompt.as_deref(),
+                        current_plan.as_ref(),
+                    ))
+            },
+            |usage| usage.total_tokens,
+        );
         if calls.is_empty() {
             return Ok(messages[persist_from..].to_vec());
         }
@@ -879,6 +904,12 @@ async fn agent<P: Provider>(
                 Ok(result) => (result.output, result.image, result.diff, true),
                 Err(error) => (format!("Error: {error:#}"), None, None, false),
             };
+            let output_tokens = config
+                .active_model()
+                .max_context_tokens
+                .saturating_sub(used_context_tokens)
+                / 5;
+            let output = truncate_tool_output(output, output_tokens);
             events
                 .send(Event::ToolResult {
                     call_id: call.id.clone(),
@@ -894,10 +925,45 @@ async fn agent<P: Provider>(
                 current_plan = Some(plan.clone());
                 internal.send(InternalEvent::PlanUpdated(plan)).await?;
             }
-            messages.push(Message::tool(call.id, output, image, diff));
+            let message = Message::tool(call.id, output, image, diff);
+            used_context_tokens =
+                used_context_tokens.saturating_add(estimate_tokens(std::slice::from_ref(&message)));
+            messages.push(message);
         }
     }
     bail!("tool loop exceeded 64 model turns")
+}
+
+fn available_context_tokens(
+    messages: &[Message],
+    config: &Config,
+    project_prompt: Option<&str>,
+    current_plan: Option<&ExecutionPlan>,
+) -> u64 {
+    let mut context = messages.to_vec();
+    strip_tool_diffs(&mut context);
+    apply_plan_context(&mut context, current_plan);
+    if let Some(prompt) = project_prompt {
+        context.insert(0, Message::system(prompt.into()));
+    }
+    config
+        .active_model()
+        .max_context_tokens
+        .saturating_sub(estimate_tokens(&context))
+}
+
+fn truncate_tool_output(mut output: String, max_tokens: u64) -> String {
+    let max_bytes = max_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
+    if output.len() <= max_bytes {
+        return output;
+    }
+    let mut end = max_bytes.saturating_sub(TOOL_OUTPUT_TRUNCATED.len());
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
+    output.push_str(TOOL_OUTPUT_TRUNCATED);
+    output
 }
 
 async fn stream_with_retry<P: Provider>(
@@ -960,7 +1026,7 @@ async fn collect(
     mut stream: crate::provider::ResponseStream,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
-) -> Result<(String, String, Vec<ToolCall>)> {
+) -> Result<(String, String, Vec<ToolCall>, Option<Usage>)> {
     let mut reasoning = String::new();
     let mut text = String::new();
     let mut calls: Vec<ToolDraft> = Vec::new();
@@ -1024,7 +1090,7 @@ async fn collect(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((reasoning, text, calls))
+    Ok((reasoning, text, calls, usage))
 }
 
 #[cfg(test)]
@@ -1199,6 +1265,60 @@ mod tests {
         assert!(matches!(
             event_rx.recv().await,
             Some(Event::ToolCallFinished { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_output_is_truncated_on_a_character_boundary() {
+        let output = truncate_tool_output("é".repeat(100), 10);
+
+        assert!(output.ends_with("[tool output truncated]"));
+        assert!(output.len() <= 40);
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_limited_to_a_fifth_of_available_context() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("echo".into()),
+                    arguments: format!(r#"{{"value":"{}"}}"#, "x".repeat(1_000)),
+                },
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 20,
+                    total_tokens: 50,
+                }),
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 100;
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let (internal_tx, mut internal_rx) = mpsc::channel(4);
+
+        let completed = agent(
+            provider,
+            &tools,
+            &config,
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+        internal_rx.recv().await;
+
+        assert!(matches!(
+            &completed[2],
+            Message::Tool { content, .. }
+                if content.ends_with("[tool output truncated]") && content.len() <= 40
         ));
     }
 

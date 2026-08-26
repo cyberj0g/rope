@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     project::ProjectState,
-    runtime::{Event, ImageContent, Message, ToolCall, UserPrompt},
+    runtime::{CANCELLED_BY_USER, Event, ImageContent, Message, ToolCall, UserPrompt},
     tool::ExecutionPlan,
 };
 
@@ -163,6 +163,8 @@ pub struct UiState {
     pub plan_scroll: u16,
     pub search: Option<ChatSearch>,
     pub image_cell_size: Option<(u16, u16)>,
+    generation_started: Option<Instant>,
+    generated_bytes: usize,
     assistant: Option<usize>,
     reasoning: Option<usize>,
     response_model: String,
@@ -300,6 +302,8 @@ impl UiState {
             plan_scroll: 0,
             search: None,
             image_cell_size: None,
+            generation_started: None,
+            generated_bytes: 0,
             assistant: None,
             reasoning: None,
             response_model: String::new(),
@@ -898,6 +902,21 @@ impl UiState {
         }
     }
 
+    pub fn collapse(&mut self, index: usize) {
+        if let Some(
+            ChatBlock::Message {
+                kind: MessageKind::User | MessageKind::Assistant,
+                expanded,
+                ..
+            }
+            | ChatBlock::Thinking { expanded, .. }
+            | ChatBlock::Tool { expanded, .. },
+        ) = self.blocks.get_mut(index)
+        {
+            *expanded = false;
+        }
+    }
+
     fn sections(&self) -> Vec<usize> {
         self.blocks
             .iter()
@@ -936,6 +955,8 @@ impl UiState {
                 self.waiting = false;
                 self.tool_running = false;
                 self.error = None;
+                self.generation_started = None;
+                self.generated_bytes = 0;
             }
             Event::ModelRequestStarted(model) => {
                 self.finish_reasoning();
@@ -946,6 +967,8 @@ impl UiState {
                 self.tool_drafts.clear();
                 self.assistant = None;
                 self.reasoning = None;
+                self.generation_started = None;
+                self.generated_bytes = 0;
             }
             Event::ResponseHeadersReceived => {
                 self.connecting = false;
@@ -961,6 +984,7 @@ impl UiState {
             Event::ResponseStarted => {
                 self.connecting = false;
                 self.waiting = false;
+                self.generation_started = Some(Instant::now());
                 if self
                     .notice
                     .as_ref()
@@ -970,6 +994,7 @@ impl UiState {
                 }
             }
             Event::ReasoningDelta(delta) => {
+                self.generated_bytes += delta.len();
                 let block = match self.reasoning {
                     Some(block) => block,
                     None => {
@@ -988,6 +1013,7 @@ impl UiState {
                 }
             }
             Event::TextDelta(delta) => {
+                self.generated_bytes += delta.len();
                 self.finish_reasoning();
                 let block = match self.assistant {
                     Some(block) => block,
@@ -1014,6 +1040,7 @@ impl UiState {
                 name,
                 arguments,
             } => {
+                self.generated_bytes += arguments.len();
                 self.finish_reasoning();
                 let block = match self.tool_drafts.get(&index).copied() {
                     Some(block) => block,
@@ -1143,6 +1170,52 @@ impl UiState {
                 self.waiting = false;
                 self.tool_running = false;
                 self.approval = None;
+                self.generation_started = None;
+                self.generated_bytes = 0;
+            }
+            Event::GenerationCancelled => {
+                self.finish_reasoning();
+                for block in &mut self.blocks {
+                    if let ChatBlock::Tool {
+                        output,
+                        status,
+                        counter,
+                        elapsed,
+                        ..
+                    } = block
+                        && matches!(
+                            status,
+                            ToolStatus::Streaming
+                                | ToolStatus::Pending
+                                | ToolStatus::WaitingApproval
+                                | ToolStatus::Running
+                        )
+                    {
+                        *status = ToolStatus::Failed;
+                        counter.push(CANCELLED_BY_USER);
+                        *output = Some(CANCELLED_BY_USER.into());
+                        elapsed.finish();
+                    }
+                }
+                self.blocks.push(ChatBlock::Message {
+                    label: "System".into(),
+                    content: CANCELLED_BY_USER.into(),
+                    images: Vec::new(),
+                    model: String::new(),
+                    kind: MessageKind::System,
+                    expanded: true,
+                });
+                self.generating = false;
+                self.connecting = false;
+                self.waiting = false;
+                self.tool_running = false;
+                self.approval = None;
+                self.notice = None;
+                self.assistant = None;
+                self.reasoning = None;
+                self.tool_drafts.clear();
+                self.generation_started = None;
+                self.generated_bytes = 0;
             }
             Event::Saved => self.notice = Some("session saved".into()),
             Event::Error(error) => {
@@ -1152,9 +1225,17 @@ impl UiState {
                 self.waiting = false;
                 self.tool_running = false;
                 self.approval = None;
+                self.generation_started = None;
+                self.generated_bytes = 0;
                 self.set_error(error);
             }
         }
+    }
+
+    pub fn generation_speed(&self) -> Option<f64> {
+        let elapsed = self.generation_started?.elapsed().as_secs_f64();
+        let tokens = self.generated_bytes.div_ceil(4);
+        Some(tokens as f64 / elapsed)
     }
 
     fn set_tool_status(&mut self, call_id: &str, value: ToolStatus) {
@@ -1408,6 +1489,56 @@ mod tests {
         assert!(!state.generating);
         assert!(!state.connecting);
         assert!(!state.waiting);
+    }
+
+    #[test]
+    fn cancellation_preserves_partial_blocks_and_fails_active_tools() {
+        let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::ReasoningDelta("partial thought".into()));
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("read".into()),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+        });
+
+        state.apply(Event::GenerationCancelled);
+
+        assert!(!state.generating);
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Thinking { content, .. } if content == "partial thought"
+        ));
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Tool {
+                status: ToolStatus::Failed,
+                output: Some(output),
+                ..
+            } if output == CANCELLED_BY_USER
+        ));
+        assert!(matches!(
+            state.blocks.last(),
+            Some(ChatBlock::Message {
+                content,
+                kind: MessageKind::System,
+                ..
+            }) if content == CANCELLED_BY_USER
+        ));
+
+        state.apply(Event::GenerationStarted);
+        state.apply(Event::ModelRequestStarted("test-model".into()));
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("continued normally".into()));
+        assert!(matches!(
+            state.blocks.last(),
+            Some(ChatBlock::Message {
+                content,
+                kind: MessageKind::Assistant,
+                ..
+            }) if content == "continued normally"
+        ));
     }
 
     #[test]
