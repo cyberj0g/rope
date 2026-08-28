@@ -64,7 +64,7 @@ rope "what is this repo up to?"
 - [Ripgrep](https://ripgrep.org/) is recommended. If missing, relevant tools use fallback utilities.
 - An interactive terminal (a real TTY): rope is a full-screen TUI that uses
 - A Rust toolchain to build from source.
-  raw mode, the alternate screen, mouse reporting, and bracketed paste, so
+- Raw mode, the alternate screen, mouse reporting, and bracketed paste, so
   it needs any modern terminal, and it does not work piped or redirected.
 
 ## Features
@@ -99,3 +99,6 @@ rope "what is this repo up to?"
   attachments (Sixel / iTerm2 / Kitty), live git status and diff panes
   (when the directory is a git worktree), plan pane, chat search, model
   picker, and prompt history.
+
+## Disclaimer
+Rope is a simple harness meant for power users and developers. It has a very basic permission system and no sandbox. Models can leak your data via tools or perform undesired actions on live system. Use it at your own risk.
