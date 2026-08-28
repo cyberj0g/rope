@@ -2,7 +2,7 @@
 
 <video src="docs/demo.mp4" controls></video>
 
-A minimalistic terminal LLM coding agent harness in Rust. The model chats, calls tools, edits
+A minimalistic terminal coding agent harness in Rust. The model chats, calls tools, edits
 files, and drives a headless browser — while every one of those states is
 shown live in your terminal. 
 

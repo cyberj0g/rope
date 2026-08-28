@@ -30,3 +30,29 @@ tool calls in one Rope process and removed during shutdown.
 Set `ROPE_BROWSER` to an external Chrome, Chromium, Brave, or Edge executable when
 automatic discovery is not sufficient. Developers can skip embedding and point
 `ROPE_PATCHRIGHT_RUNTIME_DIR` at an unpacked runtime payload.
+
+## GitHub Actions
+
+The `Build` workflow tests Rope and builds release archives for these native
+targets:
+
+| OS | Target | Archive |
+| --- | --- | --- |
+| Linux | `x86_64-unknown-linux-gnu` | `.tar.gz` |
+| macOS | `aarch64-apple-darwin` | `.tar.gz` |
+| Windows | `x86_64-pc-windows-msvc` | `.zip` |
+
+Pull requests and pushes to `main` compile all three targets. To download the
+binaries without making a release, run the workflow manually from the Actions
+tab; its artifacts are retained for one day. Pushing a `v*` tag also creates or
+updates a GitHub release with all three archives:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow uses standard GitHub-hosted runners. They are free and unlimited
+for public repositories; private repositories consume the account's included
+Actions minutes. Cargo outputs and the browser payload are cached to keep those
+builds short, and pull requests do not store binary artifacts.

@@ -17,9 +17,17 @@ case "$TARGET" in
     *) echo "unsupported target: $TARGET" >&2; exit 1 ;;
 esac
 
-for command in curl npm python3; do
+for command in curl npm; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 1; }
 done
+if command -v python3 >/dev/null; then
+    PYTHON="python3"
+elif command -v python >/dev/null; then
+    PYTHON="python"
+else
+    echo "python is required" >&2
+    exit 1
+fi
 if [[ "$ARCHIVE_EXT" == "zip" ]]; then
     command -v unzip >/dev/null || { echo "unzip is required" >&2; exit 1; }
 fi
@@ -71,7 +79,7 @@ printf '{"node":"%s","patchright":"%s","target":"%s"}\n' \
     "$NODE_VERSION" "$PATCHRIGHT_VERSION" "$TARGET" > "$WORK/runtime/runtime.json"
 
 mkdir -p "$(dirname "$OUTPUT")"
-python3 "$ROOT/scripts/archive-runtime.py" "$WORK/runtime" "$WORK/runtime.tar.gz"
+"$PYTHON" "$ROOT/scripts/archive-runtime.py" "$WORK/runtime" "$WORK/runtime.tar.gz"
 sha256 "$WORK/runtime.tar.gz" > "$WORK/runtime.tar.gz.sha256"
 mv "$WORK/runtime.tar.gz" "$OUTPUT"
 mv "$WORK/runtime.tar.gz.sha256" "$OUTPUT.sha256"

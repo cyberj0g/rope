@@ -1,0 +1,119 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: rope-x86_64-unknown-linux-gnu.tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: rope-aarch64-apple-darwin.tar.gz
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: rope-x86_64-pc-windows-msvc.zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add "${{ matrix.target }}"
+      - name: Cache Cargo build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/${{ matrix.target }}/release
+          key: cargo-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'build.rs', 'scripts/*') }}
+      - name: Cache browser runtime
+        id: browser-runtime
+        uses: actions/cache@v6
+        with:
+          path: browser-runtime
+          key: browser-${{ matrix.target }}-${{ hashFiles('scripts/*') }}
+      - name: Prepare browser runtime
+        if: steps.browser-runtime.outputs.cache-hit != 'true'
+        shell: bash
+        run: ./scripts/prepare-patchright-runtime.sh "${{ matrix.target }}"
+      - name: Build
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "${{ matrix.archive }}" -C "target/${{ matrix.target }}/release" rope
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/rope.exe" -DestinationPath "${{ matrix.archive }}"
+      - name: Upload binary
+        if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: rope-${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  release:
+    name: Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: rope-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

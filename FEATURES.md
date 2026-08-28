@@ -1,5 +1,9 @@
 # Rope features
 
+## Distribution
+
+- cached GitHub Actions builds for Linux x64, macOS arm64, and Windows x64, with manual artifacts and tag-driven GitHub releases
+
 ## Runtime and providers
 
 - provider-independent streaming runtime with an OpenAI-compatible provider
