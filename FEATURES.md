@@ -59,7 +59,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - original soft line breaks preserved when rendering user messages
 - sequential duplicate filtering in persistent prompt history
 - CommonMark/GFM rendering with inline emphasis, links, aligned tables, and syntax-colored fenced code blocks
-- streamed tool-call arguments, results, and approval prompts
+- streamed tool-call arguments, line-break-preserving results, and approval prompts
 - live tool counters that switch from characters to lines after the first literal or escaped line break
 - streamed and persisted reasoning blocks (`reasoning` and legacy `reasoning_content`)
 - collapsible messages plus collapsed-by-default thinking and tool sections; right-clicking anywhere in an expanded section collapses it

@@ -2165,7 +2165,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                             Style::default().fg(Color::DarkGray),
                         ));
                         lines.extend(
-                            markdown(output)
+                            markdown_preserving_breaks(output)
                                 .into_iter()
                                 .map(|line| pad_line(line.style(Style::default().fg(Color::Gray)))),
                         );
@@ -3222,6 +3222,44 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Tool: update_plan"));
+    }
+
+    #[test]
+    fn expanded_tool_output_preserves_line_breaks() {
+        let mut state = UiState::new();
+        state.tools_expanded = true;
+        state.apply(Event::History(vec![
+            crate::runtime::Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![crate::runtime::ToolCall {
+                    id: "read-1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": "file.txt" }),
+                }],
+            ),
+            crate::runtime::Message::tool(
+                "read-1".into(),
+                "first line\nsecond line\nthird line".into(),
+                None,
+                None,
+            ),
+        ]));
+
+        let text = chat_layout(&state, Rect::new(0, 3, 80, 20))
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let output = text
+            .iter()
+            .position(|line| line.trim() == "output")
+            .unwrap();
+
+        assert_eq!(text[output + 1].trim(), "first line");
+        assert_eq!(text[output + 2].trim(), "second line");
+        assert_eq!(text[output + 3].trim(), "third line");
     }
 
     #[tokio::test]
