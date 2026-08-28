@@ -1,4 +1,4 @@
 /target/
 /config.toml
-/.rope/state.toml
+/.rope/
 /browser-runtime/

@@ -37,6 +37,8 @@ pub enum Message {
         reasoning: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        response_items: Vec<Value>,
     },
     Tool {
         call_id: String,
@@ -69,6 +71,7 @@ impl Message {
     pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
         Self::User { content, images }
     }
+    #[cfg(test)]
     pub fn assistant(
         content: String,
         model: String,
@@ -80,6 +83,22 @@ impl Message {
             model,
             reasoning,
             tool_calls,
+            response_items: Vec::new(),
+        }
+    }
+    pub fn assistant_response(
+        content: String,
+        model: String,
+        reasoning: String,
+        tool_calls: Vec<ToolCall>,
+        response_items: Vec<Value>,
+    ) -> Self {
+        Self::Assistant {
+            content,
+            model,
+            reasoning,
+            tool_calls,
+            response_items,
         }
     }
     pub fn tool(
@@ -104,5 +123,23 @@ impl Message {
             | Self::Assistant { content, .. }
             | Self::Tool { content, .. } => content,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_assistant_messages_default_response_items() {
+        let message: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hello","model":"old","reasoning":"","tool_calls":[]}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            message,
+            Message::Assistant { response_items, .. } if response_items.is_empty()
+        ));
     }
 }

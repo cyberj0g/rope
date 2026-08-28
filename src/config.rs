@@ -48,6 +48,15 @@ pub struct ProviderConfig {
     pub name: String,
     pub base_url: String,
     pub api_key: String,
+    pub api: ProviderApi,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApi {
+    #[default]
+    Responses,
+    ChatCompletions,
 }
 
 impl Default for ProviderConfig {
@@ -56,7 +65,17 @@ impl Default for ProviderConfig {
             name: "default".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_key: String::new(),
+            api: ProviderApi::Responses,
         }
+    }
+}
+
+impl std::fmt::Display for ProviderApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Responses => "Responses",
+            Self::ChatCompletions => "Chat Completions",
+        })
     }
 }
 
@@ -262,6 +281,7 @@ impl Config {
                 name: "default".into(),
                 base_url: self.base_url.clone(),
                 api_key: self.api_key.clone(),
+                api: ProviderApi::Responses,
             });
         }
         let mut provider_names = std::collections::HashSet::new();
@@ -487,6 +507,24 @@ mod tests {
     fn reads_per_token_price() {
         let config: Config = toml::from_str("price_per_token = 0.0000025").unwrap();
         assert_eq!(config.price_per_token, 0.0000025);
+    }
+
+    #[test]
+    fn providers_default_to_responses_and_can_select_chat_completions() {
+        let responses: ProviderConfig = toml::from_str(
+            r#"name = "local"
+base_url = "http://localhost:8000/v1""#,
+        )
+        .unwrap();
+        let chat: ProviderConfig = toml::from_str(
+            r#"name = "legacy"
+base_url = "https://legacy.example/v1"
+api = "chat_completions""#,
+        )
+        .unwrap();
+
+        assert_eq!(responses.api, ProviderApi::Responses);
+        assert_eq!(chat.api, ProviderApi::ChatCompletions);
     }
 
     #[test]

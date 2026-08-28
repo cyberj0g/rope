@@ -70,6 +70,13 @@ pub fn model_config(id: String) -> ModelConfig {
 pub fn supports_chat_completions(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
     let id = id.rsplit('/').next().unwrap_or(&id);
+    supports_responses(id)
+        && !((id.starts_with("gpt-5") || id.starts_with('o')) && id.contains("-pro"))
+}
+
+pub fn supports_responses(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    let id = id.rsplit('/').next().unwrap_or(&id);
     ![
         "babbage",
         "computer-use",
@@ -90,7 +97,6 @@ pub fn supports_chat_completions(id: &str) -> bool {
         && !id.contains("deep-research")
         && !id.contains("search-preview")
         && !id.contains("transcribe")
-        && !((id.starts_with("gpt-5") || id.starts_with('o')) && id.contains("-pro"))
 }
 
 pub fn prioritize_openai_models(models: &mut [ModelConfig]) {
@@ -245,6 +251,7 @@ mod tests {
         assert!(!supports_chat_completions("text-embedding-3-small"));
         assert!(!supports_chat_completions("gpt-image-1"));
         assert!(!supports_chat_completions("gpt-5.5-pro"));
+        assert!(supports_responses("gpt-5.5-pro"));
         assert!(supports_chat_completions("local/unknown-chat-model"));
     }
 

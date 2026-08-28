@@ -8,7 +8,10 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use super::{Provider, ResponseDelta, ResponseStream};
-use crate::runtime::{CompletionRequest, Message};
+use crate::{
+    config::ProviderApi,
+    runtime::{CompletionRequest, Message},
+};
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -20,13 +23,21 @@ pub struct OpenAiProvider {
 struct Endpoint {
     base_url: String,
     api_key: String,
+    api: ProviderApi,
 }
 
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             client: Client::new(),
-            endpoints: HashMap::from([("default".into(), Endpoint { base_url, api_key })]),
+            endpoints: HashMap::from([(
+                "default".into(),
+                Endpoint {
+                    base_url,
+                    api_key,
+                    api: ProviderApi::Responses,
+                },
+            )]),
         }
     }
 
@@ -42,6 +53,7 @@ impl OpenAiProvider {
                         Endpoint {
                             base_url: provider.base_url.clone(),
                             api_key: provider.api_key.clone(),
+                            api: provider.api,
                         },
                     )
                 })
@@ -97,6 +109,15 @@ impl Provider for OpenAiProvider {
             .endpoints
             .get(&request.provider)
             .with_context(|| format!("provider {} is not configured", request.provider))?;
+        if endpoint.api == ProviderApi::Responses {
+            return super::responses::stream(
+                &self.client,
+                &endpoint.base_url,
+                &endpoint.api_key,
+                request,
+            )
+            .await;
+        }
         let url = format!(
             "{}/chat/completions",
             endpoint.base_url.trim_end_matches('/')
@@ -240,6 +261,7 @@ impl From<Message> for WireMessage {
                 model: _,
                 reasoning: _,
                 tool_calls,
+                response_items: _,
             } => Self {
                 role: "assistant",
                 content: (!content.is_empty()).then_some(WireContent::Text(content)),
@@ -304,7 +326,10 @@ impl WireMessage {
     }
 }
 
-async fn response_error(status: StatusCode, response: reqwest::Response) -> Result<ResponseStream> {
+pub(super) async fn response_error(
+    status: StatusCode,
+    response: reqwest::Response,
+) -> Result<ResponseStream> {
     let body = response.text().await.unwrap_or_default();
     bail!("server returned {status}: {body}")
 }
@@ -394,11 +419,13 @@ mod tests {
                 name: "one".into(),
                 base_url: "https://one.example/v1".into(),
                 api_key: "first".into(),
+                api: ProviderApi::Responses,
             },
             crate::config::ProviderConfig {
                 name: "two".into(),
                 base_url: "https://two.example/v1".into(),
                 api_key: "second".into(),
+                api: ProviderApi::ChatCompletions,
             },
         ];
 
@@ -406,6 +433,7 @@ mod tests {
 
         assert_eq!(provider.endpoints.len(), 2);
         assert_eq!(provider.endpoints["two"].base_url, "https://two.example/v1");
+        assert_eq!(provider.endpoints["two"].api, ProviderApi::ChatCompletions);
     }
 
     #[test]

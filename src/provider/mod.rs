@@ -1,6 +1,7 @@
 #[cfg(test)]
 pub mod mock;
 pub mod openai;
+mod responses;
 
 use std::pin::Pin;
 
@@ -17,6 +18,7 @@ pub enum ResponseDelta {
     Reasoning(String),
     Text(String),
     Usage(Usage),
+    OutputItem(serde_json::Value),
     ToolCall {
         index: usize,
         id: Option<String>,

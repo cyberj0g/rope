@@ -718,7 +718,9 @@ async fn compact<P: Provider>(
             ResponseDelta::Usage(usage) => {
                 internal.send(InternalEvent::Usage(usage)).await?;
             }
-            ResponseDelta::Reasoning(_) | ResponseDelta::ToolCall { .. } => {}
+            ResponseDelta::Reasoning(_)
+            | ResponseDelta::ToolCall { .. }
+            | ResponseDelta::OutputItem(_) => {}
         }
     }
     if summary.trim().is_empty() {
@@ -792,7 +794,7 @@ async fn generate_session_title<P: Provider>(
                 ResponseDelta::Usage(usage) => {
                     internal.send(InternalEvent::AuxiliaryUsage(usage)).await?;
                 }
-                ResponseDelta::ToolCall { .. } => {}
+                ResponseDelta::ToolCall { .. } | ResponseDelta::OutputItem(_) => {}
             }
         }
         Ok((text, reasoning))
@@ -892,12 +894,14 @@ async fn agent<P: Provider>(
             tools: tools.definitions(config.active_model().vision),
         };
         let stream = stream_with_retry(&provider, request, events).await?;
-        let (reasoning, text, calls, usage) = collect(stream, events, internal).await?;
-        messages.push(Message::assistant(
+        let (reasoning, text, calls, usage, response_items) =
+            collect(stream, events, internal).await?;
+        messages.push(Message::assistant_response(
             text,
             config.model_id().to_owned(),
             reasoning,
             calls.clone(),
+            response_items,
         ));
         let mut used_context_tokens = usage.map_or_else(
             || {
@@ -1077,11 +1081,18 @@ async fn collect(
     mut stream: crate::provider::ResponseStream,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
-) -> Result<(String, String, Vec<ToolCall>, Option<Usage>)> {
+) -> Result<(
+    String,
+    String,
+    Vec<ToolCall>,
+    Option<Usage>,
+    Vec<serde_json::Value>,
+)> {
     let mut reasoning = String::new();
     let mut text = String::new();
     let mut calls: Vec<ToolDraft> = Vec::new();
     let mut usage = None;
+    let mut response_items = Vec::new();
     let mut started = None;
     while let Some(delta) = stream.next().await {
         let delta = delta?;
@@ -1099,6 +1110,7 @@ async fn collect(
                 events.send(Event::TextDelta(delta)).await.ok();
             }
             ResponseDelta::Usage(tokens) => usage = Some(tokens),
+            ResponseDelta::OutputItem(item) => response_items.push(item),
             ResponseDelta::ToolCall {
                 index,
                 id,
@@ -1150,7 +1162,7 @@ async fn collect(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((reasoning, text, calls, usage))
+    Ok((reasoning, text, calls, usage, response_items))
 }
 
 #[cfg(test)]
@@ -1189,6 +1201,12 @@ mod tests {
             ResponseDelta::Reasoning("thinking".into()),
             ResponseDelta::Text("hel".into()),
             ResponseDelta::Text("lo".into()),
+            ResponseDelta::OutputItem(json!({
+                "id": "rs_1",
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "opaque",
+            })),
         ]]));
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
@@ -1209,6 +1227,11 @@ mod tests {
         assert!(matches!(
             completed.last().unwrap(),
             Message::Assistant { reasoning, .. } if reasoning == "thinking"
+        ));
+        assert!(matches!(
+            completed.last().unwrap(),
+            Message::Assistant { response_items, .. }
+                if response_items[0]["encrypted_content"] == "opaque"
         ));
         assert!(matches!(
             event_rx.recv().await,

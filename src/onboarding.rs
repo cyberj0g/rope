@@ -18,14 +18,17 @@ use crossterm::{
 use url::Url;
 
 use crate::{
-    config::{Config, ProviderConfig, config_root},
-    model_catalog::{model_config, prioritize_openai_models, supports_chat_completions},
+    config::{Config, ProviderApi, ProviderConfig, config_root},
+    model_catalog::{
+        model_config, prioritize_openai_models, supports_chat_completions, supports_responses,
+    },
     provider::openai::OpenAiProvider,
 };
 
 struct ProviderSummary {
     name: String,
     endpoint: String,
+    api: ProviderApi,
     models: usize,
 }
 
@@ -92,6 +95,11 @@ pub async fn run() -> Result<()> {
             }
         };
         let api_key = edit_line("API key (optional)", "", true)?;
+        let api = if confirm("Use the Responses API? (No selects Chat Completions)", true)? {
+            ProviderApi::Responses
+        } else {
+            ProviderApi::ChatCompletions
+        };
 
         print!("  {} Querying {endpoint}/models ... ", "●".yellow());
         io::stdout().flush()?;
@@ -99,7 +107,10 @@ pub async fn run() -> Result<()> {
             .models()
             .await?
             .into_iter()
-            .filter(|id| supports_chat_completions(id))
+            .filter(|id| match api {
+                ProviderApi::Responses => supports_responses(id),
+                ProviderApi::ChatCompletions => supports_chat_completions(id),
+            })
             .map(|id| {
                 let mut model = model_config(id);
                 model.provider.clone_from(&name);
@@ -110,19 +121,24 @@ pub async fn run() -> Result<()> {
             prioritize_openai_models(&mut discovered);
         }
         if discovered.is_empty() {
-            bail!("the API returned no models usable with Chat Completions");
+            bail!("the API returned no models usable with {api}");
         }
-        println!("{}", format!("{} chat model(s)", discovered.len()).green());
+        println!(
+            "{}",
+            format!("{} model(s) for {api}", discovered.len()).green()
+        );
 
         summaries.push(ProviderSummary {
             name: name.clone(),
             endpoint: endpoint.clone(),
+            api,
             models: discovered.len(),
         });
         providers.push(ProviderConfig {
             name,
             base_url: endpoint,
             api_key,
+            api,
         });
         models.extend(discovered);
 
@@ -441,10 +457,11 @@ fn report(
     success(&format!("Saved {}", config_path.display()));
     for provider in providers {
         println!(
-            "  {} {}  {}  {}",
+            "  {} {}  {}  {}  {}",
             "◆".cyan(),
             provider.name.clone().bold(),
             provider.endpoint.clone().dark_grey(),
+            provider.api.to_string().yellow(),
             format!("{} model(s)", provider.models).green()
         );
     }

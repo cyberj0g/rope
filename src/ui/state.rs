@@ -1339,6 +1339,7 @@ impl UiState {
                     model,
                     reasoning,
                     tool_calls,
+                    response_items: _,
                 } => {
                     if !reasoning.is_empty() {
                         self.blocks.push(ChatBlock::Thinking {

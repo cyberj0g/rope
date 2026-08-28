@@ -11,6 +11,8 @@ compaction_threshold = 0.75
 name = "local"
 base_url = "http://localhost:8000/v1"
 api_key = ""
+# use "chat_completions" for endpoints without Responses API support
+api = "responses"
 
 [[models]]
 name = "qwen"
