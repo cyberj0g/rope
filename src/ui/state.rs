@@ -1141,6 +1141,16 @@ impl UiState {
                 }
             }
             Event::ApprovalRequested(call) => {
+                for block in self.tool_calls.values().copied() {
+                    if let ChatBlock::Tool {
+                        status: ToolStatus::Streaming | ToolStatus::Pending,
+                        elapsed,
+                        ..
+                    } = &mut self.blocks[block]
+                    {
+                        elapsed.finish();
+                    }
+                }
                 self.set_tool_status(&call.id, ToolStatus::WaitingApproval);
                 self.approval = Some(call);
             }
@@ -1776,6 +1786,62 @@ mod tests {
                 expanded: false,
                 ..
             } if output == "contents"
+        ));
+    }
+
+    #[test]
+    fn approval_pauses_every_pending_tool_in_the_batch() {
+        let mut state = UiState::new();
+        for index in 0..2 {
+            state.apply(Event::ToolCallDelta {
+                index,
+                name: Some("read".into()),
+                arguments: "{}".into(),
+            });
+            state.apply(Event::ToolCallFinished {
+                index,
+                call: ToolCall {
+                    id: format!("call_{index}"),
+                    name: "read".into(),
+                    arguments: json!({}),
+                },
+            });
+        }
+
+        state.apply(Event::ApprovalRequested(ToolCall {
+            id: "call_0".into(),
+            name: "read".into(),
+            arguments: json!({}),
+        }));
+
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool {
+                status: ToolStatus::WaitingApproval,
+                elapsed,
+                ..
+            } if elapsed.started.is_none()
+        ));
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Tool {
+                status: ToolStatus::Pending,
+                elapsed,
+                ..
+            } if elapsed.started.is_none()
+        ));
+
+        state.apply(Event::ToolStarted {
+            call_id: "call_0".into(),
+        });
+
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool { elapsed, .. } if elapsed.started.is_some()
+        ));
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Tool { elapsed, .. } if elapsed.started.is_none()
         ));
     }
 

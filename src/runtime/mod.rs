@@ -986,7 +986,7 @@ async fn agent<P: Provider>(
             return Ok(messages[persist_from..].to_vec());
         }
 
-        for (index, call) in calls.into_iter().enumerate() {
+        for (index, call) in calls.iter().enumerate() {
             events
                 .send(Event::ToolCallFinished {
                     index,
@@ -994,6 +994,9 @@ async fn agent<P: Provider>(
                 })
                 .await
                 .ok();
+        }
+
+        for call in calls {
             let entry = tools.get(&call.name)?;
             let approved = match entry.approval {
                 Approval::Allow => true,
