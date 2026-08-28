@@ -19,9 +19,10 @@ cargo build --release --target aarch64-unknown-linux-gnu
 ```
 
 The preparation script downloads Node from nodejs.org, verifies its published
-SHA-256 digest, installs the exact Patchright version, and creates a deterministic
-archive. The Cargo build script verifies that archive and embeds it. Cargo never
-downloads dependencies from the network during the build itself.
+SHA-256 digest, installs the exact Patchright and DuckDuckGo AutoConsent versions,
+and creates a deterministic archive. The Cargo build script verifies that archive
+and embeds it. Cargo never downloads dependencies from the network during the
+build itself.
 
 On the first browser tool call, Rope extracts the payload into its versioned user
 cache. Later launches reuse it. A temporary Chrome profile is shared by all web

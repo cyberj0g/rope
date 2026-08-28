@@ -42,9 +42,9 @@
 - tool approval controls in the composer with paused execution timing across batched calls, session-persisted approvals, and decision markers retained in conversation history
 - built-in `read`, `write`, `edit`, `shell`, `search_files`, and `list_files` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks
 - persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes
-- Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a shared headless Chromium context, version-matched browser identity, a process-lifetime profile, and a `ROPE_BROWSER` override
+- Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a shared headless Chromium context, version-matched browser identity, a process-lifetime profile, automatic cookie-popup opt-out via DuckDuckGo AutoConsent, and a `ROPE_BROWSER` override
 - text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links, a shared browser session, and no model-controlled truncation
-- reproducible, checksum-verified Node and Patchright runtime embedding with lazy versioned extraction on first browser use
+- reproducible, checksum-verified Node, Patchright, and AutoConsent runtime embedding with lazy versioned extraction on first browser use
 - eager Patchright extraction plus Chrome/Chromium diagnostics during first-run setup, including `ROPE_BROWSER` override guidance
 - automatic post-consumption `web_browser` result ejection from model context while retaining the full visible and persisted transcript
 - per-call tool output capped at roughly one fifth of the available model context with an explicit truncation marker

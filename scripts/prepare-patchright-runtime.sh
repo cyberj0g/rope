@@ -3,6 +3,7 @@ set -euo pipefail
 
 NODE_VERSION="${NODE_VERSION:-24.20.0}"
 PATCHRIGHT_VERSION="${PATCHRIGHT_VERSION:-1.62.1}"
+AUTOCONSENT_VERSION="${AUTOCONSENT_VERSION:-16.31.0}"
 TARGET="${1:-$(rustc -vV | sed -n 's/^host: //p')}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT="$ROOT/browser-runtime/$TARGET.tar.gz"
@@ -70,13 +71,15 @@ npm install \
     --no-audit \
     --no-fund \
     --no-package-lock \
-    "patchright-core@$PATCHRIGHT_VERSION"
+    "patchright-core@$PATCHRIGHT_VERSION" \
+    "@duckduckgo/autoconsent@$AUTOCONSENT_VERSION"
 
 curl --fail --location --silent --show-error \
     "https://raw.githubusercontent.com/Kaliiiiiiiiii-Vinyzu/patchright/v$PATCHRIGHT_VERSION/LICENSE" \
     --output "$WORK/runtime/PATCHRIGHT-LICENSE"
-printf '{"node":"%s","patchright":"%s","target":"%s"}\n' \
-    "$NODE_VERSION" "$PATCHRIGHT_VERSION" "$TARGET" > "$WORK/runtime/runtime.json"
+cp "$WORK/runtime/node_modules/@duckduckgo/autoconsent/LICENSE" "$WORK/runtime/AUTOCONSENT-LICENSE"
+printf '{"node":"%s","patchright":"%s","autoconsent":"%s","target":"%s"}\n' \
+    "$NODE_VERSION" "$PATCHRIGHT_VERSION" "$AUTOCONSENT_VERSION" "$TARGET" > "$WORK/runtime/runtime.json"
 
 mkdir -p "$(dirname "$OUTPUT")"
 "$PYTHON" "$ROOT/scripts/archive-runtime.py" "$WORK/runtime" "$WORK/runtime.tar.gz"

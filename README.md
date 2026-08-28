@@ -14,7 +14,7 @@ status line that reflects the current state at a glance.
 
 ## Demo
 
-<video src="docs/demo.mp4" controls></video>
+<video src="assets/demo.mp4" controls></video>
 
 ## Quickstart
 
@@ -42,7 +42,9 @@ rope "what is this repo up to?"
   real time.
 - **Integrated web search and web browsing** - built-in `web_search` and
   `web_browser` tools run against a local headless browser, so all web
-  traffic stays under your control for improved privacy. No need for extra providers. Powered by embedded [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright).
+  traffic stays under your control for improved privacy. Cookie popups are
+  automatically opted out through [DuckDuckGo AutoConsent](https://github.com/duckduckgo/autoconsent).
+  No need for extra providers. Powered by embedded [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright).
 - **Vision models** - the chat supports pasting and displaying images, if terminal emulator supports it.
 - **OpenAI-compatible API** - works with local generation
   (vLLM, llama.cpp) and remote hosted APIs, with per-model profiles for routing.
@@ -78,13 +80,12 @@ rope "what is this repo up to?"
 - Persistent sessions as JSONL under `~/.local/share/harness/sessions`,
   with auto-generated titles, token totals, and resume via
   `rope --session NAME`, `/new`, or `/save`.
-- Iterative model → tool → model execution with immediate Escape
-  cancellation (force-kills child processes, preserves partial output)
+- Iterative model → tool → model execution with immediate cancellation
   and automatic retry with backoff on transient failures.
 - Per-tool `allow` / `ask` / `deny` approval policies in `config.toml`,
   with session-persisted decisions.
 - Built-in tools: `read`, `write`, `edit` (with per-call diffs),
-  `shell`, `grep`, `glob`.
+  `shell`, `search_files`, `list_files`.
 - Web tools: `web_search` (DuckDuckGo with Bing fallback) and
   `web_browser` (JavaScript-rendered, visible page content) over a shared
   headless browser session.

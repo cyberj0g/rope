@@ -1,14 +1,39 @@
 "use strict";
 
 const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
 const readline = require("node:readline");
+const { filterCompactRules } = require("@duckduckgo/autoconsent");
 const { chromium } = require("patchright-core");
+const compactRules = require("@duckduckgo/autoconsent/rules/compact-rules.json");
+
+const autoconsentScript = fs.readFileSync(
+  path.join(path.dirname(require.resolve("@duckduckgo/autoconsent")), "autoconsent.playwright.js"),
+  "utf8",
+);
+const autoconsentConfig = {
+  enabled: true,
+  autoAction: "optOut",
+  disabledCmps: [],
+  enablePrehide: true,
+  enableCosmeticRules: true,
+  enableGeneratedRules: true,
+  detectRetries: 20,
+  isMainWorld: false,
+  prehideTimeout: 2_000,
+  enableHeuristicDetection: true,
+  heuristicMode: "reject",
+  logs: { errors: false },
+};
 
 const profilePath = process.argv[2];
 const browserPath = process.argv[3];
 const active = new Map();
 const pending = new Set();
 const cancelled = new Set();
+const consentRuns = new WeakMap();
+const browserHooks = [];
 let closing = false;
 
 function send(message) {
@@ -35,8 +60,86 @@ function chromeUserAgent() {
   return `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
 }
 
+function createConsentRun() {
+  let detected;
+  let settled;
+  return {
+    detected: new Promise(resolve => { detected = resolve; }),
+    settled: new Promise(resolve => { settled = resolve; }),
+    markDetected: () => detected(true),
+    markSettled: () => {
+      detected(false);
+      settled();
+    },
+  };
+}
+
+function consentRun(page) {
+  let run = consentRuns.get(page);
+  if (!run) {
+    run = createConsentRun();
+    consentRuns.set(page, run);
+  }
+  return run;
+}
+
+async function sendAutoconsentMessage(frame, message) {
+  await frame.evaluate(message => globalThis.autoconsentReceiveMessage?.(message), message).catch(() => {});
+}
+
+async function handleAutoconsentMessage({ frame, page }, message) {
+  if (!page || !message || typeof message !== "object") return;
+
+  const mainFrame = frame.parentFrame() === null;
+  if (message.type === "init") {
+    const url = message.url || frame.url();
+    if (mainFrame && /^https?:/.test(url)) {
+      consentRuns.set(page, createConsentRun());
+    }
+    const enabled = /^https?:/.test(url);
+    const rules = enabled
+      ? { compact: filterCompactRules(compactRules, { url, mainFrame }) }
+      : { autoconsent: [] };
+    await sendAutoconsentMessage(frame, {
+      type: "initResp",
+      config: { ...autoconsentConfig, enabled },
+      rules,
+    });
+    return;
+  }
+
+  const run = consentRun(page);
+  if (message.type === "cmpDetected" || message.type === "popupFound") {
+    run.markDetected();
+  } else if (
+    message.type === "autoconsentDone"
+    || message.type === "optOutResult"
+    || (message.type === "report" && ["nothingDetected", "done", "optOutFailed", "optOutSucceeded"].includes(message.state?.lifecycle))
+  ) {
+    run.markSettled();
+  } else if (message.type === "eval") {
+    const result = await frame.evaluate(message.code);
+    await sendAutoconsentMessage(frame, { type: "evalResp", id: message.id, result });
+  }
+}
+
+async function waitForAutoconsent(page) {
+  const run = consentRun(page);
+  const detected = await Promise.race([
+    run.detected,
+    page.waitForTimeout(750).then(() => false),
+  ]);
+  if (detected) {
+    await Promise.race([run.settled, page.waitForTimeout(6_000)]);
+  }
+}
+
+async function injectAutoconsent(frame) {
+  await frame.evaluate(autoconsentScript).catch(() => {});
+}
+
 async function extract(page) {
-  await page.waitForTimeout(750);
+  await waitForAutoconsent(page);
   return page.evaluate(() => {
     const root = document.querySelector("main")
       || document.querySelector("article")
@@ -80,10 +183,12 @@ async function load(context, request) {
   pending.add(request.id);
   try {
     page = await context.newPage();
+    page.on("framenavigated", frame => void injectAutoconsent(frame));
     pending.delete(request.id);
     if (cancelled.delete(request.id)) return;
     active.set(request.id, page);
     await page.goto(request.url, { waitUntil: "load", timeout: 20_000 });
+    await Promise.all(page.frames().map(injectAutoconsent));
     send({ id: request.id, result: await extract(page) });
   } catch (error) {
     send({ id: request.id, error: errorText(error) });
@@ -111,6 +216,7 @@ async function main() {
     userAgent: chromeUserAgent(),
     viewport: null,
   });
+  browserHooks.push(await context.exposeBinding("autoconsentSendMessage", handleAutoconsentMessage));
   send({ ready: true });
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });

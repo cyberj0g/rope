@@ -279,4 +279,51 @@ mod tests {
         );
         tool.shutdown().await;
     }
+
+    #[tokio::test]
+    #[ignore = "requires a Chromium-family browser"]
+    async fn live_browser_opts_out_of_cookie_popup() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            socket.read(&mut request).await.unwrap();
+            let body = r#"<html class="show--consent"><body><main>
+                <h1>Article</h1>
+                <p id="status">undecided</p>
+                <div id="cc--main"><div id="cm">
+                    <p>Cookie choices</p>
+                    <button id="s-all-bn">Accept all</button>
+                    <button id="s-rall-bn" onclick="
+                        document.getElementById('status').textContent = 'rejected';
+                        document.getElementById('cc--main').remove();
+                    ">Reject all</button>
+                </div></div>
+            </main></body></html>"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let tool = WebBrowserTool::new(browser);
+        let result = tool
+            .run(json!({ "url": format!("http://{address}") }))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        let content = output["content"].as_str().unwrap();
+        assert!(content.contains("rejected"), "{content}");
+        assert!(!content.contains("Cookie choices"), "{content}");
+        tool.shutdown().await;
+    }
 }
