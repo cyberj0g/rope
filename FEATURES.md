@@ -73,7 +73,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - full-width conversation view with deliberate trailing whitespace
 - bounded bottom-follow chat scrolling that holds the viewport through streaming, collapses, and full-screen diff visits
 - distinctly colored session, token, context, price, and current-directory fields on the status bar, plus estimated live generation speed and the exact reported average while idle
-- asynchronously refreshed Git pane with a mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
+- asynchronously refreshed Git pane that updates after every tool call as well as at turn end, cancel, and failure, with git runs serialized and coalesced so at most one refresh is in flight; mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
 - auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
 - drag-to-copy conversation selection with a non-blocking clipboard toast
 - recent-first filtered slash-command palette with keyboard navigation and command hotkeys

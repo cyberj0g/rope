@@ -181,6 +181,41 @@ enum InternalEvent {
         reply: oneshot::Sender<ApprovalDecision>,
     },
     ProjectChanged(ProjectState),
+    ProjectRefresh,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProjectRequest {
+    Refresh,
+    Diff(Option<std::path::PathBuf>),
+}
+
+/// Serializes git-backed project work: at most one task runs at a time.
+/// A request that arrives while a task is in flight replaces the stored
+/// pending request, so bursts of requests coalesce into a single follow-up run.
+#[derive(Default)]
+struct ProjectRequests {
+    in_flight: bool,
+    pending: Option<ProjectRequest>,
+}
+
+impl ProjectRequests {
+    /// Returns the request to run now, or stores it if one is already in flight.
+    fn request(&mut self, request: ProjectRequest) -> Option<ProjectRequest> {
+        if self.in_flight {
+            self.pending = Some(request);
+            None
+        } else {
+            self.in_flight = true;
+            Some(request)
+        }
+    }
+
+    /// Called after the in-flight task reports its result; returns the follow-up, if any.
+    fn completed(&mut self) -> Option<ProjectRequest> {
+        self.in_flight = false;
+        self.pending.take()
+    }
 }
 
 struct TurnResult {
@@ -236,6 +271,7 @@ async fn run<P: Provider>(
     let (internal_tx, mut internal_rx) = mpsc::channel(8);
     let mut generation: Option<JoinHandle<()>> = None;
     let mut pending_approval: Option<PendingApproval> = None;
+    let mut project_requests = ProjectRequests::default();
 
     events.send(Event::History(messages.clone())).await.ok();
     events
@@ -297,7 +333,7 @@ async fn run<P: Provider>(
                         if let Err(error) = saved {
                             events.send(Event::Error(format!("save cancelled turn: {error:#}"))).await.ok();
                         }
-                        refresh_project(project.clone(), internal_tx.clone());
+                        request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
                     }
                 }
                 Command::Approve(decision) => {
@@ -345,15 +381,10 @@ async fn run<P: Provider>(
                     }
                 }
                 Command::RefreshProject => {
-                    refresh_project(project.clone(), internal_tx.clone());
+                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
                 }
                 Command::GitDiff(path) => {
-                    let mut changed = project.clone();
-                    let internal = internal_tx.clone();
-                    tokio::spawn(async move {
-                        changed.load_diff(path).await;
-                        internal.send(InternalEvent::ProjectChanged(changed)).await.ok();
-                    });
+                    request_project(&mut project_requests, &project, ProjectRequest::Diff(path), &internal_tx);
                 }
                 Command::Shutdown(reply) => {
                     if let Some(task) = generation.take() { task.abort(); }
@@ -403,13 +434,13 @@ async fn run<P: Provider>(
                     } else {
                         events.send(Event::GenerationFinished).await.ok();
                     }
-                    refresh_project(project.clone(), internal_tx.clone());
+                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
                 }
                 InternalEvent::Failed(error) if generation.is_some() => {
                     generation = None; pending_approval = None; messages.pop();
                     session.save().await.ok();
                     events.send(Event::Error(error)).await.ok();
-                    refresh_project(project.clone(), internal_tx.clone());
+                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
                 }
                 InternalEvent::Usage(usage) if generation.is_some() => {
                     session.record_usage(usage.total_tokens, config.active_model().price_per_token);
@@ -438,6 +469,12 @@ async fn run<P: Provider>(
                 InternalEvent::ProjectChanged(changed) => {
                     project = changed;
                     events.send(Event::ProjectChanged(project.clone())).await.ok();
+                    if let Some(next) = project_requests.completed() {
+                        spawn_project_task(&project, next, &internal_tx);
+                    }
+                }
+                InternalEvent::ProjectRefresh => {
+                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
                 }
                 InternalEvent::Finished(_)
                 | InternalEvent::Failed(_)
@@ -451,14 +488,34 @@ async fn run<P: Provider>(
     tools.shutdown().await;
 }
 
-fn refresh_project(mut project: ProjectState, internal: mpsc::Sender<InternalEvent>) {
+fn spawn_project_task(
+    project: &ProjectState,
+    request: ProjectRequest,
+    internal: &mpsc::Sender<InternalEvent>,
+) {
+    let mut snapshot = project.clone();
+    let internal = internal.clone();
     tokio::spawn(async move {
-        project.refresh().await;
+        match request {
+            ProjectRequest::Refresh => snapshot.refresh().await,
+            ProjectRequest::Diff(path) => snapshot.load_diff(path).await,
+        }
         internal
-            .send(InternalEvent::ProjectChanged(project))
+            .send(InternalEvent::ProjectChanged(snapshot))
             .await
             .ok();
     });
+}
+
+fn request_project(
+    requests: &mut ProjectRequests,
+    project: &ProjectState,
+    request: ProjectRequest,
+    internal: &mpsc::Sender<InternalEvent>,
+) {
+    if let Some(request) = requests.request(request) {
+        spawn_project_task(project, request, internal);
+    }
 }
 
 async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {
@@ -982,6 +1039,10 @@ async fn agent<P: Provider>(
                 })
                 .await
                 .ok();
+            if approved {
+                // The working tree may have changed; the runtime coalesces these refreshes.
+                internal.send(InternalEvent::ProjectRefresh).await.ok();
+            }
             if success && call.name == "update_plan" {
                 let plan: ExecutionPlan =
                     serde_json::from_str(&output).context("decode normalized execution plan")?;
@@ -1597,6 +1658,35 @@ mod tests {
         assert_eq!(
             (0..6).map(retry_delay).collect::<Vec<_>>(),
             [2, 5, 10, 30, 30, 30]
+        );
+    }
+
+    #[test]
+    fn project_requests_serialize_and_coalesce() {
+        let mut requests = ProjectRequests::default();
+        assert_eq!(
+            requests.request(ProjectRequest::Refresh),
+            Some(ProjectRequest::Refresh)
+        );
+        // Requests arriving while one is in flight are coalesced, latest wins.
+        assert_eq!(requests.request(ProjectRequest::Refresh), None);
+        assert_eq!(
+            requests.request(ProjectRequest::Diff(Some(std::path::PathBuf::from("a.rs")))),
+            None
+        );
+        assert_eq!(
+            requests.request(ProjectRequest::Diff(Some(std::path::PathBuf::from("b.rs")))),
+            None
+        );
+        assert_eq!(
+            requests.completed(),
+            Some(ProjectRequest::Diff(Some(std::path::PathBuf::from("b.rs"))))
+        );
+        // No pending work means no follow-up.
+        assert_eq!(requests.completed(), None);
+        assert_eq!(
+            requests.request(ProjectRequest::Refresh),
+            Some(ProjectRequest::Refresh)
         );
     }
 
