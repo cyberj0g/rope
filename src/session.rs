@@ -26,6 +26,8 @@ pub struct SessionMeta {
     pub compaction_summary: Option<String>,
     #[serde(default)]
     pub compacted_through: usize,
+    #[serde(default)]
+    pub approved_tools: Vec<String>,
 }
 
 pub struct Session {
@@ -76,6 +78,7 @@ impl Session {
                 context_tokens: 0,
                 compaction_summary: None,
                 compacted_through: 0,
+                approved_tools: Vec::new(),
             },
         };
         session.save().await?;
@@ -262,6 +265,7 @@ mod tests {
         assert_eq!(meta.total_tokens, 0);
         assert!(meta.title.is_none());
         assert!(meta.plan.is_none());
+        assert!(meta.approved_tools.is_empty());
     }
 
     #[test]
@@ -277,6 +281,7 @@ mod tests {
                 context_tokens: 0,
                 compaction_summary: None,
                 compacted_through: 0,
+                approved_tools: Vec::new(),
             },
         };
         assert!(session.needs_title());
@@ -326,6 +331,28 @@ mod tests {
             Message::User { images, .. } if images[0].data == STANDARD.encode(b"png bytes")
         ));
 
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_tool_approvals_survive_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-approval-session-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut session = Session::create(root.clone(), "approvals".into())
+            .await
+            .unwrap();
+        session.meta.approved_tools.push("shell".into());
+        session.save().await.unwrap();
+
+        let (loaded, _) = Session::load(root.clone(), "approvals".into())
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.meta.approved_tools, ["shell"]);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

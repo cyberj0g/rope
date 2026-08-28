@@ -1,4 +1,6 @@
 mod config;
+mod model_catalog;
+mod onboarding;
 mod project;
 mod provider;
 mod runtime;
@@ -17,8 +19,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let startup = args.startup();
     let request = args.request;
+    if !Config::global_exists()? {
+        onboarding::run().await?;
+    }
     let config = Config::load()?;
-    let provider = OpenAiProvider::new(config.base_url.clone(), config.api_key.clone());
+    let provider = OpenAiProvider::from_config(&config);
     let tools = tool::discover(&config).await?;
     let (command_tx, event_rx) = runtime::spawn(config.clone(), startup, provider, tools).await?;
 

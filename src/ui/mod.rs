@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_image::{
     Resize,
@@ -39,8 +39,8 @@ use ratatui_image::{
 use tokio::sync::mpsc;
 
 use crate::{
-    config::Config,
-    runtime::{Command, Event, ImageContent, SessionSummary, UserPrompt},
+    config::{Config, ModelConfig},
+    runtime::{ApprovalDecision, Command, Event, ImageContent, SessionSummary, UserPrompt},
     tool::PlanStatus,
 };
 use history::PromptHistory;
@@ -215,7 +215,7 @@ const MIN_CHAT_WIDTH: u16 = 40;
 const MIN_GIT_WIDTH: u16 = 24;
 const MIN_SIDE_PANE_HEIGHT: u16 = 4;
 const STATUS_WIDTH: usize = "connecting".len();
-const SPEED_WIDTH: usize = "~9999.9 tokens/s".len();
+const SPEED_WIDTH: usize = "avg. 9999.9 tokens/s".len();
 
 pub async fn run(
     config: Config,
@@ -227,6 +227,7 @@ pub async fn run(
     let mut terminal = TerminalGuard::new()?;
     let mut images = ImageRenderer::new();
     let mut state = UiState::new();
+    state.recent_models.clone_from(&config.recent_models);
     let mut request = request;
     let (input_load_tx, mut input_load_rx) = mpsc::unbounded_channel();
     let mut chat_height = 0;
@@ -320,7 +321,12 @@ pub async fn run(
                         }
                         TerminalEvent::Paste(text) => {
                             let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                            if let Some(search) = &mut state.search {
+                            if let Some(picker) = &mut state.model_picker {
+                                let text = text.replace('\n', " ");
+                                picker.query.insert_str(picker.cursor, &text);
+                                picker.cursor += text.len();
+                                picker.selected = 0;
+                            } else if let Some(search) = &mut state.search {
                                 let text = text.replace('\n', " ");
                                 search.query.insert_str(search.cursor, &text);
                                 search.cursor += text.len();
@@ -350,6 +356,7 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
                 | Event::ModelRequestStarted(_)
                 | Event::ResponseHeadersReceived
                 | Event::ResponseStarted
+                | Event::ModelResponseFinished { .. }
                 | Event::ReasoningDelta(_)
                 | Event::TextDelta(_)
                 | Event::ToolCallDelta { .. }
@@ -394,25 +401,39 @@ async fn handle_key(
     if handle_fullscreen_diff_key(key, state, screen.height) {
         return Ok(false);
     }
-    if key.code == KeyCode::Esc && state.generating {
-        state.approval = None;
-        commands.send(Command::Cancel).await?;
-        return Ok(false);
-    }
     if let Some(call) = &state.approval {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                state.notice = Some(format!("allowed {}", call.name));
+                state.notice = Some(format!("allowed {} once", call.name));
                 state.approval = None;
-                commands.send(Command::Approve(true)).await?;
+                commands
+                    .send(Command::Approve(ApprovalDecision::AllowOnce))
+                    .await?;
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                state.notice = Some(format!("allowed {} for this session", call.name));
+                state.approval = None;
+                commands
+                    .send(Command::Approve(ApprovalDecision::AllowSession))
+                    .await?;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 state.notice = Some(format!("denied {}", call.name));
                 state.approval = None;
-                commands.send(Command::Approve(false)).await?;
+                commands
+                    .send(Command::Approve(ApprovalDecision::Deny))
+                    .await?;
             }
             _ => {}
         }
+        return Ok(false);
+    }
+    if state.model_picker.is_some() {
+        handle_model_picker_key(key, config, state, commands).await?;
+        return Ok(false);
+    }
+    if key.code == KeyCode::Esc && state.generating {
+        commands.send(Command::Cancel).await?;
         return Ok(false);
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
@@ -615,6 +636,120 @@ async fn handle_key(
     Ok(false)
 }
 
+async fn handle_model_picker_key(
+    key: KeyEvent,
+    config: &Config,
+    state: &mut UiState,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    let indices = filtered_model_indices(config, state);
+    let picker = state.model_picker.as_mut().unwrap();
+    match key.code {
+        KeyCode::Esc => state.model_picker = None,
+        KeyCode::Enter => {
+            let Some(index) = indices.get(picker.selected).copied() else {
+                return Ok(());
+            };
+            let model = config.models[index].name.clone();
+            state.recent_models.retain(|name| name != &model);
+            state.recent_models.insert(0, model.clone());
+            state.recent_models.truncate(12);
+            state.model_picker = None;
+            commands.send(Command::SelectModel(model)).await?;
+        }
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(indices.len().saturating_sub(1))
+        }
+        KeyCode::PageUp => picker.selected = picker.selected.saturating_sub(10),
+        KeyCode::PageDown => {
+            picker.selected = (picker.selected + 10).min(indices.len().saturating_sub(1))
+        }
+        KeyCode::Home => picker.selected = 0,
+        KeyCode::End => picker.selected = indices.len().saturating_sub(1),
+        KeyCode::Backspace => {
+            if let Some((start, _)) = picker.query[..picker.cursor].char_indices().next_back() {
+                picker.query.replace_range(start..picker.cursor, "");
+                picker.cursor = start;
+                picker.selected = 0;
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(character) = picker.query[picker.cursor..].chars().next() {
+                picker
+                    .query
+                    .replace_range(picker.cursor..picker.cursor + character.len_utf8(), "");
+                picker.selected = 0;
+            }
+        }
+        KeyCode::Left => {
+            if let Some((start, _)) = picker.query[..picker.cursor].char_indices().next_back() {
+                picker.cursor = start;
+            }
+        }
+        KeyCode::Right => {
+            if let Some(character) = picker.query[picker.cursor..].chars().next() {
+                picker.cursor += character.len_utf8();
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.query.clear();
+            picker.cursor = 0;
+            picker.selected = 0;
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.query.insert(picker.cursor, character);
+            picker.cursor += character.len_utf8();
+            picker.selected = 0;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn open_model_picker(config: &Config, state: &mut UiState) {
+    if state.generating {
+        state.notice = Some("finish or cancel the current response before switching models".into());
+        return;
+    }
+    state.model_picker = Some(state::ModelPicker::default());
+    let indices = filtered_model_indices(config, state);
+    if let Some(selected) = indices
+        .iter()
+        .position(|index| config.models[*index].name == state.model)
+    {
+        state.model_picker.as_mut().unwrap().selected = selected;
+    }
+}
+
+fn filtered_model_indices(config: &Config, state: &UiState) -> Vec<usize> {
+    let query = state
+        .model_picker
+        .as_ref()
+        .map(|picker| picker.query.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut indices = config
+        .models
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| {
+            query.is_empty()
+                || model.name.to_ascii_lowercase().contains(&query)
+                || model.id.to_ascii_lowercase().contains(&query)
+                || model.provider.to_ascii_lowercase().contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|index| {
+        state
+            .recent_models
+            .iter()
+            .position(|name| name == &config.models[*index].name)
+            .unwrap_or(usize::MAX)
+    });
+    indices
+}
+
 fn handle_fullscreen_diff_key(key: KeyEvent, state: &mut UiState, screen_height: u16) -> bool {
     if !state.git_fullscreen_diff {
         return false;
@@ -685,7 +820,7 @@ async fn dispatch(
                 );
             }
         }
-        "/model" if argument.is_empty() => commands.send(Command::NextModel).await?,
+        "/model" if argument.is_empty() => open_model_picker(config, state),
         "/reason" if argument.is_empty() => commands.send(Command::NextReasoningEffort).await?,
         "/thinking" if argument.is_empty() => state.toggle_thinking_default(),
         "/tools" if argument.is_empty() => state.toggle_tools_default(),
@@ -826,6 +961,9 @@ async fn handle_mouse(
     areas: MouseAreas,
     commands: &mpsc::Sender<Command>,
 ) -> Result<()> {
+    if state.model_picker.is_some() {
+        return Ok(());
+    }
     let MouseAreas {
         body,
         conversation,
@@ -906,7 +1044,12 @@ async fn handle_mouse(
                 .reasoning_effort
                 .map_or(3, |effort| effort.to_string().chars().count() as u16);
         if (model_start..model_end).contains(&mouse.column) {
-            commands.send(Command::NextModel).await?;
+            if state.generating {
+                state.notice =
+                    Some("finish or cancel the current response before switching models".into());
+            } else {
+                state.model_picker = Some(state::ModelPicker::default());
+            }
         } else if (reason_start..reason_end).contains(&mouse.column) {
             commands.send(Command::NextReasoningEffort).await?;
         }
@@ -1192,7 +1335,10 @@ fn draw(
         Span::styled(effort, Style::default().fg(Color::Magenta)),
     ];
     if let Some(call) = &state.approval {
-        title.push(Span::raw(format!(" · allow tool {}? y/n", call.name)));
+        title.push(Span::styled(
+            format!(" · {} approval: y once / n deny / s session", call.name),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     if state.generating {
         title.push(Span::styled(
@@ -1243,8 +1389,91 @@ fn draw(
             frame.set_cursor_position((input.x + 1 + column, input.y + 1 + row));
         }
     }
+    draw_model_picker(frame, config, state);
     draw_toast(frame, state);
     chat_height
+}
+
+fn draw_model_picker(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
+    let Some(picker) = &state.model_picker else {
+        return;
+    };
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(84);
+    let height = screen.height.saturating_sub(4).min(24);
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select model · ↑↓ navigate · Enter select · Esc close ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [search, list] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .areas(inner);
+    frame.render_widget(
+        Paragraph::new(picker.query.clone()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Filter models "),
+        ),
+        search,
+    );
+
+    let indices = filtered_model_indices(config, state);
+    let items = indices
+        .iter()
+        .map(|index| model_picker_item(&config.models[*index], state))
+        .collect::<Vec<_>>();
+    let mut list_state = ListState::default();
+    if !items.is_empty() {
+        list_state.select(Some(picker.selected.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("› ").highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        list,
+        &mut list_state,
+    );
+    let cursor_column = picker.query[..picker.cursor].chars().count() as u16;
+    frame.set_cursor_position((
+        search.x + 1 + cursor_column.min(search.width.saturating_sub(3)),
+        search.y + 1,
+    ));
+}
+
+fn model_picker_item(model: &ModelConfig, state: &UiState) -> ListItem<'static> {
+    let recent = state.recent_models.iter().any(|name| name == &model.name);
+    let marker = if model.name == state.model {
+        "●"
+    } else if recent {
+        "◷"
+    } else {
+        " "
+    };
+    let detail = if model.name == model.id {
+        model.provider.clone()
+    } else {
+        format!("{} · {}", model.provider, model.id)
+    };
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{marker} {}", model.name),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
+    ]))
 }
 
 fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
@@ -2227,6 +2456,8 @@ fn pad_line(mut line: Line<'static>) -> Line<'static> {
 fn app_status(state: &UiState) -> (&'static str, Color) {
     if state.error.is_some() {
         ("error", Color::Red)
+    } else if state.approval.is_some() {
+        ("approval", Color::Yellow)
     } else if state.connecting {
         ("connecting", Color::Yellow)
     } else if state.waiting {
@@ -2253,13 +2484,14 @@ fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
         _ => Color::Red,
     };
     let price = state.total_tokens as f64 * config.price_per_token;
-    let speed = if status == "generating" {
-        state
+    let speed = match status {
+        "generating" => state
             .generation_speed()
-            .map(|speed| format!("~{:.1} tokens/s", speed.min(9999.9)))
-            .unwrap_or_default()
-    } else {
-        String::new()
+            .map(|speed| format!("~{:.1} tokens/s", speed.min(9999.9))),
+        "idle" => state
+            .average_generation_speed()
+            .map(|speed| format!("avg. {:.1} tokens/s", speed.min(9999.9))),
+        _ => None,
     };
     let mut spans = vec![
         Span::raw(" "),
@@ -2269,7 +2501,7 @@ fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{speed:<SPEED_WIDTH$}"),
+            format!("{:<SPEED_WIDTH$}", speed.unwrap_or_default()),
             Style::default().fg(Color::Green),
         ),
     ];
@@ -2355,7 +2587,7 @@ fn tool_status(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Streaming => "streaming",
         ToolStatus::Pending => "pending",
-        ToolStatus::WaitingApproval => "approval",
+        ToolStatus::WaitingApproval => "waiting for approval · y once / n deny / s session",
         ToolStatus::Running => "running",
         ToolStatus::Done => "done",
         ToolStatus::Failed => "failed",
@@ -2367,7 +2599,8 @@ fn tool_color(status: ToolStatus) -> Color {
         ToolStatus::Done => Color::Green,
         ToolStatus::Failed => Color::Red,
         ToolStatus::Running | ToolStatus::Streaming => Color::Yellow,
-        ToolStatus::Pending | ToolStatus::WaitingApproval => Color::DarkGray,
+        ToolStatus::WaitingApproval => Color::Yellow,
+        ToolStatus::Pending => Color::DarkGray,
     }
 }
 
@@ -3314,6 +3547,15 @@ mod tests {
         state.apply(Event::ResponseStarted);
         assert_eq!(app_status(&state), ("generating", Color::Green));
 
+        state.apply(Event::ApprovalRequested(crate::runtime::ToolCall {
+            id: "call-1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({}),
+        }));
+        assert_eq!(app_status(&state), ("approval", Color::Yellow));
+        assert!(tool_status(ToolStatus::WaitingApproval).starts_with("waiting for approval"));
+        state.approval = None;
+
         state.apply(Event::ToolStarted {
             call_id: "call-1".into(),
         });
@@ -3366,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_speed_only_while_generating() {
+    fn status_bar_switches_from_estimated_to_reported_speed() {
         let mut state = UiState::new();
         state.session = "session".into();
         let config = Config::default();
@@ -3389,9 +3631,14 @@ mod tests {
         assert!(generating.contains('~'));
         assert!(generating.contains(" tokens/s"));
         assert_eq!(generating.find("session"), Some(session_column));
+        state.apply(Event::ModelResponseFinished {
+            output_tokens: 120,
+            duration: Duration::from_secs(2),
+        });
         state.apply(Event::GenerationFinished);
-        assert!(!rendered(&state).contains("tokens/s"));
-        assert_eq!(rendered(&state).find("session"), Some(session_column));
+        let idle = rendered(&state);
+        assert!(idle.contains("avg. 60.0 tokens/s"));
+        assert_eq!(idle.find("session"), Some(session_column));
     }
 
     #[test]
@@ -3757,6 +4004,63 @@ mod tests {
             ["/thinking", "/tools"]
         );
         assert!(palette_commands("/add ").is_none());
+    }
+
+    #[test]
+    fn model_picker_filters_and_keeps_recent_models_first() {
+        let mut config = Config::default();
+        config.models = vec![
+            crate::model_catalog::model_config("gpt-4.1".into()),
+            crate::model_catalog::model_config("gpt-5.6-sol".into()),
+            crate::model_catalog::model_config("Qwen/Qwen3.8-27B".into()),
+        ];
+        let mut state = UiState::new();
+        state.recent_models = vec!["Qwen/Qwen3.8-27B".into(), "gpt-4.1".into()];
+        state.model_picker = Some(state::ModelPicker::default());
+
+        let indices = filtered_model_indices(&config, &state);
+        assert_eq!(config.models[indices[0]].name, "Qwen/Qwen3.8-27B");
+        assert_eq!(config.models[indices[1]].name, "gpt-4.1");
+
+        state.model_picker.as_mut().unwrap().query = "5.6".into();
+        let indices = filtered_model_indices(&config, &state);
+        assert_eq!(indices, [1]);
+    }
+
+    #[test]
+    fn model_picker_renders_as_a_searchable_modal() {
+        use ratatui::backend::TestBackend;
+
+        let mut config = Config::default();
+        config.models = vec![
+            crate::model_catalog::model_config("gpt-5.6-sol".into()),
+            crate::model_catalog::model_config("Qwen/Qwen3.8-27B".into()),
+        ];
+        let mut state = UiState::new();
+        state.model = "gpt-5.6-sol".into();
+        state.model_picker = Some(state::ModelPicker::default());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut images = ImageRenderer::new();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, &config, &state, 0, &mut images);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..30)
+            .map(|row| {
+                (0..100)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Select model"));
+        assert!(screen.contains("Filter models"));
+        assert!(screen.contains("gpt-5.6-sol"));
+        assert!(screen.contains("Qwen/Qwen3.8-27B"));
     }
 
     #[test]

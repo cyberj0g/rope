@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use super::{
 };
 
 pub struct WebSearchTool {
-    browser: HeadlessBrowser,
+    browser: Arc<HeadlessBrowser>,
 }
 
 #[derive(Serialize)]
@@ -60,8 +60,8 @@ impl Provider {
 }
 
 impl WebSearchTool {
-    pub fn discover() -> Option<Self> {
-        HeadlessBrowser::discover().map(|browser| Self { browser })
+    pub fn new(browser: Arc<HeadlessBrowser>) -> Self {
+        Self { browser }
     }
 
     async fn search(&self, provider: Provider, query: &str) -> Result<BrowserPage> {
@@ -138,6 +138,10 @@ impl Tool for WebSearchTool {
             }
         }
         bail!("web search failed: {}", errors.join("; "))
+    }
+
+    async fn shutdown(&self) {
+        self.browser.shutdown().await;
     }
 }
 
@@ -284,12 +288,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a Chromium-family browser and network access"]
     async fn live_headless_search() {
-        let tool = WebSearchTool::discover().expect("Chromium-family browser not found");
+        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let tool = WebSearchTool::new(browser);
         let result = tool
             .run(json!({ "query": "Rust programming language", "max_results": 3 }))
             .await
             .unwrap();
         let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["provider"], "duckduckgo");
         assert_eq!(output["results"].as_array().unwrap().len(), 3);
         assert!(
             output["results"][0]["url"]
@@ -302,5 +308,6 @@ mod tests {
                 .as_str()
                 .is_some_and(|snippet| !snippet.is_empty())
         }));
+        tool.shutdown().await;
     }
 }

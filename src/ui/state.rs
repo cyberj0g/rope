@@ -57,6 +57,13 @@ impl Elapsed {
         }
     }
 
+    fn resume(&mut self) {
+        if self.started.is_none() {
+            self.started = Some(Instant::now());
+            self.duration.get_or_insert(Duration::ZERO);
+        }
+    }
+
     pub fn value(&self) -> Option<Duration> {
         self.duration.map(|duration| {
             duration
@@ -162,9 +169,14 @@ pub struct UiState {
     pub plan_split_dragging: bool,
     pub plan_scroll: u16,
     pub search: Option<ChatSearch>,
+    pub model_picker: Option<ModelPicker>,
+    pub recent_models: Vec<String>,
     pub image_cell_size: Option<(u16, u16)>,
     generation_started: Option<Instant>,
     generated_bytes: usize,
+    reported_generation_duration: Duration,
+    reported_output_tokens: u64,
+    average_generation_speed: Option<f64>,
     assistant: Option<usize>,
     reasoning: Option<usize>,
     response_model: String,
@@ -185,6 +197,13 @@ pub struct ChatSearch {
     pub cursor: usize,
     pub current: usize,
     pub total: usize,
+}
+
+#[derive(Default)]
+pub struct ModelPicker {
+    pub query: String,
+    pub cursor: usize,
+    pub selected: usize,
 }
 
 impl ChatSearch {
@@ -301,9 +320,14 @@ impl UiState {
             plan_split_dragging: false,
             plan_scroll: 0,
             search: None,
+            model_picker: None,
+            recent_models: Vec::new(),
             image_cell_size: None,
             generation_started: None,
             generated_bytes: 0,
+            reported_generation_duration: Duration::ZERO,
+            reported_output_tokens: 0,
+            average_generation_speed: None,
             assistant: None,
             reasoning: None,
             response_model: String::new(),
@@ -957,6 +981,9 @@ impl UiState {
                 self.error = None;
                 self.generation_started = None;
                 self.generated_bytes = 0;
+                self.reported_generation_duration = Duration::ZERO;
+                self.reported_output_tokens = 0;
+                self.average_generation_speed = None;
             }
             Event::ModelRequestStarted(model) => {
                 self.finish_reasoning();
@@ -992,6 +1019,15 @@ impl UiState {
                 {
                     self.notice = None;
                 }
+            }
+            Event::ModelResponseFinished {
+                output_tokens,
+                duration,
+            } => {
+                self.reported_output_tokens += output_tokens;
+                self.reported_generation_duration += duration;
+                self.generation_started = None;
+                self.generated_bytes = 0;
             }
             Event::ReasoningDelta(delta) => {
                 self.generated_bytes += delta.len();
@@ -1165,6 +1201,12 @@ impl UiState {
             }
             Event::GenerationFinished => {
                 self.finish_reasoning();
+                if !self.reported_generation_duration.is_zero() {
+                    self.average_generation_speed = Some(
+                        self.reported_output_tokens as f64
+                            / self.reported_generation_duration.as_secs_f64(),
+                    );
+                }
                 self.generating = false;
                 self.connecting = false;
                 self.waiting = false;
@@ -1172,6 +1214,8 @@ impl UiState {
                 self.approval = None;
                 self.generation_started = None;
                 self.generated_bytes = 0;
+                self.reported_generation_duration = Duration::ZERO;
+                self.reported_output_tokens = 0;
             }
             Event::GenerationCancelled => {
                 self.finish_reasoning();
@@ -1216,6 +1260,8 @@ impl UiState {
                 self.tool_drafts.clear();
                 self.generation_started = None;
                 self.generated_bytes = 0;
+                self.reported_generation_duration = Duration::ZERO;
+                self.reported_output_tokens = 0;
             }
             Event::Saved => self.notice = Some("session saved".into()),
             Event::Error(error) => {
@@ -1227,6 +1273,8 @@ impl UiState {
                 self.approval = None;
                 self.generation_started = None;
                 self.generated_bytes = 0;
+                self.reported_generation_duration = Duration::ZERO;
+                self.reported_output_tokens = 0;
                 self.set_error(error);
             }
         }
@@ -1238,11 +1286,22 @@ impl UiState {
         Some(tokens as f64 / elapsed)
     }
 
+    pub fn average_generation_speed(&self) -> Option<f64> {
+        self.average_generation_speed
+    }
+
     fn set_tool_status(&mut self, call_id: &str, value: ToolStatus) {
         if let Some(block) = self.tool_calls.get(call_id).copied()
-            && let ChatBlock::Tool { status, .. } = &mut self.blocks[block]
+            && let ChatBlock::Tool {
+                status, elapsed, ..
+            } = &mut self.blocks[block]
         {
             *status = value;
+            match value {
+                ToolStatus::WaitingApproval => elapsed.finish(),
+                ToolStatus::Running => elapsed.resume(),
+                _ => {}
+            }
         }
     }
 
@@ -1662,9 +1721,30 @@ mod tests {
             ChatBlock::Tool { counter, .. }
                 if counter.label() == format!("{} chars", arguments.chars().count())
         ));
+        state.apply(Event::ApprovalRequested(ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: json!({ "path": "src/main.rs" }),
+        }));
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool {
+                status: ToolStatus::WaitingApproval,
+                elapsed,
+                ..
+            } if elapsed.started.is_none()
+        ));
         state.apply(Event::ToolStarted {
             call_id: "call_1".into(),
         });
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool {
+                status: ToolStatus::Running,
+                elapsed,
+                ..
+            } if elapsed.started.is_some()
+        ));
         state.apply(Event::ToolResult {
             call_id: "call_1".into(),
             output: "contents".into(),
@@ -2005,5 +2085,18 @@ mod tests {
 
         assert_eq!(state.input, "one\ntwo\nthree");
         assert_eq!(state.input_lines().len(), 3);
+    }
+
+    #[test]
+    fn elapsed_time_stays_frozen_while_paused() {
+        let mut elapsed = Elapsed::started();
+        elapsed.finish();
+        let paused = elapsed.value();
+
+        std::thread::sleep(Duration::from_millis(2));
+
+        assert_eq!(elapsed.value(), paused);
+        elapsed.resume();
+        assert!(elapsed.started.is_some());
     }
 }

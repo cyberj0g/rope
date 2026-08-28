@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use super::{
 const MAX_LINKS: usize = 50;
 
 pub struct WebBrowserTool {
-    browser: HeadlessBrowser,
+    browser: Arc<HeadlessBrowser>,
 }
 
 #[derive(Serialize)]
@@ -29,8 +29,8 @@ struct PageContent {
 }
 
 impl WebBrowserTool {
-    pub fn discover() -> Option<Self> {
-        HeadlessBrowser::discover().map(|browser| Self { browser })
+    pub fn new(browser: Arc<HeadlessBrowser>) -> Self {
+        Self { browser }
     }
 }
 
@@ -79,6 +79,10 @@ impl Tool for WebBrowserTool {
             image: None,
             diff: None,
         })
+    }
+
+    async fn shutdown(&self) {
+        self.browser.shutdown().await;
     }
 }
 
@@ -187,7 +191,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a Chromium-family browser and network access"]
     async fn live_headless_page_read() {
-        let tool = WebBrowserTool::discover().expect("Chromium-family browser not found");
+        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let tool = WebBrowserTool::new(browser);
         let result = tool
             .run(json!({ "url": "https://example.com" }))
             .await
@@ -201,6 +206,7 @@ mod tests {
                 .contains("Example Domain")
         );
         assert!(output.get("truncated").is_none());
+        tool.shutdown().await;
     }
 
     #[tokio::test]
@@ -214,35 +220,63 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 1024];
-            let read = socket.read(&mut request).await.unwrap();
-            assert!(read > 0);
-            let body = r#"<html><head><title>Visibility</title></head><body><main>
-                <h1>Visible heading</h1>
-                <p style="display:none">Hidden text</p>
-                <nav><p>Navigation text</p></nav>
-                <p id="rendered">Before script</p>
-                <script>document.getElementById('rendered').textContent = 'Rendered text';</script>
-            </main></body></html>"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket.write_all(response.as_bytes()).await.unwrap();
+            let mut visit = 0;
+            while visit < 2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let read = socket.read(&mut request).await.unwrap();
+                if read == 0 {
+                    continue;
+                }
+                let body = if visit == 0 {
+                    r#"<html><head><title>Visibility</title></head><body><main>
+                        <h1>Visible heading</h1>
+                        <p style="display:none">Hidden text</p>
+                        <nav><p>Navigation text</p></nav>
+                        <p id="rendered">Before script</p>
+                        <script>
+                            localStorage.setItem('rope-test', 'Persistent session');
+                            document.getElementById('rendered').textContent = 'Rendered text';
+                        </script>
+                    </main></body></html>"#
+                } else {
+                    r#"<html><body><main><p id="stored"></p><script>
+                        document.getElementById('stored').textContent = localStorage.getItem('rope-test');
+                    </script></main></body></html>"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                visit += 1;
+            }
         });
 
-        let tool = WebBrowserTool::discover().expect("Chromium-family browser not found");
+        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let tool = WebBrowserTool::new(browser);
         let result = tool
             .run(json!({ "url": format!("http://{address}") }))
             .await
             .unwrap();
-        server.await.unwrap();
         let output: Value = serde_json::from_str(&result.output).unwrap();
         let content = output["content"].as_str().unwrap();
         assert!(content.contains("Visible heading"));
         assert!(content.contains("Rendered text"));
         assert!(!content.contains("Hidden text"));
         assert!(!content.contains("Navigation text"));
+        let result = tool
+            .run(json!({ "url": format!("http://{address}/again") }))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            output["content"]
+                .as_str()
+                .unwrap()
+                .contains("Persistent session")
+        );
+        tool.shutdown().await;
     }
 }

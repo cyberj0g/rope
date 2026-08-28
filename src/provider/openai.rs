@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -11,6 +13,11 @@ use crate::runtime::{CompletionRequest, Message};
 #[derive(Clone)]
 pub struct OpenAiProvider {
     client: Client,
+    endpoints: HashMap<String, Endpoint>,
+}
+
+#[derive(Clone)]
+struct Endpoint {
     base_url: String,
     api_key: String,
 }
@@ -19,19 +26,84 @@ impl OpenAiProvider {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             client: Client::new(),
-            base_url,
-            api_key,
+            endpoints: HashMap::from([("default".into(), Endpoint { base_url, api_key })]),
         }
     }
+
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            client: Client::new(),
+            endpoints: config
+                .providers
+                .iter()
+                .map(|provider| {
+                    (
+                        provider.name.clone(),
+                        Endpoint {
+                            base_url: provider.base_url.clone(),
+                            api_key: provider.api_key.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    pub async fn models(&self) -> Result<Vec<String>> {
+        let endpoint = self
+            .endpoints
+            .get("default")
+            .context("default provider is not configured")?;
+        let url = format!("{}/models", endpoint.base_url.trim_end_matches('/'));
+        let mut builder = self.client.get(url);
+        if !endpoint.api_key.is_empty() {
+            builder = builder.bearer_auth(&endpoint.api_key);
+        }
+        let response = builder.send().await.context("query API models")?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("model endpoint returned {status}: {body}");
+        }
+        let mut models = response
+            .json::<ModelList>()
+            .await
+            .context("decode API model list")?
+            .data
+            .into_iter()
+            .map(|model| model.id)
+            .filter(|id| !id.trim().is_empty())
+            .collect::<Vec<_>>();
+        models.sort_unstable();
+        models.dedup();
+        Ok(models)
+    }
+}
+
+#[derive(Deserialize)]
+struct ModelList {
+    data: Vec<ApiModel>,
+}
+
+#[derive(Deserialize)]
+struct ApiModel {
+    id: String,
 }
 
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let endpoint = self
+            .endpoints
+            .get(&request.provider)
+            .with_context(|| format!("provider {} is not configured", request.provider))?;
+        let url = format!(
+            "{}/chat/completions",
+            endpoint.base_url.trim_end_matches('/')
+        );
         let mut builder = self.client.post(url).json(&WireRequest::from(request));
-        if !self.api_key.is_empty() {
-            builder = builder.bearer_auth(&self.api_key);
+        if !endpoint.api_key.is_empty() {
+            builder = builder.bearer_auth(&endpoint.api_key);
         }
         let response = builder.send().await.context("send completion request")?;
         let status = response.status();
@@ -70,7 +142,10 @@ struct WireRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<crate::runtime::ReasoningEffort>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "max_completion_tokens",
+        skip_serializing_if = "Option::is_none"
+    )]
     max_tokens: Option<u32>,
     stream: bool,
     stream_options: StreamOptions,
@@ -310,6 +385,28 @@ fn parse_delta(data: &str) -> Result<Vec<ResponseDelta>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_routes_for_every_configured_provider() {
+        let mut config = crate::config::Config::default();
+        config.providers = vec![
+            crate::config::ProviderConfig {
+                name: "one".into(),
+                base_url: "https://one.example/v1".into(),
+                api_key: "first".into(),
+            },
+            crate::config::ProviderConfig {
+                name: "two".into(),
+                base_url: "https://two.example/v1".into(),
+                api_key: "second".into(),
+            },
+        ];
+
+        let provider = OpenAiProvider::from_config(&config);
+
+        assert_eq!(provider.endpoints.len(), 2);
+        assert_eq!(provider.endpoints["two"].base_url, "https://two.example/v1");
+    }
 
     #[test]
     fn extracts_text_and_tool_deltas() {

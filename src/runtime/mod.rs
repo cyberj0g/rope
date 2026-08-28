@@ -1,6 +1,11 @@
 mod message;
 
-use std::{collections::HashSet, str::FromStr, sync::Arc};
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -25,21 +30,27 @@ const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    None,
+    Minimal,
     Low,
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 impl FromStr for ReasoningEffort {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
         match value {
+            "none" => Ok(Self::None),
+            "minimal" => Ok(Self::Minimal),
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
             "xhigh" => Ok(Self::XHigh),
-            _ => bail!("reasoning effort must be low, medium, high, or xhigh"),
+            "max" => Ok(Self::Max),
+            _ => bail!("reasoning effort must be none, minimal, low, medium, high, xhigh, or max"),
         }
     }
 }
@@ -47,16 +58,20 @@ impl FromStr for ReasoningEffort {
 impl std::fmt::Display for ReasoningEffort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
         })
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct CompletionRequest {
+    pub provider: String,
     pub model: String,
     pub messages: Vec<Message>,
     pub temperature: Option<f32>,
@@ -71,15 +86,22 @@ pub struct UserPrompt {
     pub images: Vec<ImageContent>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowSession,
+    Deny,
+}
+
 pub enum Command {
     Submit(UserPrompt),
     Cancel,
-    Approve(bool),
+    Approve(ApprovalDecision),
     NewSession(Option<String>),
     Save,
     AddContext(String),
     DropContext(String),
-    NextModel,
+    SelectModel(String),
     NextReasoningEffort,
     RefreshProject,
     GitDiff(Option<std::path::PathBuf>),
@@ -109,6 +131,10 @@ pub enum Event {
     ModelRequestStarted(String),
     ResponseHeadersReceived,
     ResponseStarted,
+    ModelResponseFinished {
+        output_tokens: u64,
+        duration: Duration,
+    },
     ReasoningDelta(String),
     TextDelta(String),
     ToolCallDelta {
@@ -149,7 +175,7 @@ enum InternalEvent {
     PlanUpdated(ExecutionPlan),
     Approval {
         call: ToolCall,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<ApprovalDecision>,
     },
     ProjectChanged(ProjectState),
 }
@@ -163,6 +189,11 @@ struct TurnResult {
 struct Compaction {
     summary: String,
     through: usize,
+}
+
+struct PendingApproval {
+    tool: String,
+    reply: oneshot::Sender<ApprovalDecision>,
 }
 
 pub async fn spawn<P: Provider>(
@@ -201,7 +232,7 @@ async fn run<P: Provider>(
 ) {
     let (internal_tx, mut internal_rx) = mpsc::channel(8);
     let mut generation: Option<JoinHandle<()>> = None;
-    let mut pending_approval: Option<oneshot::Sender<bool>> = None;
+    let mut pending_approval: Option<PendingApproval> = None;
 
     events.send(Event::History(messages.clone())).await.ok();
     events
@@ -269,8 +300,18 @@ async fn run<P: Provider>(
                         refresh_project(project.clone(), internal_tx.clone());
                     }
                 }
-                Command::Approve(approved) => {
-                    if let Some(reply) = pending_approval.take() { reply.send(approved).ok(); }
+                Command::Approve(decision) => {
+                    if let Some(pending) = pending_approval.take() {
+                        if decision == ApprovalDecision::AllowSession
+                            && !session.meta.approved_tools.contains(&pending.tool)
+                        {
+                            session.meta.approved_tools.push(pending.tool.clone());
+                            if let Err(error) = session.save().await {
+                                events.send(Event::Error(format!("save session approval: {error:#}"))).await.ok();
+                            }
+                        }
+                        pending.reply.send(decision).ok();
+                    }
                 }
                 Command::NewSession(name) if generation.is_none() => match Session::new_named(name).await {
                     Ok(new_session) => {
@@ -295,7 +336,7 @@ async fn run<P: Provider>(
                     Ok(()) => { events.send(Event::ProjectChanged(project.clone())).await.ok(); }
                     Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
                 }
-                Command::NextModel if generation.is_none() => match config.next_model() {
+                Command::SelectModel(model) if generation.is_none() => match config.set_model(&model) {
                     Ok(()) => {
                         send_settings(&events, &config).await;
                         send_context(&events, &session, &config).await;
@@ -319,6 +360,7 @@ async fn run<P: Provider>(
                 }
                 Command::Shutdown(reply) => {
                     if let Some(task) = generation.take() { task.abort(); }
+                    tools.shutdown().await;
                     session.save().await.ok();
                     reply.send(SessionSummary {
                         name: session.meta.name.clone(),
@@ -327,7 +369,7 @@ async fn run<P: Provider>(
                     break;
                 }
                 Command::NewSession(_)
-                | Command::NextModel
+                | Command::SelectModel(_)
                 | Command::NextReasoningEffort => {}
             },
             Some(event) = internal_rx.recv() => match event {
@@ -387,8 +429,13 @@ async fn run<P: Provider>(
                     events.send(Event::PlanChanged(Some(plan))).await.ok();
                 }
                 InternalEvent::Approval { call, reply } => {
-                    if generation.is_none() || pending_approval.is_some() { reply.send(false).ok(); }
-                    else { pending_approval = Some(reply); events.send(Event::ApprovalRequested(call)).await.ok(); }
+                    if generation.is_none() || pending_approval.is_some() { reply.send(ApprovalDecision::Deny).ok(); }
+                    else if session.meta.approved_tools.contains(&call.name) {
+                        reply.send(ApprovalDecision::AllowSession).ok();
+                    } else {
+                        pending_approval = Some(PendingApproval { tool: call.name.clone(), reply });
+                        events.send(Event::ApprovalRequested(call)).await.ok();
+                    }
                 }
                 InternalEvent::ProjectChanged(changed) => {
                     project = changed;
@@ -403,6 +450,7 @@ async fn run<P: Provider>(
             else => break,
         }
     }
+    tools.shutdown().await;
 }
 
 fn refresh_project(mut project: ProjectState, internal: mpsc::Sender<InternalEvent>) {
@@ -419,7 +467,7 @@ async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {
     events
         .send(Event::SettingsChanged {
             model: config.model_name().to_owned(),
-            reasoning_effort: config.reasoning_effort,
+            reasoning_effort: config.effective_reasoning_effort(),
         })
         .await
         .ok();
@@ -642,10 +690,11 @@ async fn compact<P: Provider>(
     )];
     request_messages.extend(messages);
     let request = CompletionRequest {
+        provider: config.provider_name().to_owned(),
         model: config.model_id().to_owned(),
         messages: request_messages,
-        temperature: Some(0.0),
-        reasoning_effort: None,
+        temperature: config.effective_temperature(),
+        reasoning_effort: config.light_reasoning_effort(),
         max_tokens: Some(
             (config.active_model().max_context_tokens / 8)
                 .clamp(512, 4096)
@@ -711,6 +760,7 @@ async fn generate_session_title<P: Provider>(
         .await
         .ok();
     let request = CompletionRequest {
+        provider: config.provider_name().to_owned(),
         model: config.model_id().to_owned(),
         messages: vec![
             Message::system(
@@ -720,7 +770,7 @@ async fn generate_session_title<P: Provider>(
             Message::user_with_images(prompt, Vec::new()),
         ],
         temperature: None,
-        reasoning_effort: Some(ReasoningEffort::Low),
+        reasoning_effort: config.light_reasoning_effort(),
         max_tokens: Some(512),
         stream: true,
         tools: Vec::new(),
@@ -832,10 +882,11 @@ async fn agent<P: Provider>(
             request_messages.insert(0, Message::system(prompt.clone()));
         }
         let request = CompletionRequest {
+            provider: config.provider_name().to_owned(),
             model: config.model_id().to_owned(),
             messages: request_messages,
             temperature: config.effective_temperature(),
-            reasoning_effort: config.reasoning_effort,
+            reasoning_effort: config.effective_reasoning_effort(),
             max_tokens: None,
             stream: true,
             tools: tools.definitions(config.active_model().vision),
@@ -886,7 +937,7 @@ async fn agent<P: Provider>(
                             reply,
                         })
                         .await?;
-                    decision.await.unwrap_or(false)
+                    decision.await.unwrap_or(ApprovalDecision::Deny) != ApprovalDecision::Deny
                 }
             };
             let result = if approved {
@@ -1031,12 +1082,12 @@ async fn collect(
     let mut text = String::new();
     let mut calls: Vec<ToolDraft> = Vec::new();
     let mut usage = None;
-    let mut started = false;
+    let mut started = None;
     while let Some(delta) = stream.next().await {
         let delta = delta?;
-        if !started {
+        if started.is_none() {
+            started = Some(Instant::now());
             events.send(Event::ResponseStarted).await.ok();
-            started = true;
         }
         match delta {
             ResponseDelta::Reasoning(delta) => {
@@ -1077,6 +1128,15 @@ async fn collect(
         }
     }
     if let Some(tokens) = usage {
+        if let Some(started) = started {
+            events
+                .send(Event::ModelResponseFinished {
+                    output_tokens: tokens.total_tokens.saturating_sub(tokens.prompt_tokens),
+                    duration: started.elapsed(),
+                })
+                .await
+                .ok();
+        }
         internal.send(InternalEvent::Usage(tokens)).await?;
     }
     let calls = calls
@@ -1177,7 +1237,7 @@ mod tests {
                 total_tokens: 321,
             }),
         ]]));
-        let (event_tx, _event_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
 
         agent(
@@ -1201,6 +1261,17 @@ mod tests {
                 total_tokens: 321
             }))
         ));
+        while let Some(event) = event_rx.recv().await {
+            if let Event::ModelResponseFinished {
+                output_tokens,
+                duration,
+            } = event
+            {
+                assert_eq!(output_tokens, 121);
+                assert!(!duration.is_zero());
+                break;
+            }
+        }
     }
 
     #[tokio::test]

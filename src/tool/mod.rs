@@ -16,8 +16,11 @@ use builtin::{
     EditTool, GlobTool, GrepTool, ReadTool, ShellTool, UpdatePlanTool, ViewImageTool, WriteTool,
 };
 use external::ExternalTool;
+use headless::HeadlessBrowser;
 use web_browser::WebBrowserTool;
 use web_search::WebSearchTool;
+
+pub use headless::{browser_executable, prepare_runtime as prepare_browser_runtime};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -79,6 +82,7 @@ pub trait Tool: Send + Sync {
         false
     }
     async fn run(&self, args: Value) -> Result<ToolResult>;
+    async fn shutdown(&self) {}
 }
 
 #[derive(Clone)]
@@ -123,6 +127,12 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    pub async fn shutdown(&self) {
+        for entry in self.tools.values() {
+            entry.tool.shutdown().await;
+        }
+    }
 }
 
 pub async fn discover(config: &Config) -> Result<ToolRegistry> {
@@ -135,12 +145,11 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     registry.insert(GrepTool(cwd.clone()), config.tools.grep);
     registry.insert(GlobTool(cwd.clone()), config.tools.glob);
     registry.insert(ViewImageTool(cwd.clone()), config.tools.read);
-    if let Some(tool) = WebBrowserTool::discover() {
-        registry.insert(tool, config.tools.web_browser);
-    }
-    if let Some(tool) = WebSearchTool::discover() {
-        registry.insert(tool, config.tools.web_search);
-    }
+    add_web_tools(
+        &mut registry,
+        config,
+        HeadlessBrowser::discover().map(Arc::new),
+    );
 
     if let Some(global) =
         directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("rope/tools"))
@@ -155,6 +164,20 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     .await?;
     registry.insert(UpdatePlanTool, Approval::Allow);
     Ok(registry)
+}
+
+fn add_web_tools(
+    registry: &mut ToolRegistry,
+    config: &Config,
+    browser: Option<Arc<HeadlessBrowser>>,
+) {
+    if let Some(browser) = browser {
+        registry.insert(
+            WebBrowserTool::new(browser.clone()),
+            config.tools.web_browser,
+        );
+        registry.insert(WebSearchTool::new(browser), config.tools.web_search);
+    }
 }
 
 async fn add_external(
@@ -207,6 +230,15 @@ mod tests {
             tools.definitions(true)[0].function.name,
             "view_image".to_owned()
         );
+    }
+
+    #[test]
+    fn web_tools_are_omitted_without_a_headless_browser() {
+        let mut tools = ToolRegistry::default();
+        add_web_tools(&mut tools, &Config::default(), None);
+
+        assert!(tools.get("web_browser").is_err());
+        assert!(tools.get("web_search").is_err());
     }
 
     #[tokio::test]

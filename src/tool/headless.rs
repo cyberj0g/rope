@@ -1,32 +1,45 @@
 use std::{
-    collections::HashSet,
-    path::PathBuf,
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
     process::Stdio,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use futures_util::{SinkExt, StreamExt};
+use flate2::read::GzDecoder;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tar::Archive;
+use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    net::TcpStream,
-    process::Command,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, Command},
+    sync::{Mutex, mpsc, oneshot},
+    task::JoinHandle,
     time::timeout,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use url::Url;
 
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
-const LOAD_TIMEOUT: Duration = Duration::from_secs(20);
-static PROFILE_ID: AtomicU64 = AtomicU64::new(0);
+const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_ARCHIVE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/patchright-runtime.tar.gz"));
+const RUNTIME_HASH: &str = env!("ROPE_PATCHRIGHT_RUNTIME_HASH");
+const RUNTIME_TARGET: &str = env!("ROPE_PATCHRIGHT_RUNTIME_TARGET");
 
-type CdpSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Reply = std::result::Result<Value, String>;
+type Waiters = Arc<StdMutex<HashMap<u64, oneshot::Sender<Reply>>>>;
 
 pub struct HeadlessBrowser {
     executable: PathBuf,
+    next_id: AtomicU64,
+    state: Mutex<BrowserState>,
 }
 
 #[derive(Deserialize)]
@@ -51,17 +64,37 @@ pub struct BrowserLink {
     pub url: String,
 }
 
-#[derive(Deserialize)]
-struct DebugTarget {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(rename = "webSocketDebuggerUrl")]
-    websocket_url: Option<String>,
+#[derive(Default)]
+struct BrowserState {
+    sidecar: Option<Sidecar>,
+    profile: Option<TempDir>,
+}
+
+struct Sidecar {
+    child: Child,
+    commands: mpsc::UnboundedSender<String>,
+    waiters: Waiters,
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+    stderr: JoinHandle<()>,
+}
+
+struct CancelGuard {
+    id: u64,
+    commands: mpsc::UnboundedSender<String>,
+    armed: bool,
 }
 
 impl HeadlessBrowser {
     pub fn discover() -> Option<Self> {
-        find_browser().map(|executable| Self { executable })
+        if !runtime_available() {
+            return None;
+        }
+        find_browser().map(|executable| Self {
+            executable,
+            next_id: AtomicU64::new(1),
+            state: Mutex::new(BrowserState::default()),
+        })
     }
 
     pub async fn load(&self, url: &Url) -> Result<BrowserPage> {
@@ -71,213 +104,364 @@ impl HeadlessBrowser {
     }
 
     async fn load_inner(&self, url: &Url) -> Result<BrowserPage> {
-        let profile = BrowserProfile::new()?;
-        let mut command = Command::new(&self.executable);
-        command
-            .kill_on_drop(true)
-            .arg("--headless=new")
-            .arg("--disable-gpu")
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-extensions")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--remote-debugging-port=0")
-            .arg("--remote-allow-origins=*")
-            .arg("--window-size=1280,900")
-            .arg(format!("--user-agent={USER_AGENT}"))
-            .arg(format!("--user-data-dir={}", profile.0.display()))
-            .arg("about:blank")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let receiver;
+        let commands;
+        {
+            let mut state = self.state.lock().await;
+            let stopped = match state.sidecar.as_mut() {
+                Some(sidecar) => sidecar.child.try_wait()?.is_some(),
+                None => false,
+            };
+            if stopped {
+                state.sidecar.take();
+            }
+            if state.profile.is_none() {
+                state.profile = Some(
+                    tempfile::Builder::new()
+                        .prefix("rope-browser-")
+                        .tempdir()
+                        .context("create browser profile")?,
+                );
+            }
+            if state.sidecar.is_none() {
+                let runtime = tokio::task::spawn_blocking(ensure_runtime)
+                    .await
+                    .context("prepare Patchright runtime task")??;
+                let profile = state.profile.as_ref().unwrap().path();
+                state.sidecar = Some(Sidecar::start(&runtime, profile, &self.executable).await?);
+            }
+            let sidecar = state.sidecar.as_ref().unwrap();
+            receiver = sidecar.request(id, "load", Some(url.as_str()))?;
+            commands = sidecar.commands.clone();
+        }
 
-        let mut child = command.spawn().context("start browser")?;
-        let stderr = child.stderr.take().context("capture browser stderr")?;
-        let mut stderr = BufReader::new(stderr).lines();
-        let browser_socket = loop {
-            let line = stderr
-                .next_line()
-                .await?
-                .context("browser exited before opening its debug port")?;
-            if let Some(socket) = line
-                .split_once("DevTools listening on ")
-                .map(|(_, url)| url)
-            {
-                break Url::parse(socket)?;
+        let mut cancel = CancelGuard {
+            id,
+            commands,
+            armed: true,
+        };
+        let reply = receiver.await.context("Patchright browser stopped")?;
+        cancel.armed = false;
+        let value = reply.map_err(anyhow::Error::msg)?;
+        serde_json::from_value(value).context("decode page from Patchright")
+    }
+
+    pub async fn shutdown(&self) {
+        let (sidecar, profile) = {
+            let mut state = self.state.lock().await;
+            (state.sidecar.take(), state.profile.take())
+        };
+        if let Some(sidecar) = sidecar {
+            sidecar
+                .shutdown(self.next_id.fetch_add(1, Ordering::Relaxed))
+                .await;
+        }
+        drop(profile);
+    }
+}
+
+pub fn browser_executable() -> Option<PathBuf> {
+    find_browser()
+}
+
+pub async fn prepare_runtime() -> Result<Option<PathBuf>> {
+    if !runtime_available() {
+        return Ok(None);
+    }
+    tokio::task::spawn_blocking(ensure_runtime)
+        .await
+        .context("prepare Patchright runtime task")?
+        .map(Some)
+}
+
+impl Sidecar {
+    async fn start(runtime: &Path, profile: &Path, browser: &Path) -> Result<Self> {
+        let mut command = Command::new(runtime.join(node_name()));
+        command
+            .arg(runtime.join("sidecar.cjs"))
+            .arg(profile)
+            .arg(browser)
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().context("start Patchright browser helper")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("capture Patchright helper stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("capture Patchright helper stdout")?;
+        let stderr_pipe = child
+            .stderr
+            .take()
+            .context("capture Patchright helper stderr")?;
+        let errors = Arc::new(StdMutex::new(String::new()));
+        let captured = errors.clone();
+        let stderr = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr_pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut output = captured.lock().expect("Patchright stderr mutex poisoned");
+                if output.len() < 32 * 1024 {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+        });
+
+        let mut lines = BufReader::new(stdout).lines();
+        let ready = match timeout(START_TIMEOUT, lines.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => {
+                stderr.await.ok();
+                bail!(
+                    "Patchright browser helper exited during startup: {}",
+                    startup_error(&errors)
+                );
+            }
+            Ok(Err(error)) => {
+                child.kill().await.ok();
+                bail!("read Patchright startup reply: {error}");
+            }
+            Err(_) => {
+                child.kill().await.ok();
+                stderr.await.ok();
+                bail!(
+                    "Patchright browser startup timed out: {}",
+                    startup_error(&errors)
+                );
             }
         };
-        let port = browser_socket.port().context("debug socket has no port")?;
-        let targets: Vec<DebugTarget> = reqwest::get(format!("http://127.0.0.1:{port}/json/list"))
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let page_socket = targets
-            .into_iter()
-            .find(|target| target.kind == "page")
-            .and_then(|target| target.websocket_url)
-            .context("browser created no page target")?;
-        let (mut socket, _) = connect_async(page_socket).await?;
+        let message: Value =
+            serde_json::from_str(&ready).context("invalid Patchright startup reply")?;
+        if message.get("ready").and_then(Value::as_bool) != Some(true) {
+            let error = errors
+                .lock()
+                .expect("Patchright stderr mutex poisoned")
+                .trim()
+                .to_owned();
+            child.kill().await.ok();
+            bail!("Patchright browser failed to start: {error}");
+        }
 
-        cdp_send(&mut socket, 1, "Page.enable", json!({})).await?;
-        cdp_send(
-            &mut socket,
-            2,
-            "Page.setLifecycleEventsEnabled",
-            json!({ "enabled": true }),
-        )
-        .await?;
-        wait_for_responses(&mut socket, [1, 2]).await?;
-        cdp_send(
-            &mut socket,
-            3,
-            "Page.navigate",
-            json!({ "url": url.as_str() }),
-        )
-        .await?;
-        wait_for_navigation(&mut socket).await?;
-        cdp_send(
-            &mut socket,
-            4,
-            "Runtime.evaluate",
-            json!({
-                "expression": EXTRACTION_SCRIPT,
-                "awaitPromise": true,
-                "returnByValue": true,
-            }),
-        )
-        .await?;
-        let value = wait_for_response(&mut socket, 4).await?;
-        let value = value
-            .pointer("/result/result/value")
-            .cloned()
-            .context("browser returned no page content")?;
-        let page = serde_json::from_value(value)?;
-        child.kill().await.ok();
-        Ok(page)
+        let (commands, mut command_rx) = mpsc::unbounded_channel::<String>();
+        let writer = tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(command) = command_rx.recv().await {
+                if stdin.write_all(command.as_bytes()).await.is_err()
+                    || stdin.write_all(b"\n").await.is_err()
+                    || stdin.flush().await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let waiters: Waiters = Arc::new(StdMutex::new(HashMap::new()));
+        let pending = waiters.clone();
+        let reader = tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(id) = message.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let reply = match message.get("error").and_then(Value::as_str) {
+                    Some(error) => Err(error.to_owned()),
+                    None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+                };
+                if let Some(waiter) = pending
+                    .lock()
+                    .expect("Patchright waiter mutex poisoned")
+                    .remove(&id)
+                {
+                    waiter.send(reply).ok();
+                }
+            }
+            for (_, waiter) in pending
+                .lock()
+                .expect("Patchright waiter mutex poisoned")
+                .drain()
+            {
+                waiter.send(Err("Patchright browser stopped".into())).ok();
+            }
+        });
+
+        Ok(Self {
+            child,
+            commands,
+            waiters,
+            reader,
+            writer,
+            stderr,
+        })
+    }
+
+    fn request(
+        &self,
+        id: u64,
+        method: &str,
+        url: Option<&str>,
+    ) -> Result<oneshot::Receiver<Reply>> {
+        let (sender, receiver) = oneshot::channel();
+        self.waiters
+            .lock()
+            .expect("Patchright waiter mutex poisoned")
+            .insert(id, sender);
+        let mut request = json!({ "id": id, "method": method });
+        if let Some(url) = url {
+            request["url"] = Value::String(url.to_owned());
+        }
+        if self.commands.send(request.to_string()).is_err() {
+            self.waiters
+                .lock()
+                .expect("Patchright waiter mutex poisoned")
+                .remove(&id);
+            bail!("Patchright browser stopped");
+        }
+        Ok(receiver)
+    }
+
+    async fn shutdown(mut self, id: u64) {
+        if let Ok(reply) = self.request(id, "shutdown", None) {
+            let _ = timeout(SHUTDOWN_TIMEOUT, reply).await;
+        }
+        if timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await.is_err() {
+            self.child.kill().await.ok();
+        }
     }
 }
 
-async fn cdp_send(socket: &mut CdpSocket, id: u64, method: &str, params: Value) -> Result<()> {
-    socket
-        .send(Message::Text(
-            json!({ "id": id, "method": method, "params": params })
-                .to_string()
-                .into(),
-        ))
-        .await?;
+fn startup_error(errors: &StdMutex<String>) -> String {
+    let error = errors
+        .lock()
+        .expect("Patchright stderr mutex poisoned")
+        .trim()
+        .to_owned();
+    if error.is_empty() {
+        "no diagnostics".into()
+    } else {
+        error
+    }
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
+        self.stderr.abort();
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.commands
+                .send(json!({ "id": self.id, "method": "cancel" }).to_string())
+                .ok();
+        }
+    }
+}
+
+fn runtime_available() -> bool {
+    runtime_override().is_some() || !RUNTIME_ARCHIVE.is_empty()
+}
+
+fn ensure_runtime() -> Result<PathBuf> {
+    if let Some(runtime) = runtime_override() {
+        validate_runtime(&runtime)?;
+        return Ok(runtime);
+    }
+    if RUNTIME_ARCHIVE.is_empty() {
+        bail!(
+            "Patchright runtime is not embedded; run scripts/prepare-patchright-runtime.sh before building"
+        );
+    }
+
+    let cache = directories::BaseDirs::new()
+        .context("find user cache directory")?
+        .cache_dir()
+        .join("rope/patchright");
+    let runtime = cache.join(format!("{}-{RUNTIME_TARGET}", &RUNTIME_HASH[..16]));
+    if runtime.exists() {
+        if runtime.join(".complete").is_file() && validate_runtime(&runtime).is_ok() {
+            return Ok(runtime);
+        }
+        fs::remove_dir_all(&runtime).context("remove incomplete Patchright runtime")?;
+    }
+
+    fs::create_dir_all(&cache).context("create Patchright cache directory")?;
+    let staging = tempfile::Builder::new()
+        .prefix("extract-")
+        .tempdir_in(&cache)
+        .context("create Patchright staging directory")?;
+    Archive::new(GzDecoder::new(RUNTIME_ARCHIVE))
+        .unpack(staging.path())
+        .context("extract Patchright runtime")?;
+    validate_runtime(staging.path())?;
+    make_node_executable(staging.path())?;
+    fs::write(staging.path().join(".complete"), RUNTIME_HASH)
+        .context("mark Patchright runtime complete")?;
+    match fs::rename(staging.path(), &runtime) {
+        Ok(()) => {}
+        Err(_error) if runtime.join(".complete").is_file() => {
+            validate_runtime(&runtime)?;
+            return Ok(runtime);
+        }
+        Err(error) => return Err(error).context("install Patchright runtime"),
+    }
+    Ok(runtime)
+}
+
+fn runtime_override() -> Option<PathBuf> {
+    std::env::var_os("ROPE_PATCHRIGHT_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| validate_runtime(path).is_ok())
+}
+
+fn validate_runtime(path: &Path) -> Result<()> {
+    for entry in [
+        path.join(node_name()),
+        path.join("sidecar.cjs"),
+        path.join("node_modules/patchright-core"),
+    ] {
+        if !entry.exists() {
+            bail!(
+                "incomplete Patchright runtime: {} is missing",
+                entry.display()
+            );
+        }
+    }
     Ok(())
 }
 
-async fn cdp_message(socket: &mut CdpSocket) -> Result<Value> {
-    loop {
-        let message = socket
-            .next()
-            .await
-            .context("browser debug socket closed")??;
-        if let Message::Text(text) = message {
-            return Ok(serde_json::from_str(&text)?);
-        }
-    }
-}
-
-async fn wait_for_responses(socket: &mut CdpSocket, ids: [u64; 2]) -> Result<()> {
-    let mut waiting = HashSet::from(ids);
-    while !waiting.is_empty() {
-        let message = cdp_message(socket).await?;
-        if let Some(id) = message["id"].as_u64()
-            && waiting.remove(&id)
-            && let Some(error) = message.get("error")
-        {
-            bail!("browser command failed: {error}");
-        }
-    }
+#[cfg(unix)]
+fn make_node_executable(runtime: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let node = runtime.join(node_name());
+    let mut permissions = fs::metadata(&node)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(node, permissions)?;
     Ok(())
 }
 
-async fn wait_for_navigation(socket: &mut CdpSocket) -> Result<()> {
-    let mut loader = None;
-    let mut loaded = HashSet::new();
-    loop {
-        let message = cdp_message(socket).await?;
-        if message["id"] == 3 {
-            if let Some(error) = message.get("error") {
-                bail!("browser navigation failed: {error}");
-            }
-            if let Some(error) = message.pointer("/result/errorText").and_then(Value::as_str) {
-                bail!("browser navigation failed: {error}");
-            }
-            loader = message
-                .pointer("/result/loaderId")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-        } else if message["method"] == "Page.lifecycleEvent"
-            && message.pointer("/params/name").and_then(Value::as_str) == Some("load")
-            && let Some(loader) = message.pointer("/params/loaderId").and_then(Value::as_str)
-        {
-            loaded.insert(loader.to_owned());
-        }
-        if loader
-            .as_ref()
-            .is_some_and(|loader| loaded.contains(loader))
-        {
-            return Ok(());
-        }
-    }
+#[cfg(not(unix))]
+fn make_node_executable(_runtime: &Path) -> Result<()> {
+    Ok(())
 }
 
-async fn wait_for_response(socket: &mut CdpSocket, id: u64) -> Result<Value> {
-    loop {
-        let message = cdp_message(socket).await?;
-        if message["id"] == id {
-            if let Some(error) = message.get("error") {
-                bail!("browser command failed: {error}");
-            }
-            if let Some(error) = message.pointer("/result/exceptionDetails") {
-                bail!("browser script failed: {error}");
-            }
-            return Ok(message);
-        }
-    }
+#[cfg(windows)]
+fn node_name() -> &'static str {
+    "node.exe"
 }
 
-const EXTRACTION_SCRIPT: &str = r#"
-new Promise(resolve => setTimeout(() => {
-  const root = document.querySelector('main')
-    || document.querySelector('article')
-    || document.querySelector('[role="main"]')
-    || document.body;
-  const excluded = 'script, style, noscript, svg, nav, aside, footer, [hidden], [aria-hidden="true"]';
-  const containers = 'li, blockquote, pre, td, th, tr';
-  const text = element => element.innerText.replace(/\s+/g, ' ').trim();
-  const visible = element => {
-    if (!element || element.closest(excluded) || !text(element)) return false;
-    const style = getComputedStyle(element);
-    return style.display !== 'none'
-      && style.visibility !== 'hidden'
-      && style.visibility !== 'collapse'
-      && Number(style.opacity) !== 0;
-  };
-  const blocks = [...root.querySelectorAll('h1, h2, h3, h4, h5, h6, p, pre, li, blockquote, dt, dd, tr')]
-    .filter(element => visible(element) && !element.parentElement.closest(containers))
-    .map(element => ({
-      tag: element.tagName.toLowerCase(),
-      text: element.tagName === 'TR'
-        ? [...element.querySelectorAll(':scope > th, :scope > td')].map(text).join(' | ')
-        : text(element)
-    }));
-  const links = [...root.querySelectorAll('a[href]')]
-    .filter(visible)
-    .map(element => ({ text: text(element), url: element.href }));
-  resolve({
-    title: document.title,
-    url: location.href,
-    html: document.documentElement.outerHTML,
-    visible_text: root.innerText,
-    blocks,
-    links
-  });
-}, 750))
-"#;
+#[cfg(not(windows))]
+fn node_name() -> &'static str {
+    "node"
+}
 
 fn find_browser() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ROPE_BROWSER").map(PathBuf::from) {
@@ -331,21 +515,4 @@ fn platform_browser() -> Option<PathBuf> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_browser() -> Option<PathBuf> {
     None
-}
-
-struct BrowserProfile(PathBuf);
-
-impl BrowserProfile {
-    fn new() -> Result<Self> {
-        let id = PROFILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rope-browser-{}-{id}", std::process::id()));
-        std::fs::create_dir(&path).context("create temporary browser profile")?;
-        Ok(Self(path))
-    }
-}
-
-impl Drop for BrowserProfile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }

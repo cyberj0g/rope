@@ -6,7 +6,12 @@
 - deterministic mock provider for runtime tests
 - streamed text and OpenAI function-call assembly
 - layered `~/.config/rope/config.toml` and `./.rope/config.toml` configuration
-- named model profiles with context size, temperature, and vision capabilities; omitted names use the API model ID
+- colored, keyboard-navigable first-run setup for multiple OpenAI-compatible providers with optional API-key entry, API model discovery, and private global config creation
+- OpenAI-first onboarding with official endpoint recognition and pinned current OpenAI models above the full API catalog
+- explicit per-model provider routing, including duplicate model IDs across endpoints and legacy single-endpoint config compatibility
+- named model profiles with context size, temperature, reasoning defaults/options, and vision capabilities; omitted names use the API model ID
+- built-in defaults for popular OpenAI-compatible model families, including Qwen3.8
+- searchable recent-first model picker shared by `/model`, Alt+M, and the clickable model status
 - automatic global and project `AGENTS.md` instructions
 
 ## Sessions
@@ -27,10 +32,13 @@
 - configurable context fill tracking and automatic continuation compaction
 - preserved visible transcripts with persisted `Context compacted` markers
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
+- explicit in-chat tool approval state with paused execution timing and `y` once, `n` deny, or session-persisted `s` approval
 - built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
 - persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes
-- browser-backed `web_search` using DuckDuckGo with Bing fallback, Chromium-family browser discovery, and a `ROPE_BROWSER` override
-- text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links and no model-controlled truncation
+- Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a shared headless Chromium context, version-matched browser identity, a process-lifetime profile, and a `ROPE_BROWSER` override
+- text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links, a shared browser session, and no model-controlled truncation
+- reproducible, checksum-verified Node and Patchright runtime embedding with lazy versioned extraction on first browser use
+- eager Patchright extraction plus Chrome/Chromium diagnostics during first-run setup, including `ROPE_BROWSER` override guidance
 - automatic post-consumption `web_browser` result ejection from model context while retaining the full visible and persisted transcript
 - per-call tool output capped at roughly one fifth of the available model context with an explicit truncation marker
 - multimodal `view_image` tool advertised only by vision-enabled model profiles
@@ -62,7 +70,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - generating model recorded beside each assistant response
 - full-width conversation view with deliberate trailing whitespace
 - bounded bottom-follow chat scrolling that holds the viewport through streaming, collapses, and full-screen diff visits
-- distinctly colored session, token, context, price, and current-directory fields on the status bar, plus live generation speed while streaming
+- distinctly colored session, token, context, price, and current-directory fields on the status bar, plus estimated live generation speed and the exact reported average while idle
 - asynchronously refreshed Git pane with a mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
 - auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
 - drag-to-copy conversation selection with a non-blocking clipboard toast
