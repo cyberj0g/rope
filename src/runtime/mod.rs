@@ -103,6 +103,7 @@ pub enum Command {
     DropContext(String),
     SelectModel(String),
     NextReasoningEffort,
+    RememberCommand(String),
     RefreshProject,
     GitDiff(Option<std::path::PathBuf>),
     Shutdown(oneshot::Sender<SessionSummary>),
@@ -348,6 +349,11 @@ async fn run<P: Provider>(
                     Ok(()) => send_settings(&events, &config).await,
                     Err(error) => { events.send(Event::Error(format!("save reasoning setting: {error:#}"))).await.ok(); }
                 },
+                Command::RememberCommand(command) => {
+                    if let Err(error) = config.remember_command(&command) {
+                        events.send(Event::Error(format!("save command history: {error:#}"))).await.ok();
+                    }
+                }
                 Command::RefreshProject => {
                     refresh_project(project.clone(), internal_tx.clone());
                 }

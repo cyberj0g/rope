@@ -228,6 +228,7 @@ pub async fn run(
     let mut images = ImageRenderer::new();
     let mut state = UiState::new();
     state.recent_models.clone_from(&config.recent_models);
+    state.recent_commands.clone_from(&config.recent_commands);
     let mut request = request;
     let (input_load_tx, mut input_load_rx) = mpsc::unbounded_channel();
     let mut chat_height = 0;
@@ -506,7 +507,8 @@ async fn handle_key(
         }
         return Ok(false);
     }
-    if key.code == KeyCode::Esc && palette_commands(&state.input).is_some() {
+    if key.code == KeyCode::Esc && palette_commands(&state.input, &state.recent_commands).is_some()
+    {
         state.clear_input();
         state.palette_selected = 0;
         return Ok(false);
@@ -523,7 +525,7 @@ async fn handle_key(
             state.insert_char('\n');
         }
         KeyCode::Enter => {
-            if let Some(filtered) = palette_commands(&state.input)
+            if let Some(filtered) = palette_commands(&state.input, &state.recent_commands)
                 && let Some(command) = filtered.get(state.palette_selected).copied()
             {
                 if command.argument {
@@ -601,7 +603,7 @@ async fn handle_key(
         KeyCode::Up if state.has_input_images() => {}
         KeyCode::Down if state.has_input_images() => {}
         KeyCode::Up => {
-            if palette_commands(&state.input).is_some() {
+            if palette_commands(&state.input, &state.recent_commands).is_some() {
                 state.palette_selected = state.palette_selected.saturating_sub(1);
             } else {
                 let mut input = state.input.clone();
@@ -610,7 +612,7 @@ async fn handle_key(
             }
         }
         KeyCode::Down => {
-            if let Some(filtered) = palette_commands(&state.input) {
+            if let Some(filtered) = palette_commands(&state.input, &state.recent_commands) {
                 state.palette_selected =
                     (state.palette_selected + 1).min(filtered.len().saturating_sub(1));
             } else {
@@ -801,24 +803,31 @@ async fn dispatch(
     let (command, argument) = input
         .split_once(' ')
         .map_or((input.as_str(), ""), |parts| parts);
-    match command {
+    let command = command.to_owned();
+    let used = match command.as_str() {
         "/new" => {
             commands
                 .send(Command::NewSession(
                     (!argument.is_empty()).then(|| argument.to_owned()),
                 ))
-                .await?
+                .await?;
+            true
         }
-        "/save" if argument.is_empty() => commands.send(Command::Save).await?,
+        "/save" if argument.is_empty() => {
+            commands.send(Command::Save).await?;
+            true
+        }
         "/add" if !argument.is_empty() => {
             commands
                 .send(Command::AddContext(argument.to_owned()))
-                .await?
+                .await?;
+            true
         }
         "/drop" if !argument.is_empty() => {
             commands
                 .send(Command::DropContext(argument.to_owned()))
-                .await?
+                .await?;
+            true
         }
         "/image" if !argument.is_empty() => {
             if !model_supports_vision(config, state) {
@@ -833,23 +842,48 @@ async fn dispatch(
                     move || image_from_path(&path).map(LoadedInput::Image),
                 );
             }
+            true
         }
-        "/model" if argument.is_empty() => open_model_picker(config, state),
-        "/reason" if argument.is_empty() => commands.send(Command::NextReasoningEffort).await?,
-        "/thinking" if argument.is_empty() => state.toggle_thinking_default(),
-        "/tools" if argument.is_empty() => state.toggle_tools_default(),
-        "/plan" if argument.is_empty() => state.toggle_plan_panel(),
+        "/model" if argument.is_empty() => {
+            open_model_picker(config, state);
+            true
+        }
+        "/reason" if argument.is_empty() => {
+            commands.send(Command::NextReasoningEffort).await?;
+            true
+        }
+        "/thinking" if argument.is_empty() => {
+            state.toggle_thinking_default();
+            true
+        }
+        "/tools" if argument.is_empty() => {
+            state.toggle_tools_default();
+            true
+        }
+        "/plan" if argument.is_empty() => {
+            state.toggle_plan_panel();
+            true
+        }
         "/diff" if argument.is_empty() => {
             state.open_fullscreen_git_diff();
             commands.send(Command::GitDiff(None)).await?;
+            true
         }
         value if value.starts_with('/') => {
             history.reset_navigation();
-            state.set_error(format!("unknown or incomplete command: {value}"))
+            state.set_error(format!("unknown or incomplete command: {value}"));
+            false
         }
         _ => {
             submit(input, Vec::new(), state, history, commands).await?;
+            false
         }
+    };
+    if used {
+        state.recent_commands.retain(|name| name != &command);
+        state.recent_commands.insert(0, command.clone());
+        state.recent_commands.truncate(12);
+        commands.send(Command::RememberCommand(command)).await?;
     }
     if is_command {
         history.reset_navigation();
@@ -1586,21 +1620,26 @@ fn draw_toast(frame: &mut ratatui::Frame, state: &UiState) {
     );
 }
 
-fn palette_commands(input: &str) -> Option<Vec<SlashCommand>> {
+fn palette_commands(input: &str, recent: &[String]) -> Option<Vec<SlashCommand>> {
     if !input.starts_with('/') || input.contains(char::is_whitespace) {
         return None;
     }
     let query = input.trim_start_matches('/').to_ascii_lowercase();
-    Some(
-        COMMANDS
+    let mut commands = COMMANDS
+        .iter()
+        .copied()
+        .filter(|command| {
+            command.name[1..].to_ascii_lowercase().contains(&query)
+                || command.title.to_ascii_lowercase().contains(&query)
+        })
+        .collect::<Vec<_>>();
+    commands.sort_by_key(|command| {
+        recent
             .iter()
-            .copied()
-            .filter(|command| {
-                command.name[1..].to_ascii_lowercase().contains(&query)
-                    || command.title.to_ascii_lowercase().contains(&query)
-            })
-            .collect(),
-    )
+            .position(|name| name == command.name)
+            .unwrap_or(usize::MAX)
+    });
+    Some(commands)
 }
 
 fn hotkey_command(key: KeyEvent) -> Option<&'static str> {
@@ -1621,7 +1660,7 @@ fn is_shift_insert(key: KeyEvent) -> bool {
 }
 
 fn draw_command_palette(frame: &mut ratatui::Frame, state: &UiState, input: Rect) {
-    let Some(commands) = palette_commands(&state.input) else {
+    let Some(commands) = palette_commands(&state.input, &state.recent_commands) else {
         return;
     };
     let height = (commands.len() as u16 + 2).min(input.y);
@@ -4070,11 +4109,11 @@ mod tests {
 
     #[test]
     fn command_palette_filters_by_name_and_title() {
-        let by_name = palette_commands("/rea").unwrap();
+        let by_name = palette_commands("/rea", &[]).unwrap();
         assert_eq!(by_name.len(), 1);
         assert_eq!(by_name[0].name, "/reason");
 
-        let by_title = palette_commands("/visibility").unwrap();
+        let by_title = palette_commands("/visibility", &[]).unwrap();
         assert_eq!(
             by_title
                 .iter()
@@ -4082,7 +4121,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/thinking", "/tools"]
         );
-        assert!(palette_commands("/add ").is_none());
+        assert!(palette_commands("/add ", &[]).is_none());
+    }
+
+    #[test]
+    fn command_palette_keeps_recent_commands_first() {
+        let recent = vec!["/tools".into(), "/save".into()];
+        let commands = palette_commands("/", &recent).unwrap();
+
+        assert_eq!(commands[0].name, "/tools");
+        assert_eq!(commands[1].name, "/save");
+        assert_eq!(commands[2].name, "/new");
     }
 
     #[test]

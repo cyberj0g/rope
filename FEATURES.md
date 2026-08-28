@@ -76,7 +76,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - asynchronously refreshed Git pane with a mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
 - auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
 - drag-to-copy conversation selection with a non-blocking clipboard toast
-- filtered slash-command palette with keyboard navigation and command hotkeys
+- recent-first filtered slash-command palette with keyboard navigation and command hotkeys
 - non-blocking clipboard and `/image` image attachments with an elapsed processing plate
 - inline, vertically sliced Sixel, iTerm2, and Kitty image rendering that follows chat scrolling when supported by the terminal, with text fallback
 - bracketed paste plus direct Shift+Insert clipboard fallback

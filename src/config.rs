@@ -38,6 +38,8 @@ pub struct Config {
     #[serde(skip)]
     pub recent_models: Vec<String>,
     #[serde(skip)]
+    pub recent_commands: Vec<String>,
+    #[serde(skip)]
     settings_path: PathBuf,
 }
 
@@ -161,6 +163,7 @@ impl Default for Config {
             compaction_threshold: 0.75,
             tools: ToolPolicies::default(),
             recent_models: Vec::new(),
+            recent_commands: Vec::new(),
             settings_path: PathBuf::new(),
         }
     }
@@ -265,6 +268,13 @@ impl Config {
             .and_then(|current| efforts.iter().position(|effort| *effort == current))
             .map_or(0, |index| (index + 1) % efforts.len());
         self.reasoning_effort = Some(efforts[next]);
+        self.persist_settings()
+    }
+
+    pub fn remember_command(&mut self, command: &str) -> Result<()> {
+        self.recent_commands.retain(|name| name != command);
+        self.recent_commands.insert(0, command.to_owned());
+        self.recent_commands.truncate(12);
         self.persist_settings()
     }
 
@@ -376,6 +386,7 @@ impl Config {
             .into_iter()
             .filter(|name| self.models.iter().any(|model| model.name == *name))
             .collect();
+        self.recent_commands = settings.recent_commands;
         self.remember_model();
         if let Some(effort) = settings.reasoning_effort {
             self.reasoning_effort = Some(effort);
@@ -394,6 +405,7 @@ impl Config {
             model: Some(self.model.clone()),
             reasoning_effort: self.reasoning_effort,
             recent_models: self.recent_models.clone(),
+            recent_commands: self.recent_commands.clone(),
         };
         fs::create_dir_all(self.settings_path.parent().unwrap())?;
         fs::write(&self.settings_path, toml::to_string_pretty(&settings)?)
@@ -426,6 +438,8 @@ struct PersistedSettings {
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     recent_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recent_commands: Vec<String>,
 }
 
 pub fn config_root() -> Result<PathBuf> {
@@ -727,5 +741,24 @@ max_context_tokens = 32768
             config.effective_reasoning_effort(),
             Some(ReasoningEffort::XHigh)
         );
+    }
+
+    #[test]
+    fn recently_used_commands_are_persisted_in_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            settings_path: directory.path().join("state.toml"),
+            ..Config::default()
+        };
+
+        config.remember_command("/save").unwrap();
+        config.remember_command("/tools").unwrap();
+        config.remember_command("/save").unwrap();
+
+        assert_eq!(config.recent_commands, ["/save", "/tools"]);
+        let settings: PersistedSettings =
+            toml::from_str(&std::fs::read_to_string(directory.path().join("state.toml")).unwrap())
+                .unwrap();
+        assert_eq!(settings.recent_commands, ["/save", "/tools"]);
     }
 }
