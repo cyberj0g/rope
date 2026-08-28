@@ -12,7 +12,6 @@ pub struct GitFile {
 #[derive(Clone, Debug, Default)]
 pub struct ProjectState {
     pub cwd: PathBuf,
-    pub context: Vec<PathBuf>,
     pub git_available: bool,
     pub git_files: Vec<GitFile>,
     pub git_diff: String,
@@ -27,28 +26,6 @@ impl ProjectState {
         };
         state.refresh().await;
         Ok(state)
-    }
-
-    pub async fn add(&mut self, value: &str) -> Result<()> {
-        let path = absolute(&self.cwd, value);
-        if !path.is_file() {
-            bail!("context file not found: {}", path.display());
-        }
-        if !self.context.contains(&path) {
-            self.context.push(path);
-            self.context.sort();
-        }
-        Ok(())
-    }
-
-    pub fn drop(&mut self, value: &str) -> Result<()> {
-        let path = absolute(&self.cwd, value);
-        let before = self.context.len();
-        self.context.retain(|entry| entry != &path);
-        if self.context.len() == before {
-            bail!("file is not in context: {value}");
-        }
-        Ok(())
     }
 
     pub async fn prompt(&self) -> Result<Option<String>> {
@@ -68,19 +45,6 @@ impl ProjectState {
                 "Project instructions (AGENTS.md):\n{}",
                 tokio::fs::read_to_string(&local_agents).await?
             ));
-        }
-        if !self.context.is_empty() {
-            sections.push(format!(
-                "Current working directory: {}\nExplicit context files:",
-                self.cwd.display()
-            ));
-        }
-        for path in &self.context {
-            let relative = path.strip_prefix(&self.cwd).unwrap_or(path);
-            let content = tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("read context {}", path.display()))?;
-            sections.push(format!("--- {} ---\n{}", relative.display(), content));
         }
         Ok((!sections.is_empty()).then(|| sections.join("\n\n")))
     }
@@ -173,15 +137,6 @@ async fn diff(cwd: &Path, path: Option<&Path>) -> Result<String> {
         .await?;
     }
     Ok(output)
-}
-
-fn absolute(cwd: &Path, value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    }
 }
 
 async fn git(cwd: &Path, args: &[&str]) -> Result<String> {

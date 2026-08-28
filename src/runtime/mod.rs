@@ -99,8 +99,6 @@ pub enum Command {
     Approve(ApprovalDecision),
     NewSession(Option<String>),
     Save,
-    AddContext(String),
-    DropContext(String),
     SelectModel(String),
     NextReasoningEffort,
     RememberCommand(String),
@@ -328,14 +326,6 @@ async fn run<P: Provider>(
                 }
                 Command::Save => match session.save().await {
                     Ok(()) => { events.send(Event::Saved).await.ok(); }
-                    Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
-                }
-                Command::AddContext(path) => match project.add(&path).await {
-                    Ok(()) => { events.send(Event::ProjectChanged(project.clone())).await.ok(); }
-                    Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
-                }
-                Command::DropContext(path) => match project.drop(&path) {
-                    Ok(()) => { events.send(Event::ProjectChanged(project.clone())).await.ok(); }
                     Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
                 }
                 Command::SelectModel(model) if generation.is_none() => match config.set_model(&model) {

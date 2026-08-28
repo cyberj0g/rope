@@ -81,4 +81,3 @@ External tools receive their function arguments as JSON on stdin and must return
 - inline, vertically sliced Sixel, iTerm2, and Kitty image rendering that follows chat scrolling when supported by the terminal, with text fallback
 - bracketed paste plus direct Shift+Insert clipboard fallback
 - `/thinking` and `/tools` global visibility toggles plus clickable model and reasoning selectors
-- `/add PATH`, `/drop PATH`, and `/diff`

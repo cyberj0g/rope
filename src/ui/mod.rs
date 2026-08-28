@@ -156,18 +156,6 @@ const COMMANDS: &[SlashCommand] = &[
         argument: false,
     },
     SlashCommand {
-        name: "/add",
-        title: "Add context file",
-        hotkey: "—",
-        argument: true,
-    },
-    SlashCommand {
-        name: "/drop",
-        title: "Drop context file",
-        hotkey: "—",
-        argument: true,
-    },
-    SlashCommand {
         name: "/image",
         title: "Attach image file",
         hotkey: "Ctrl+V",
@@ -815,18 +803,6 @@ async fn dispatch(
         }
         "/save" if argument.is_empty() => {
             commands.send(Command::Save).await?;
-            true
-        }
-        "/add" if !argument.is_empty() => {
-            commands
-                .send(Command::AddContext(argument.to_owned()))
-                .await?;
-            true
-        }
-        "/drop" if !argument.is_empty() => {
-            commands
-                .send(Command::DropContext(argument.to_owned()))
-                .await?;
             true
         }
         "/image" if !argument.is_empty() => {
@@ -4159,7 +4135,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["/thinking", "/tools"]
         );
-        assert!(palette_commands("/add ", &[]).is_none());
+        assert!(palette_commands("/image ", &[]).is_none());
     }
 
     #[test]
