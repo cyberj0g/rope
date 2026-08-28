@@ -404,22 +404,25 @@ async fn handle_key(
     if let Some(call) = &state.approval {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                state.notice = Some(format!("allowed {} once", call.name));
+                let detail = format!("{} · once", call.name);
                 state.approval = None;
+                push_tool_decision(state, "Tool approved", detail);
                 commands
                     .send(Command::Approve(ApprovalDecision::AllowOnce))
                     .await?;
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                state.notice = Some(format!("allowed {} for this session", call.name));
+                let detail = format!("{} · session", call.name);
                 state.approval = None;
+                push_tool_decision(state, "Tool approved", detail);
                 commands
                     .send(Command::Approve(ApprovalDecision::AllowSession))
                     .await?;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                state.notice = Some(format!("denied {}", call.name));
+                let detail = call.name.clone();
                 state.approval = None;
+                push_tool_decision(state, "Tool denied", detail);
                 commands
                     .send(Command::Approve(ApprovalDecision::Deny))
                     .await?;
@@ -634,6 +637,17 @@ async fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+fn push_tool_decision(state: &mut UiState, label: &str, content: String) {
+    state.blocks.push(ChatBlock::Message {
+        label: label.into(),
+        content,
+        images: Vec::new(),
+        model: String::new(),
+        kind: MessageKind::System,
+        expanded: true,
+    });
 }
 
 async fn handle_model_picker_key(
@@ -2587,7 +2601,7 @@ fn tool_status(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Streaming => "streaming",
         ToolStatus::Pending => "pending",
-        ToolStatus::WaitingApproval => "waiting for approval · y once / n deny / s session",
+        ToolStatus::WaitingApproval => "waiting for approval",
         ToolStatus::Running => "running",
         ToolStatus::Done => "done",
         ToolStatus::Failed => "failed",
@@ -3553,7 +3567,10 @@ mod tests {
             arguments: serde_json::json!({}),
         }));
         assert_eq!(app_status(&state), ("approval", Color::Yellow));
-        assert!(tool_status(ToolStatus::WaitingApproval).starts_with("waiting for approval"));
+        assert_eq!(
+            tool_status(ToolStatus::WaitingApproval),
+            "waiting for approval"
+        );
         state.approval = None;
 
         state.apply(Event::ToolStarted {
@@ -3579,6 +3596,33 @@ mod tests {
                 kind: MessageKind::Error,
                 ..
             }) if label == "Error" && content == "failed"
+        ));
+    }
+
+    #[test]
+    fn tool_decisions_are_conversation_history_entries() {
+        let mut state = UiState::new();
+        push_tool_decision(&mut state, "Tool approved", "shell · once".into());
+        push_tool_decision(&mut state, "Tool denied", "write".into());
+
+        assert!(state.notice.is_none());
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                label,
+                content,
+                kind: MessageKind::System,
+                ..
+            } if label == "Tool approved" && content == "shell · once"
+        ));
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Message {
+                label,
+                content,
+                kind: MessageKind::System,
+                ..
+            } if label == "Tool denied" && content == "write"
         ));
     }
 

@@ -32,7 +32,7 @@
 - configurable context fill tracking and automatic continuation compaction
 - preserved visible transcripts with persisted `Context compacted` markers
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
-- explicit in-chat tool approval state with paused execution timing and `y` once, `n` deny, or session-persisted `s` approval
+- tool approval controls in the composer with paused execution timing, session-persisted approvals, and decision markers retained in conversation history
 - built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
 - persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes
 - Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a shared headless Chromium context, version-matched browser identity, a process-lifetime profile, and a `ROPE_BROWSER` override
