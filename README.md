@@ -14,7 +14,7 @@ status line that reflects the current state at a glance.
 
 ## Demo
 
-<video src="assets/demo.mp4" controls></video>
+https://github.com/user-attachments/assets/c8a0636d-a37e-4877-9472-f46b9bea4d68
 
 ## Quickstart
 
