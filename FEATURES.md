@@ -35,7 +35,7 @@
 - preserved visible transcripts with persisted `Context compacted` markers
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - tool approval controls in the composer with paused execution timing, session-persisted approvals, and decision markers retained in conversation history
-- built-in `read`, `write`, `edit`, `shell`, `grep`, and `glob` tools
+- built-in `read`, `write`, `edit`, `shell`, `search_files`, and `list_files` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks
 - persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes
 - Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a shared headless Chromium context, version-matched browser identity, a process-lifetime profile, and a `ROPE_BROWSER` override
 - text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links, a shared browser session, and no model-controlled truncation

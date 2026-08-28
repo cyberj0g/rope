@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fmt::Write as _,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -14,10 +17,28 @@ pub struct ReadTool(pub PathBuf);
 pub struct WriteTool(pub PathBuf);
 pub struct EditTool(pub PathBuf);
 pub struct ShellTool(pub PathBuf);
-pub struct GrepTool(pub PathBuf);
-pub struct GlobTool(pub PathBuf);
+pub struct SearchFilesTool {
+    root: PathBuf,
+    ripgrep: bool,
+}
+pub struct ListFilesTool {
+    root: PathBuf,
+    ripgrep: bool,
+}
 pub struct ViewImageTool(pub PathBuf);
 pub struct UpdatePlanTool;
+
+impl SearchFilesTool {
+    pub fn new(root: PathBuf, ripgrep: bool) -> Self {
+        Self { root, ripgrep }
+    }
+}
+
+impl ListFilesTool {
+    pub fn new(root: PathBuf, ripgrep: bool) -> Self {
+        Self { root, ripgrep }
+    }
+}
 
 fn path(root: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
@@ -197,12 +218,12 @@ impl Tool for ShellTool {
 }
 
 #[async_trait]
-impl Tool for GrepTool {
+impl Tool for SearchFilesTool {
     fn name(&self) -> &str {
-        "grep"
+        "search_files"
     }
     fn description(&self) -> &str {
-        "Search files with ripgrep"
+        "Search file contents with a ripgrep-compatible regular expression. Respects ignore files."
     }
     fn schema(&self) -> Value {
         object(
@@ -219,20 +240,47 @@ impl Tool for GrepTool {
             path: Option<String>,
         }
         let args: Args = serde_json::from_value(args)?;
-        let mut command = Command::new("rg");
-        command
-            .kill_on_drop(true)
-            .arg("--line-number")
-            .arg("--color=never")
-            .arg(args.pattern)
-            .arg(args.path.unwrap_or_else(|| ".".into()))
-            .current_dir(&self.0);
-        let output = command.output().await.context("run rg")?;
-        if !output.status.success() && output.status.code() != Some(1) {
-            bail!("rg exited with {}", output.status);
+        let search_path = args.path.unwrap_or_else(|| ".".into());
+        if self.ripgrep {
+            let mut command = Command::new("rg");
+            command
+                .kill_on_drop(true)
+                .arg("--line-number")
+                .arg("--color=never")
+                .arg("--no-require-git")
+                .arg("--path-separator")
+                .arg("/")
+                .arg("--")
+                .arg(&args.pattern)
+                .arg(&search_path)
+                .current_dir(&self.root);
+            match command.output().await {
+                Ok(output) => {
+                    if !output.status.success() && output.status.code() != Some(1) {
+                        bail!(
+                            "rg exited with {}\n{}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    return Ok(ToolResult {
+                        output: String::from_utf8_lossy(&output.stdout).into_owned(),
+                        image: None,
+                        diff: None,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("run rg"),
+            }
         }
+
+        let root = self.root.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            search_files_fallback(&root, &search_path, &args.pattern)
+        })
+        .await??;
         Ok(ToolResult {
-            output: String::from_utf8_lossy(&output.stdout).into_owned(),
+            output,
             image: None,
             diff: None,
         })
@@ -240,12 +288,12 @@ impl Tool for GrepTool {
 }
 
 #[async_trait]
-impl Tool for GlobTool {
+impl Tool for ListFilesTool {
     fn name(&self) -> &str {
-        "glob"
+        "list_files"
     }
     fn description(&self) -> &str {
-        "List paths matching a glob pattern"
+        "List files matching a glob pattern. Respects ignore files."
     }
     fn schema(&self) -> Value {
         object(json!({ "pattern": { "type": "string" } }), &["pattern"])
@@ -256,24 +304,116 @@ impl Tool for GlobTool {
             pattern: String,
         }
         let args: Args = serde_json::from_value(args)?;
-        let pattern = path(&self.0, &args.pattern).to_string_lossy().into_owned();
-        let mut paths = glob::glob(&pattern)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        paths.sort();
-        let output = paths
-            .into_iter()
-            .map(|path| {
-                path.strip_prefix(&self.0)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let matcher = globset::Glob::new(&args.pattern)?.compile_matcher();
+        if self.ripgrep {
+            let mut command = Command::new("rg");
+            command
+                .kill_on_drop(true)
+                .arg("--files")
+                .arg("--color=never")
+                .arg("--no-require-git")
+                .arg("--path-separator")
+                .arg("/")
+                .current_dir(&self.root);
+            match command.output().await {
+                Ok(output) => {
+                    if !output.status.success() && output.status.code() != Some(1) {
+                        bail!(
+                            "rg exited with {}\n{}",
+                            output.status,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    let mut paths = String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .filter(|path| matcher.is_match(path))
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    paths.sort();
+                    return Ok(ToolResult {
+                        output: paths.join("\n"),
+                        image: None,
+                        diff: None,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("run rg"),
+            }
+        }
+
+        let root = self.root.clone();
+        let output =
+            tokio::task::spawn_blocking(move || list_files_fallback(&root, &matcher)).await??;
         Ok(ToolResult {
             output,
             image: None,
             diff: None,
         })
+    }
+}
+
+fn search_files_fallback(root: &Path, search_path: &str, pattern: &str) -> Result<String> {
+    let regex = regex::Regex::new(pattern)?;
+    let target = path(root, search_path);
+    let files = if target.is_file() {
+        vec![target]
+    } else {
+        ignore::WalkBuilder::new(target)
+            .require_git(false)
+            .build()
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
+                    Some(Ok(entry.into_path()))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut output = String::new();
+    for file in files {
+        let content = match std::fs::read_to_string(&file) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let display = normalized_path(file.strip_prefix(root).unwrap_or(&file));
+        for (line, content) in content.lines().enumerate() {
+            if regex.is_match(content) {
+                writeln!(output, "{display}:{}:{content}", line + 1)?;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn list_files_fallback(root: &Path, matcher: &globset::GlobMatcher) -> Result<String> {
+    let mut paths = ignore::WalkBuilder::new(root)
+        .require_git(false)
+        .build()
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.file_type().is_some_and(|kind| kind.is_file()) => {
+                let path = entry.path().strip_prefix(root).unwrap_or(entry.path());
+                let path = normalized_path(path);
+                matcher.is_match(&path).then_some(Ok(path))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    paths.sort();
+    Ok(paths.join("\n"))
+}
+
+fn normalized_path(path: &Path) -> String {
+    normalize_path_separator(&path.to_string_lossy(), std::path::MAIN_SEPARATOR)
+}
+
+fn normalize_path_separator(path: &str, separator: char) -> String {
+    if separator == '/' {
+        path.to_owned()
+    } else {
+        path.replace(separator, "/")
     }
 }
 
@@ -439,5 +579,86 @@ mod tests {
         assert!(write_diff.contains("+new file"));
 
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_search_fallbacks_respect_gitignore() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-file-search-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(root.join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("ignored"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(".gitignore"), "ignored.rs\nignored/\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("visible.rs"), "needle\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("ignored.rs"), "needle\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("nested/match.rs"), "needle nested\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("ignored/hidden.rs"), "needle\n")
+            .await
+            .unwrap();
+
+        let listed = ListFilesTool::new(root.clone(), false)
+            .run(json!({ "pattern": "**/*.rs" }))
+            .await
+            .unwrap()
+            .output;
+        assert_eq!(listed, "nested/match.rs\nvisible.rs");
+
+        let searched = SearchFilesTool::new(root.clone(), false)
+            .run(json!({ "pattern": "needle" }))
+            .await
+            .unwrap()
+            .output;
+        assert!(searched.contains("visible.rs:1:needle"));
+        assert!(searched.contains("nested/match.rs:1:needle nested"));
+        assert!(!searched.contains("ignored"));
+
+        if super::super::ripgrep_available() {
+            let listed_with_ripgrep = ListFilesTool::new(root.clone(), true)
+                .run(json!({ "pattern": "**/*.rs" }))
+                .await
+                .unwrap()
+                .output;
+            assert_eq!(listed_with_ripgrep, listed);
+
+            let searched_with_ripgrep = SearchFilesTool::new(root.clone(), true)
+                .run(json!({ "pattern": "needle" }))
+                .await
+                .unwrap()
+                .output;
+            assert!(searched_with_ripgrep.contains("visible.rs:1:needle"));
+            assert!(searched_with_ripgrep.contains("nested/match.rs:1:needle nested"));
+            assert!(!searched_with_ripgrep.contains("ignored"));
+        }
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[test]
+    fn tool_paths_use_portable_separators() {
+        assert_eq!(
+            normalize_path_separator("nested/match.rs", '/'),
+            "nested/match.rs"
+        );
+        assert_eq!(
+            normalize_path_separator(r"nested\match.rs", '\\'),
+            "nested/match.rs"
+        );
     }
 }

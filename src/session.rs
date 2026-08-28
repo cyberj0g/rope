@@ -94,11 +94,18 @@ impl Session {
 
     async fn load(root: PathBuf, name: String) -> Result<(Self, Vec<Message>)> {
         let directory = root.join(&name);
-        let meta: SessionMeta = serde_json::from_slice(
+        let mut meta: SessionMeta = serde_json::from_slice(
             &tokio::fs::read(directory.join("session.json"))
                 .await
                 .with_context(|| format!("load session {name}"))?,
         )?;
+        for tool in &mut meta.approved_tools {
+            match tool.as_str() {
+                "grep" => *tool = "search_files".into(),
+                "glob" => *tool = "list_files".into(),
+                _ => {}
+            }
+        }
         let data = tokio::fs::read_to_string(directory.join("messages.jsonl"))
             .await
             .unwrap_or_default();
@@ -401,13 +408,18 @@ mod tests {
             .await
             .unwrap();
         session.meta.approved_tools.push("shell".into());
+        session.meta.approved_tools.push("grep".into());
+        session.meta.approved_tools.push("glob".into());
         session.save().await.unwrap();
 
         let (loaded, _) = Session::load(root.clone(), "approvals".into())
             .await
             .unwrap();
 
-        assert_eq!(loaded.meta.approved_tools, ["shell"]);
+        assert_eq!(
+            loaded.meta.approved_tools,
+            ["shell", "search_files", "list_files"]
+        );
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

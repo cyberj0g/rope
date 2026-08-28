@@ -148,6 +148,14 @@ pub async fn run() -> Result<()> {
     }
 
     disambiguate_model_names(&mut models);
+    section("File search");
+    if crate::tool::ripgrep_available() {
+        success("ripgrep: available");
+    } else {
+        warning(
+            "ripgrep not found. The built-in fallback will be used; install ripgrep for faster file searches.",
+        );
+    }
     section("Browser tools");
     let browser = prepare_browser().await;
 
@@ -474,10 +482,12 @@ fn report(
     let web_available = browser.runtime_ready && browser.executable.is_some();
     if web_available {
         success(
-            "Tools: read, write, edit, shell, grep, glob, view_image, update_plan, web_search, web_browser",
+            "Tools: read, write, edit, shell, search_files, list_files, view_image, update_plan, web_search, web_browser",
         );
     } else {
-        success("Tools: read, write, edit, shell, grep, glob, view_image, update_plan");
+        success(
+            "Tools: read, write, edit, shell, search_files, list_files, view_image, update_plan",
+        );
         warning("Web tools: unavailable until both Patchright and Chrome are available");
     }
 

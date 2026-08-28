@@ -120,8 +120,10 @@ pub struct ToolPolicies {
     pub write: Approval,
     pub edit: Approval,
     pub shell: Approval,
-    pub grep: Approval,
-    pub glob: Approval,
+    #[serde(alias = "grep")]
+    pub search_files: Approval,
+    #[serde(alias = "glob")]
+    pub list_files: Approval,
     pub web_browser: Approval,
     pub web_search: Approval,
     pub external: Approval,
@@ -134,8 +136,8 @@ impl Default for ToolPolicies {
             write: Approval::Ask,
             edit: Approval::Ask,
             shell: Approval::Ask,
-            grep: Approval::Allow,
-            glob: Approval::Allow,
+            search_files: Approval::Allow,
+            list_files: Approval::Allow,
             web_browser: Approval::Ask,
             web_search: Approval::Ask,
             external: Approval::Ask,
@@ -200,6 +202,7 @@ impl Config {
             if path.exists() {
                 let mut overlay = read_toml(path)?;
                 promote_legacy_provider(&mut overlay);
+                promote_legacy_tool_names(&mut overlay);
                 merge(&mut value, overlay);
             }
         }
@@ -461,6 +464,25 @@ fn promote_legacy_provider(value: &mut toml::Value) {
     );
 }
 
+fn promote_legacy_tool_names(value: &mut toml::Value) {
+    let Some(tools) = value
+        .as_table_mut()
+        .and_then(|table| table.get_mut("tools"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+    for (old, new) in [("grep", "search_files"), ("glob", "list_files")] {
+        if !tools.contains_key(new)
+            && let Some(policy) = tools.remove(old)
+        {
+            tools.insert(new.into(), policy);
+        } else {
+            tools.remove(old);
+        }
+    }
+}
+
 fn merge(base: &mut toml::Value, overlay: toml::Value) {
     match (base, overlay) {
         (toml::Value::Table(base), toml::Value::Table(overlay)) => {
@@ -584,6 +606,23 @@ api_key = "local-key"
             Some("http://localhost:8000/v1")
         );
         assert_eq!(value["providers"][0]["api_key"].as_str(), Some("local-key"));
+    }
+
+    #[test]
+    fn legacy_tool_policy_names_are_promoted() {
+        let mut value: toml::Value = toml::from_str(
+            r#"[tools]
+grep = "deny"
+glob = "ask""#,
+        )
+        .unwrap();
+
+        promote_legacy_tool_names(&mut value);
+
+        assert_eq!(value["tools"]["search_files"].as_str(), Some("deny"));
+        assert_eq!(value["tools"]["list_files"].as_str(), Some("ask"));
+        assert!(value["tools"].get("grep").is_none());
+        assert!(value["tools"].get("glob").is_none());
     }
 
     #[test]

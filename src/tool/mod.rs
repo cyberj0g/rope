@@ -4,7 +4,7 @@ mod headless;
 mod web_browser;
 mod web_search;
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, process::Stdio, sync::Arc};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -13,7 +13,8 @@ use serde_json::Value;
 
 use crate::{config::Config, runtime::ImageContent};
 use builtin::{
-    EditTool, GlobTool, GrepTool, ReadTool, ShellTool, UpdatePlanTool, ViewImageTool, WriteTool,
+    EditTool, ListFilesTool, ReadTool, SearchFilesTool, ShellTool, UpdatePlanTool, ViewImageTool,
+    WriteTool,
 };
 use external::ExternalTool;
 use headless::HeadlessBrowser;
@@ -21,6 +22,16 @@ use web_browser::WebBrowserTool;
 use web_search::WebSearchTool;
 
 pub use headless::{browser_executable, prepare_runtime as prepare_browser_runtime};
+
+pub fn ripgrep_available() -> bool {
+    std::process::Command::new("rg")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -142,8 +153,15 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     registry.insert(WriteTool(cwd.clone()), config.tools.write);
     registry.insert(EditTool(cwd.clone()), config.tools.edit);
     registry.insert(ShellTool(cwd.clone()), config.tools.shell);
-    registry.insert(GrepTool(cwd.clone()), config.tools.grep);
-    registry.insert(GlobTool(cwd.clone()), config.tools.glob);
+    let ripgrep = ripgrep_available();
+    registry.insert(
+        SearchFilesTool::new(cwd.clone(), ripgrep),
+        config.tools.search_files,
+    );
+    registry.insert(
+        ListFilesTool::new(cwd.clone(), ripgrep),
+        config.tools.list_files,
+    );
     registry.insert(ViewImageTool(cwd.clone()), config.tools.read);
     add_web_tools(
         &mut registry,
