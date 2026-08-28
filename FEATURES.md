@@ -4,7 +4,7 @@
 
 - provider-independent streaming runtime with an OpenAI-compatible provider
 - Responses API by default for OpenAI and local vLLM endpoints, with endpoint-level `chat_completions` compatibility
-- stateless Responses conversations backed by Rope sessions, including persisted opaque reasoning and output items
+- stateless Responses conversations backed by Rope sessions, including persisted opaque reasoning and model-scoped output-item replay that remains safe across model switches
 - deterministic mock provider for runtime tests
 - streamed text and OpenAI function-call assembly
 - layered `~/.config/rope/config.toml` and `./.rope/config.toml` configuration

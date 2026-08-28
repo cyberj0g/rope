@@ -85,9 +85,10 @@ struct ResponseTool {
 
 impl From<CompletionRequest> for ResponseRequest {
     fn from(request: CompletionRequest) -> Self {
+        let input = input_items(request.messages, &request.model);
         Self {
             model: request.model,
-            input: input_items(request.messages),
+            input,
             temperature: request.temperature,
             reasoning: request.reasoning_effort.map(|effort| ResponseReasoning {
                 effort,
@@ -114,11 +115,14 @@ impl From<ToolDefinition> for ResponseTool {
     }
 }
 
-fn input_items(messages: Vec<Message>) -> Vec<Value> {
-    messages.into_iter().flat_map(message_items).collect()
+fn input_items(messages: Vec<Message>, model: &str) -> Vec<Value> {
+    messages
+        .into_iter()
+        .flat_map(|message| message_items(message, model))
+        .collect()
 }
 
-fn message_items(message: Message) -> Vec<Value> {
+fn message_items(message: Message, model: &str) -> Vec<Value> {
     match message {
         Message::System { content } => vec![json!({ "role": "system", "content": content })],
         Message::User { content, images } if images.is_empty() => {
@@ -130,10 +134,11 @@ fn message_items(message: Message) -> Vec<Value> {
         })],
         Message::Assistant {
             content,
+            model: source_model,
             tool_calls,
             response_items,
             ..
-        } if response_items.is_empty() => {
+        } if response_items.is_empty() || source_model != model => {
             let mut items = Vec::with_capacity(tool_calls.len() + usize::from(!content.is_empty()));
             if !content.is_empty() {
                 items.push(json!({ "role": "assistant", "content": content }));
@@ -155,6 +160,9 @@ fn message_items(message: Message) -> Vec<Value> {
             ..
         } => {
             for item in &mut response_items {
+                if let Some(item) = item.as_object_mut() {
+                    item.remove("status");
+                }
                 if item.get("type").and_then(Value::as_str) != Some("function_call") {
                     continue;
                 }
@@ -425,6 +433,7 @@ mod tests {
         let reasoning = json!({
             "id": "rs_1",
             "type": "reasoning",
+            "status": "completed",
             "summary": [],
             "encrypted_content": "opaque",
         });
@@ -432,6 +441,7 @@ mod tests {
             "id": "fc_1",
             "type": "function_call",
             "call_id": "call_1",
+            "status": "completed",
             "name": "read",
             "arguments": "{\"path\":\"README.md\"}",
         });
@@ -451,7 +461,68 @@ mod tests {
         assert_eq!(value["store"], false);
         assert_eq!(value["include"][0], "reasoning.encrypted_content");
         assert_eq!(value["reasoning"]["context"], "all_turns");
-        assert_eq!(value["input"], json!([reasoning, function_call]));
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": "opaque",
+                },
+                {
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{\"path\":\"README.md\"}",
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn model_switch_rebuilds_portable_assistant_items() {
+        let assistant = Message::assistant_response(
+            "done".into(),
+            "previous-model".into(),
+            "private reasoning".into(),
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                arguments: json!({"path":"README.md"}),
+            }],
+            vec![
+                json!({
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "encrypted_content": "model-specific",
+                }),
+                json!({
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "status": "completed",
+                    "name": "read",
+                    "arguments": "{}",
+                }),
+            ],
+        );
+        let value = serde_json::to_value(request(vec![assistant])).unwrap();
+
+        assert_eq!(
+            value["input"],
+            json!([
+                { "role": "assistant", "content": "done" },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{\"path\":\"README.md\"}",
+                }
+            ])
+        );
     }
 
     #[test]
