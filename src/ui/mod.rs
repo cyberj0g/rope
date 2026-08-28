@@ -2497,7 +2497,12 @@ fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
         75..=89 => Color::Yellow,
         _ => Color::Red,
     };
-    let price = state.total_tokens as f64 * config.price_per_token;
+    let total_cost = config
+        .models
+        .iter()
+        .find(|model| model.name == state.model || model.id == state.model)
+        .and_then(|model| model.price_per_token)
+        .and(state.total_cost);
     let speed = match status {
         "generating" => state
             .generation_speed()
@@ -2534,8 +2539,14 @@ fn status_bar(state: &UiState, config: &Config) -> Line<'static> {
             format!("{context_percent}%"),
             Style::default().fg(context_color),
         ),
-        Span::raw("  "),
-        Span::styled(format!("${price:.2}"), Style::default().fg(Color::Green)),
+    ]);
+    if let Some(cost) = total_cost {
+        spans.extend([
+            Span::raw("  "),
+            Span::styled(format!("${cost:.2}"), Style::default().fg(Color::Green)),
+        ]);
+    }
+    spans.extend([
         Span::raw("  "),
         Span::styled(
             state.project.cwd.display().to_string(),
@@ -3630,12 +3641,14 @@ mod tests {
     fn status_bar_fields_have_distinct_colors() {
         let mut state = UiState::new();
         state.session = "Colorful Session".into();
+        state.model = "qwen".into();
         state.total_tokens = 42;
+        state.total_cost = Some(0.42);
         state.context_tokens = 80;
         state.max_context_tokens = 100;
         state.project.cwd = "/project".into();
         let mut config = Config::default();
-        config.price_per_token = 0.01;
+        config.models[0].price_per_token = Some(0.01);
         let line = status_bar(&state, &config);
         let color = |text: &str| {
             line.spans
@@ -3649,6 +3662,28 @@ mod tests {
         assert_eq!(color("80%"), Some(Color::Yellow));
         assert_eq!(color("$0.42"), Some(Color::Green));
         assert_eq!(color("/project"), Some(Color::Magenta));
+    }
+
+    #[test]
+    fn status_bar_omits_unknown_session_cost() {
+        let mut state = UiState::new();
+        state.model = "qwen".into();
+        state.total_tokens = 42;
+        state.total_cost = Some(0.42);
+        let mut config = Config::default();
+        let rendered = |state: &UiState, config: &Config| {
+            status_bar(state, config)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        assert!(!rendered(&state, &config).contains('$'));
+
+        config.models[0].price_per_token = Some(0.01);
+        state.total_cost = None;
+        assert!(!rendered(&state, &config).contains('$'));
     }
 
     #[test]

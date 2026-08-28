@@ -62,6 +62,7 @@ pub fn model_config(id: String) -> ModelConfig {
             temperature: Some(1.0),
             reasoning_effort: None,
             reasoning_efforts: Vec::new(),
+            price_per_token: None,
             vision: false,
         },
     }
@@ -126,6 +127,7 @@ impl Defaults {
             temperature: self.temperature,
             reasoning_effort: self.reasoning_effort,
             reasoning_efforts: self.reasoning_efforts.to_vec(),
+            price_per_token: None,
             vision: self.vision,
         }
     }

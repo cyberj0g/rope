@@ -3,7 +3,6 @@ model = "qwen"
 # set this to override every model's temperature
 # temperature = 0.8
 reasoning_effort = "xhigh"
-price_per_token = 0.0
 paste_collapse_chars = 200
 compaction_threshold = 0.75
 
@@ -22,6 +21,7 @@ max_context_tokens = 262144
 temperature = 1.0
 reasoning_effort = "xhigh"
 reasoning_efforts = ["low", "medium", "xhigh"]
+# price_per_token = 0.0000025
 vision = true
 
 [tools]

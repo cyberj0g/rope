@@ -21,6 +21,10 @@ pub struct SessionMeta {
     #[serde(default)]
     pub total_tokens: u64,
     #[serde(default)]
+    pub total_cost: f64,
+    #[serde(default)]
+    pub cost_complete: bool,
+    #[serde(default)]
     pub context_tokens: u64,
     #[serde(default)]
     pub compaction_summary: Option<String>,
@@ -75,6 +79,8 @@ impl Session {
                 plan: None,
                 created_at: now(),
                 total_tokens: 0,
+                total_cost: 0.0,
+                cost_complete: true,
                 context_tokens: 0,
                 compaction_summary: None,
                 compacted_through: 0,
@@ -129,6 +135,21 @@ impl Session {
         )
         .await?;
         Ok(())
+    }
+
+    pub fn record_usage(&mut self, tokens: u64, price_per_token: Option<f64>) {
+        self.meta.total_tokens += tokens;
+        if self.meta.cost_complete {
+            if let Some(price) = price_per_token {
+                self.meta.total_cost += tokens as f64 * price;
+            } else {
+                self.meta.cost_complete = false;
+            }
+        }
+    }
+
+    pub fn total_cost(&self) -> Option<f64> {
+        (self.meta.cost_complete && self.meta.total_tokens > 0).then_some(self.meta.total_cost)
     }
 
     pub fn display_name(&self) -> &str {
@@ -263,6 +284,8 @@ mod tests {
     fn old_session_metadata_defaults_token_usage() {
         let meta: SessionMeta = serde_json::from_str(r#"{"name":"old","created_at":1}"#).unwrap();
         assert_eq!(meta.total_tokens, 0);
+        assert_eq!(meta.total_cost, 0.0);
+        assert!(!meta.cost_complete);
         assert!(meta.title.is_none());
         assert!(meta.plan.is_none());
         assert!(meta.approved_tools.is_empty());
@@ -278,6 +301,8 @@ mod tests {
                 plan: None,
                 created_at: 1,
                 total_tokens: 0,
+                total_cost: 0.0,
+                cost_complete: true,
                 context_tokens: 0,
                 compaction_summary: None,
                 compacted_through: 0,
@@ -294,6 +319,36 @@ mod tests {
         session.meta.name = "named-session".into();
         session.meta.title = None;
         assert!(!session.needs_title());
+    }
+
+    #[test]
+    fn session_cost_requires_a_price_for_every_usage() {
+        let mut session = Session {
+            root: PathBuf::new(),
+            meta: SessionMeta {
+                name: "priced".into(),
+                title: None,
+                plan: None,
+                created_at: 1,
+                total_tokens: 0,
+                total_cost: 0.0,
+                cost_complete: true,
+                context_tokens: 0,
+                compaction_summary: None,
+                compacted_through: 0,
+                approved_tools: Vec::new(),
+            },
+        };
+
+        assert_eq!(session.total_cost(), None);
+        session.record_usage(100, Some(0.01));
+        assert_eq!(session.total_cost(), Some(1.0));
+
+        session.record_usage(25, None);
+        assert_eq!(session.total_cost(), None);
+        session.record_usage(10, Some(0.01));
+        assert_eq!(session.total_cost(), None);
+        assert_eq!(session.meta.total_tokens, 135);
     }
 
     #[tokio::test]

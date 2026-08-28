@@ -27,13 +27,11 @@ async fn main() -> Result<()> {
     let tools = tool::discover(&config).await?;
     let (command_tx, event_rx) = runtime::spawn(config.clone(), startup, provider, tools).await?;
 
-    let price_per_token = config.price_per_token;
     let summary = ui::run(config, command_tx, event_rx, request).await?;
     println!("tokens used: {}", summary.total_tokens);
-    println!(
-        "estimated cost: ${:.6}",
-        summary.total_tokens as f64 * price_per_token
-    );
+    if let Some(cost) = summary.total_cost {
+        println!("estimated cost: ${cost:.6}");
+    }
     println!(
         "resume with: rope --session '{}'",
         summary.name.replace('\'', "'\"'\"'")

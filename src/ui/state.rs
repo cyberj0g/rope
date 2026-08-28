@@ -145,6 +145,7 @@ pub struct UiState {
     pub chat_scroll_max: u16,
     pub session: String,
     pub total_tokens: u64,
+    pub total_cost: Option<f64>,
     pub context_tokens: u64,
     pub max_context_tokens: u64,
     pub model: String,
@@ -296,6 +297,7 @@ impl UiState {
             chat_scroll_max: 0,
             session: String::new(),
             total_tokens: 0,
+            total_cost: None,
             context_tokens: 0,
             max_context_tokens: 0,
             model: String::new(),
@@ -953,7 +955,13 @@ impl UiState {
         match event {
             Event::History(messages) => self.set_history(messages),
             Event::SessionChanged(session) => self.session = session,
-            Event::UsageChanged(tokens) => self.total_tokens = tokens,
+            Event::UsageChanged {
+                total_tokens,
+                total_cost,
+            } => {
+                self.total_tokens = total_tokens;
+                self.total_cost = total_cost;
+            }
             Event::ContextChanged { tokens, max_tokens } => {
                 self.context_tokens = tokens;
                 self.max_context_tokens = max_tokens;
@@ -1670,8 +1678,12 @@ mod tests {
     #[test]
     fn usage_updates_the_session_total() {
         let mut state = UiState::new();
-        state.apply(Event::UsageChanged(12_345));
+        state.apply(Event::UsageChanged {
+            total_tokens: 12_345,
+            total_cost: Some(0.25),
+        });
         assert_eq!(state.total_tokens, 12_345);
+        assert_eq!(state.total_cost, Some(0.25));
     }
 
     #[test]

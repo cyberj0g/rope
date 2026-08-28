@@ -111,12 +111,16 @@ pub enum Command {
 pub struct SessionSummary {
     pub name: String,
     pub total_tokens: u64,
+    pub total_cost: Option<f64>,
 }
 
 pub enum Event {
     History(Vec<Message>),
     SessionChanged(String),
-    UsageChanged(u64),
+    UsageChanged {
+        total_tokens: u64,
+        total_cost: Option<f64>,
+    },
     ContextChanged {
         tokens: u64,
         max_tokens: u64,
@@ -239,10 +243,7 @@ async fn run<P: Provider>(
         .send(Event::SessionChanged(session.display_name().to_owned()))
         .await
         .ok();
-    events
-        .send(Event::UsageChanged(session.meta.total_tokens))
-        .await
-        .ok();
+    send_usage(&events, &session).await;
     send_settings(&events, &config).await;
     send_context(&events, &session, &config).await;
     events
@@ -318,7 +319,7 @@ async fn run<P: Provider>(
                         session = new_session; messages.clear();
                         events.send(Event::History(Vec::new())).await.ok();
                         events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
-                        events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
+                        send_usage(&events, &session).await;
                         events.send(Event::PlanChanged(None)).await.ok();
                         send_context(&events, &session, &config).await;
                     }
@@ -365,6 +366,7 @@ async fn run<P: Provider>(
                     reply.send(SessionSummary {
                         name: session.meta.name.clone(),
                         total_tokens: session.meta.total_tokens,
+                        total_cost: session.total_cost(),
                     }).ok();
                     break;
                 }
@@ -414,14 +416,14 @@ async fn run<P: Provider>(
                     refresh_project(project.clone(), internal_tx.clone());
                 }
                 InternalEvent::Usage(usage) if generation.is_some() => {
-                    session.meta.total_tokens += usage.total_tokens;
+                    session.record_usage(usage.total_tokens, config.active_model().price_per_token);
                     session.meta.context_tokens = usage.total_tokens;
-                    events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
+                    send_usage(&events, &session).await;
                     send_context(&events, &session, &config).await;
                 }
                 InternalEvent::AuxiliaryUsage(usage) if generation.is_some() => {
-                    session.meta.total_tokens += usage.total_tokens;
-                    events.send(Event::UsageChanged(session.meta.total_tokens)).await.ok();
+                    session.record_usage(usage.total_tokens, config.active_model().price_per_token);
+                    send_usage(&events, &session).await;
                 }
                 InternalEvent::PlanUpdated(plan) if generation.is_some() => {
                     session.meta.plan = Some(plan.clone());
@@ -468,6 +470,16 @@ async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {
         .send(Event::SettingsChanged {
             model: config.model_name().to_owned(),
             reasoning_effort: config.effective_reasoning_effort(),
+        })
+        .await
+        .ok();
+}
+
+async fn send_usage(events: &mpsc::Sender<Event>, session: &Session) {
+    events
+        .send(Event::UsageChanged {
+            total_tokens: session.meta.total_tokens,
+            total_cost: session.total_cost(),
         })
         .await
         .ok();

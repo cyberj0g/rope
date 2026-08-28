@@ -21,10 +21,10 @@
 - automatic sessions under `~/.local/share/harness/sessions`
 - persisted 2-3 word model-generated titles for automatically named sessions, created after the first completed response
 - JSONL conversation persistence after completed turns
-- persisted session token totals and configurable per-token cost estimates
+- persisted session token totals and per-model cost estimates, hidden when any model used in the session has no configured token price
 - `--session NAME` to create or resume a session, plus `/new [NAME]` and `/save`
 - optional positional startup request submitted as soon as the terminal UI opens
-- exit summary with tokens used, estimated cost, and the exact session resume command
+- exit summary with tokens used, estimated cost when available, and the exact session resume command
 
 ## Tools
 

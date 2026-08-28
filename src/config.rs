@@ -32,7 +32,6 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub price_per_token: f64,
     pub paste_collapse_chars: usize,
     pub compaction_threshold: f32,
     pub tools: ToolPolicies,
@@ -90,6 +89,7 @@ pub struct ModelConfig {
     pub temperature: Option<f32>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub reasoning_efforts: Vec<ReasoningEffort>,
+    pub price_per_token: Option<f64>,
     pub vision: bool,
 }
 
@@ -107,6 +107,7 @@ impl Default for ModelConfig {
                 ReasoningEffort::Medium,
                 ReasoningEffort::XHigh,
             ],
+            price_per_token: None,
             vision: true,
         }
     }
@@ -154,7 +155,6 @@ impl Default for Config {
             models: vec![model],
             temperature: None,
             reasoning_effort,
-            price_per_token: 0.0,
             paste_collapse_chars: 200,
             compaction_threshold: 0.75,
             tools: ToolPolicies::default(),
@@ -504,9 +504,16 @@ mod tests {
     }
 
     #[test]
-    fn reads_per_token_price() {
-        let config: Config = toml::from_str("price_per_token = 0.0000025").unwrap();
-        assert_eq!(config.price_per_token, 0.0000025);
+    fn reads_per_model_token_price() {
+        let model: ModelConfig = toml::from_str(
+            r#"name = "priced"
+id = "priced"
+price_per_token = 0.0000025"#,
+        )
+        .unwrap();
+
+        assert_eq!(model.price_per_token, Some(0.0000025));
+        assert_eq!(ModelConfig::default().price_per_token, None);
     }
 
     #[test]
