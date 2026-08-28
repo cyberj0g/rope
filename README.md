@@ -1,6 +1,6 @@
-# Rope
+# rope
 
-<video src="docs/demo.mp4" controls></video>
+[![Build](https://github.com/cyberj0g/rope/actions/workflows/build.yml/badge.svg)](https://github.com/cyberj0g/rope/actions/workflows/build.yml)
 
 A minimalistic terminal coding agent harness in Rust. The model chats, calls tools, edits
 files, and drives a headless browser — while every one of those states is
@@ -12,9 +12,13 @@ or compacting context, you can watch it: streamed tool calls, per-call
 diffs, a live git pane, a live plan pane, token and cost counters, and a
 status line that reflects the current state at a glance.
 
+## Demo
+
+<video src="docs/demo.mp4" controls></video>
+
 ## Quickstart
 
-Download a version for your system from [releases]().
+Download a version for your system from [releases](https://github.com/cyberj0g/rope/releases).
 
 First run walks you through provider setup — OpenAI or any
 OpenAI-compatible endpoint. Or start from
@@ -94,4 +98,3 @@ rope "what is this repo up to?"
   attachments (Sixel / iTerm2 / Kitty), live git status and diff panes
   (when the directory is a git worktree), plan pane, chat search, model
   picker, and prompt history.
-

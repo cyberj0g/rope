@@ -18,6 +18,7 @@
 - named model profiles with context size, temperature, reasoning defaults/options, and vision capabilities; omitted names use the API model ID
 - built-in defaults for popular OpenAI-compatible model families, including Qwen3.8
 - searchable recent-first model picker shared by `/model`, Alt+M, and the clickable model status
+- current local date included in every agent turn alongside global and project instructions
 - automatic global and project `AGENTS.md` instructions
 
 ## Sessions

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::Local;
 use tokio::process::Command;
 
 #[derive(Clone, Debug, Default)]
@@ -29,24 +30,28 @@ impl ProjectState {
     }
 
     pub async fn prompt(&self) -> Result<Option<String>> {
-        let mut sections = Vec::new();
-        if let Some(base) = directories::BaseDirs::new() {
+        let global = if let Some(base) = directories::BaseDirs::new() {
             let path = base.config_dir().join("rope/AGENTS.md");
             if path.is_file() {
-                sections.push(format!(
-                    "Global instructions (~/.config/rope/AGENTS.md):\n{}",
-                    tokio::fs::read_to_string(&path).await?
-                ));
+                Some(tokio::fs::read_to_string(&path).await?)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         let local_agents = self.cwd.join("AGENTS.md");
-        if local_agents.is_file() {
-            sections.push(format!(
-                "Project instructions (AGENTS.md):\n{}",
-                tokio::fs::read_to_string(&local_agents).await?
-            ));
-        }
-        Ok((!sections.is_empty()).then(|| sections.join("\n\n")))
+        let project = if local_agents.is_file() {
+            Some(tokio::fs::read_to_string(&local_agents).await?)
+        } else {
+            None
+        };
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        Ok(Some(compose_prompt(
+            &date,
+            global.as_deref(),
+            project.as_deref(),
+        )))
     }
 
     pub async fn refresh(&mut self) {
@@ -74,6 +79,19 @@ impl ProjectState {
         self.git_diff_path = path;
         self.refresh().await;
     }
+}
+
+fn compose_prompt(date: &str, global: Option<&str>, project: Option<&str>) -> String {
+    let mut sections = vec![format!("Current date: {date}")];
+    if let Some(instructions) = global {
+        sections.push(format!(
+            "Global instructions (~/.config/rope/AGENTS.md):\n{instructions}"
+        ));
+    }
+    if let Some(instructions) = project {
+        sections.push(format!("Project instructions (AGENTS.md):\n{instructions}"));
+    }
+    sections.join("\n\n")
 }
 
 fn parse_status_line(line: &str) -> Option<GitFile> {
@@ -163,6 +181,22 @@ async fn git_allow_failure(cwd: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_always_includes_the_current_date() {
+        assert_eq!(
+            compose_prompt("2026-08-28", None, None),
+            "Current date: 2026-08-28"
+        );
+    }
+
+    #[test]
+    fn prompt_places_the_date_before_agent_instructions() {
+        assert_eq!(
+            compose_prompt("2026-08-28", Some("global"), Some("project")),
+            "Current date: 2026-08-28\n\nGlobal instructions (~/.config/rope/AGENTS.md):\nglobal\n\nProject instructions (AGENTS.md):\nproject"
+        );
+    }
 
     #[test]
     fn parses_short_git_status() {
