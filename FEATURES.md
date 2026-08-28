@@ -2,7 +2,7 @@
 
 ## Distribution
 
-- cached GitHub Actions builds for Linux x64, macOS arm64, and Windows x64, with manual artifacts and tag-driven GitHub releases
+- test-only GitHub Actions checks for regular changes, plus cached tagged releases for Linux x64, macOS arm64, and Windows x64
 
 ## Runtime and providers
 

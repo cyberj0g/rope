@@ -42,10 +42,9 @@ targets:
 | macOS | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows | `x86_64-pc-windows-msvc` | `.zip` |
 
-Pull requests and pushes to `main` compile all three targets. To download the
-binaries without making a release, run the workflow manually from the Actions
-tab; its artifacts are retained for one day. Pushing a `v*` tag also creates or
-updates a GitHub release with all three archives:
+Pull requests, pushes to `main`, and manual runs only run the test suite. Pushing
+a `v*` tag runs the tests, builds all three targets, and creates or updates a
+GitHub release with the archives:
 
 ```sh
 git tag v0.1.0
@@ -54,5 +53,6 @@ git push origin v0.1.0
 
 The workflow uses standard GitHub-hosted runners. They are free and unlimited
 for public repositories; private repositories consume the account's included
-Actions minutes. Cargo outputs and the browser payload are cached to keep those
-builds short, and pull requests do not store binary artifacts.
+Actions minutes. Cargo outputs and the browser payload are cached to keep tagged
+builds short. Non-release runs use only the Linux test runner and store no
+binary artifacts.
