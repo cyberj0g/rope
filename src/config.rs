@@ -40,6 +40,8 @@ pub struct Config {
     #[serde(skip)]
     pub recent_commands: Vec<String>,
     #[serde(skip)]
+    notices: Vec<String>,
+    #[serde(skip)]
     settings_path: PathBuf,
 }
 
@@ -80,19 +82,37 @@ impl std::fmt::Display for ProviderApi {
     }
 }
 
+/// A model entry in `config.toml`.
+///
+/// Omitted fields deserialize to neutral values instead of `Default`, so a
+/// minimal `[[models]]` entry never inherits the built-in default model's
+/// profile (vision, temperature, or Qwen reasoning settings).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(default)]
 pub struct ModelConfig {
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub provider: String,
+    #[serde(default)]
     pub id: String,
+    #[serde(default = "neutral_max_context_tokens")]
     pub max_context_tokens: u64,
+    #[serde(default)]
     pub temperature: Option<f32>,
+    #[serde(default)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default)]
     pub reasoning_efforts: Vec<ReasoningEffort>,
+    #[serde(default)]
     pub price_per_token: Option<f64>,
+    #[serde(default)]
     pub vision: bool,
+}
+
+/// Context size for entries that omit `max_context_tokens`; the same fallback
+/// `model_catalog` uses for unknown models.
+fn neutral_max_context_tokens() -> u64 {
+    32_768
 }
 
 impl Default for ModelConfig {
@@ -164,6 +184,7 @@ impl Default for Config {
             tools: ToolPolicies::default(),
             recent_models: Vec::new(),
             recent_commands: Vec::new(),
+            notices: Vec::new(),
             settings_path: PathBuf::new(),
         }
     }
@@ -235,6 +256,11 @@ impl Config {
 
     pub fn model_name(&self) -> &str {
         &self.active_model().name
+    }
+
+    /// Non-fatal problems found while loading (e.g. a stale saved model).
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     pub fn effective_temperature(&self) -> Option<f32> {
@@ -331,6 +357,9 @@ impl Config {
             if model.name.is_empty() {
                 model.name.clone_from(&model.id);
             }
+            if model.name.is_empty() {
+                bail!("each model entry needs a name or an id");
+            }
             if model.max_context_tokens == 0 {
                 bail!("model {} has zero max_context_tokens", model.name);
             }
@@ -378,8 +407,15 @@ impl Config {
         };
         let settings: PersistedSettings = toml::from_str(&data)
             .with_context(|| format!("parse settings {}", self.settings_path.display()))?;
-        if let Some(model) = settings.model {
-            self.select_model(&model)?;
+        if let Some(model) = settings.model
+            && self.select_model(&model).is_err()
+        {
+            // A stale state file must not make Rope un-startable; fall back
+            // to the config's model, the way normalize() already does.
+            let current = self.model.clone();
+            self.notices.push(format!(
+                "saved model '{model}' is not in the config; using '{current}' instead"
+            ));
         }
         self.recent_models = settings
             .recent_models
@@ -550,6 +586,63 @@ price_per_token = 0.0000025"#,
 
         assert_eq!(model.price_per_token, Some(0.0000025));
         assert_eq!(ModelConfig::default().price_per_token, None);
+    }
+
+    #[test]
+    fn omitted_model_fields_default_to_neutral_values() {
+        let model: ModelConfig = toml::from_str(
+            r#"
+id = "gpt-4o"
+max_context_tokens = 128000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(model.name, "");
+        assert_eq!(model.provider, "");
+        assert_eq!(model.max_context_tokens, 128_000);
+        assert_eq!(model.temperature, None);
+        assert_eq!(model.reasoning_effort, None);
+        assert!(model.reasoning_efforts.is_empty());
+        assert_eq!(model.price_per_token, None);
+        assert!(!model.vision);
+    }
+
+    #[test]
+    fn minimal_model_entries_do_not_inherit_the_default_model_profile() {
+        let mut config: Config = toml::from_str(
+            r#"
+model = "plain"
+
+[[models]]
+name = "plain"
+max_context_tokens = 8192
+"#,
+        )
+        .unwrap();
+        config.normalize().unwrap();
+
+        let model = config.active_model();
+        assert!(!model.vision);
+        assert_eq!(model.temperature, None);
+        assert_eq!(model.reasoning_effort, None);
+        assert!(model.reasoning_efforts.is_empty());
+        assert_eq!(config.effective_temperature(), None);
+        assert_eq!(config.effective_reasoning_effort(), None);
+    }
+
+    #[test]
+    fn model_entries_need_a_name_or_an_id() {
+        let mut config: Config = toml::from_str(
+            r#"
+[[models]]
+max_context_tokens = 8192
+"#,
+        )
+        .unwrap();
+
+        let error = config.normalize().unwrap_err().to_string();
+        assert!(error.contains("name or an id"), "{error}");
     }
 
     #[test]
@@ -760,5 +853,23 @@ max_context_tokens = 32768
             toml::from_str(&std::fs::read_to_string(directory.path().join("state.toml")).unwrap())
                 .unwrap();
         assert_eq!(settings.recent_commands, ["/save", "/tools"]);
+    }
+
+    #[test]
+    fn stale_saved_model_falls_back_to_the_configured_model() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("state.toml"), "model = \"gone\"\n").unwrap();
+        let mut config = Config {
+            settings_path: directory.path().join("state.toml"),
+            ..Config::default()
+        };
+
+        config.load_settings().unwrap();
+
+        assert_eq!(config.model, "qwen");
+        assert_eq!(config.recent_models, ["qwen"]);
+        assert_eq!(config.notices.len(), 1);
+        assert!(config.notices[0].contains("gone"), "{}", config.notices[0]);
+        assert!(config.notices[0].contains("qwen"), "{}", config.notices[0]);
     }
 }

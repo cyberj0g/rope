@@ -23,6 +23,9 @@ async fn main() -> Result<()> {
         onboarding::run().await?;
     }
     let config = Config::load()?;
+    for notice in config.notices() {
+        eprintln!("warning: {notice}");
+    }
     let provider = OpenAiProvider::from_config(&config);
     let tools = tool::discover(&config).await?;
     let (command_tx, event_rx) = runtime::spawn(config.clone(), startup, provider, tools).await?;

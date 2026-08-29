@@ -16,6 +16,8 @@
 - OpenAI-first onboarding with official endpoint recognition and pinned current OpenAI models above the full API catalog
 - explicit per-model provider routing, including duplicate model IDs across endpoints and legacy single-endpoint config compatibility
 - named model profiles with context size, temperature, reasoning defaults/options, and vision capabilities; omitted names use the API model ID
+- minimal `[[models]]` entries use neutral omitted-field defaults (no vision, temperature, or reasoning) instead of inheriting the built-in default model's profile
+- stale saved model selections fall back to the config's model with a startup warning instead of failing to start
 - built-in defaults for popular OpenAI-compatible model families, including Qwen3.8
 - searchable recent-first model picker shared by `/model`, Alt+M, and the clickable model status
 - current local date included in every agent turn alongside global and project instructions
