@@ -35,7 +35,7 @@
 
 ## Tools
 
-- iterative model → tool → model execution
+- iterative model → tool → model execution, with the 64 tool call cap applied per assistant message so long turns keep running instead of failing after a fixed number of model turns
 - immediate Escape cancellation with force-killed child processes, preserved partial output, failed in-flight tools, and a persisted cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
 - configurable context fill tracking and automatic continuation compaction that replays the persisted summary into model context

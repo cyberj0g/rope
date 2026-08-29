@@ -29,6 +29,10 @@ pub const CANCELLED_BY_USER: &str = "cancelled by user";
 /// remainder of the marker content is the summary the context was reduced to.
 pub const COMPACTION_MARKER: &str = "Context compacted";
 const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
+/// Hard cap on the tool calls one assistant message may batch. The cap
+/// resets for every assistant message, so a turn may run as many model
+/// turns as needed; only a single message is bounded.
+const MAX_TOOL_CALLS_PER_MESSAGE: usize = 64;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -949,7 +953,7 @@ async fn agent<P: Provider>(
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<Vec<Message>> {
-    for _ in 0..64 {
+    loop {
         events
             .send(Event::ModelRequestStarted(config.model_id().to_owned()))
             .await
@@ -971,8 +975,10 @@ async fn agent<P: Provider>(
             tools: tools.definitions(config.active_model().vision),
         };
         let stream = stream_with_retry(&provider, request, events).await?;
-        let (reasoning, text, calls, usage, response_items) =
+        let (reasoning, text, mut calls, usage, response_items) =
             collect(stream, events, internal).await?;
+        // The tool call cap applies between assistant messages, not per turn.
+        calls.truncate(MAX_TOOL_CALLS_PER_MESSAGE);
         messages.push(Message::assistant_response(
             text,
             config.model_id().to_owned(),
@@ -1070,7 +1076,6 @@ async fn agent<P: Provider>(
             messages.push(message);
         }
     }
-    bail!("tool loop exceeded 64 model turns")
 }
 
 fn available_context_tokens(
@@ -1444,6 +1449,87 @@ mod tests {
             event_rx.recv().await,
             Some(Event::ToolCallFinished { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn tool_call_cap_resets_for_each_assistant_message() {
+        let response: Vec<ResponseDelta> = (0..65)
+            .map(|index| ResponseDelta::ToolCall {
+                index,
+                id: Some(format!("call_{index}")),
+                name: Some("echo".into()),
+                arguments: format!(r#"{{"value":"v{index}"}}"#),
+            })
+            .collect();
+        let provider = Arc::new(MockProvider::new(vec![
+            response,
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let (event_tx, _) = mpsc::channel(512);
+        let (internal_tx, _) = mpsc::channel(2);
+        let completed = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        // user, assistant, the capped tool results, final assistant
+        assert_eq!(completed.len(), 1 + 1 + MAX_TOOL_CALLS_PER_MESSAGE + 1);
+        let Message::Assistant { tool_calls, .. } = &completed[1] else {
+            panic!("expected assistant message");
+        };
+        assert_eq!(tool_calls.len(), MAX_TOOL_CALLS_PER_MESSAGE);
+        assert_eq!(tool_calls.last().unwrap().id, "call_63");
+        assert_eq!(completed[2].content(), "v0");
+        assert_eq!(completed[3].content(), "v1");
+    }
+
+    #[tokio::test]
+    async fn one_turn_may_run_more_model_turns_than_the_tool_call_cap() {
+        let response = vec![ResponseDelta::ToolCall {
+            index: 0,
+            id: Some("call".into()),
+            name: Some("echo".into()),
+            arguments: r#"{"value":"done"}"#.into(),
+        }];
+        let responses = std::iter::repeat_with(|| response.clone())
+            .take(2 * MAX_TOOL_CALLS_PER_MESSAGE)
+            .chain(std::iter::once(vec![ResponseDelta::Text(
+                "finished".into(),
+            )]))
+            .collect();
+        let provider = Arc::new(MockProvider::new(responses));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let (event_tx, _) = mpsc::channel(4096);
+        let (internal_tx, _) = mpsc::channel(2);
+        let completed = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        // user, 2 * cap assistant/tool message pairs, final assistant
+        assert_eq!(completed.len(), 1 + 2 * MAX_TOOL_CALLS_PER_MESSAGE * 2 + 1);
+        assert_eq!(completed.last().unwrap().content(), "finished");
     }
 
     #[test]
