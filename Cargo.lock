@@ -2260,6 +2260,7 @@ dependencies = [
  "globset",
  "ignore",
  "image",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",

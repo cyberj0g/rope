@@ -36,3 +36,6 @@ url = "2.5"
 
 [build-dependencies]
 sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

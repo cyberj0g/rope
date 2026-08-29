@@ -36,13 +36,15 @@
 ## Tools
 
 - iterative model → tool → model execution, with the 64 tool call cap applied per assistant message so long turns keep running instead of failing after a fixed number of model turns
-- immediate Escape cancellation with force-killed child processes, preserved partial model and command output, failed in-flight tools, and a persisted cancellation marker
+- immediate Escape cancellation with force-killed command process trees, preserved partial model and command output, failed in-flight tools, and a persisted cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
 - configurable context fill tracking and automatic continuation compaction that replays the persisted summary into model context
 - preserved visible transcripts with persisted `Context compacted` markers whose summary stays in history as a collapsed chat section
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - tool approval controls in the composer with paused execution timing across batched calls, session-persisted approvals, and decision markers retained in conversation history
-- built-in `read`, `write`, `edit`, `shell`, `search_files`, and `list_files` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks
+- built-in `read`, `write`, `edit`, `shell`, `shell_poll`, `shell_cancel`, `search_files`, and `list_files` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks
+- model-driven long-polling `shell`: each call returns a compact status/job_id/output envelope once the command exits or the yield period expires (default 10s, capped at 30s), and `shell_poll` retrieves remaining output without gaps or repeats until the status becomes finished or cancelled, whose result carries all remaining output; running envelopes always fit their output budget with the status and job_id prioritized, and `shell_cancel` stops a job deliberately and returns its remaining output as cancelled
+- `shell_poll` and `shell_cancel` are always allowed because they can only observe or stop an already-approved command; shell jobs never outlive the turn that started them — turn end, failure, Escape, and shutdown all kill them, together with their child processes (whole process group on Unix)
 - live `shell` output read from both pipes as the command runs, with stdout and stderr interleaved in arrival order and a UTF-8-safe decoder for split multi-byte sequences
 - per-call tool output capped at roughly one fifth of the available model context with an explicit truncation marker, and live `shell` output streaming bounded by the same cap
 - persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes

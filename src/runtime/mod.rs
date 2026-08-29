@@ -335,7 +335,13 @@ async fn run<P: Provider>(
                 Command::Submit(_) => {}
                 Command::Cancel => {
                     if let Some(task) = generation.take() {
-                        task.abort(); pending_approval = None;
+                        task.abort();
+                        // Let the aborted generation fully unwind before
+                        // cancelling tools, so a shell job cannot be
+                        // registered after cancellation began.
+                        task.await.ok();
+                        tools.cancel_active().await;
+                        pending_approval = None;
                         let pending_from = messages.len().saturating_sub(1);
                         messages.push(Message::system(CANCELLED_BY_USER.into()));
                         let saved = async {
@@ -400,7 +406,12 @@ async fn run<P: Provider>(
                     request_project(&mut project_requests, &project, ProjectRequest::Diff(path), &internal_tx);
                 }
                 Command::Shutdown(reply) => {
-                    if let Some(task) = generation.take() { task.abort(); }
+                    if let Some(task) = generation.take() {
+                        task.abort();
+                        // Same ordering as Cancel: let the generation unwind
+                        // before shell-job cleanup starts.
+                        task.await.ok();
+                    }
                     tools.shutdown().await;
                     session.save().await.ok();
                     reply.send(SessionSummary {
@@ -417,6 +428,9 @@ async fn run<P: Provider>(
             Some(event) = internal_rx.recv() => match event {
                 InternalEvent::Finished(result) if generation.is_some() => {
                     generation = None; pending_approval = None;
+                    // The agent already reaps its jobs on a clean return;
+                    // this guarantees no job outlives the turn on any path.
+                    tools.cancel_active().await;
                     messages.truncate(messages.len().saturating_sub(1));
                     let TurnResult { completed, compaction, title } = result;
                     if let Some(title) = title {
@@ -452,6 +466,9 @@ async fn run<P: Provider>(
                 }
                 InternalEvent::Failed(error) if generation.is_some() => {
                     generation = None; pending_approval = None; messages.pop();
+                    // A failed turn may leave jobs behind (the agent's clean
+                    // return does not run on error); reap them here.
+                    tools.cancel_active().await;
                     session.save().await.ok();
                     events.send(Event::Error(error)).await.ok();
                     request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
@@ -1005,6 +1022,9 @@ async fn agent<P: Provider>(
             |usage| usage.total_tokens,
         );
         if calls.is_empty() {
+            // The turn is done: no job outlives it, so a command the model
+            // stopped polling is killed instead of running unattended.
+            tools.cancel_active().await;
             return Ok(messages[persist_from..].to_vec());
         }
 
@@ -1059,7 +1079,7 @@ async fn agent<P: Provider>(
                 ));
                 let result = entry
                     .tool
-                    .run_streamed(call.arguments.clone(), Some(delta_tx))
+                    .run_streamed(call.arguments.clone(), Some(delta_tx), max_streamed_bytes)
                     .await;
                 // Let in-flight deltas land before the final result.
                 forward.await.ok();
@@ -1304,7 +1324,9 @@ async fn collect(
 mod tests {
     use super::*;
     use crate::provider::{ResponseDelta, mock::MockProvider};
-    use crate::tool::{Approval, Tool, ToolResult};
+    use crate::tool::{
+        Approval, ShellCancelTool, ShellJobManager, ShellPollTool, ShellTool, Tool, ToolResult,
+    };
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
@@ -1344,12 +1366,13 @@ mod tests {
             json!({ "type": "object" })
         }
         async fn run(&self, _args: Value) -> Result<ToolResult> {
-            self.run_streamed(_args, None).await
+            self.run_streamed(_args, None, usize::MAX).await
         }
         async fn run_streamed(
             &self,
             _args: Value,
             sink: Option<mpsc::UnboundedSender<String>>,
+            _max_output_bytes: usize,
         ) -> Result<ToolResult> {
             let mut output = String::new();
             for chunk in &self.0 {
@@ -1795,6 +1818,265 @@ mod tests {
             Message::Tool { content, .. }
                 if content.ends_with("[tool output truncated]") && content.len() <= 40
         ));
+    }
+
+    #[tokio::test]
+    async fn shell_poll_follows_shell_in_model_context() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("shell".into()),
+                arguments: r#"{"command":"sleep 0.3; echo done","yield_time_ms":50}"#.into(),
+            }],
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_2".into()),
+                name: Some("shell_poll".into()),
+                arguments: r#"{"job_id":"shell-1","yield_time_ms":2000}"#.into(),
+            }],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        let jobs = ShellJobManager::new(std::env::temp_dir());
+        tools.insert(ShellTool(jobs.clone()), Approval::Allow);
+        tools.insert(ShellPollTool(jobs), Approval::Allow);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast instead
+        // of blocking once the buffer fills.
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+        let completed = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("go".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        // user, shell call, running result, poll call, finished result, final
+        assert_eq!(completed.len(), 6);
+        assert!(matches!(
+            &completed[1],
+            Message::Assistant { tool_calls, .. }
+                if tool_calls[0].name == "shell"
+        ));
+        assert!(matches!(
+            &completed[2],
+            Message::Tool { call_id, content, .. }
+                if call_id == "call_1"
+                    && content.starts_with("status: running\n")
+                    && content.contains("job_id: shell-1\n")
+        ));
+        assert!(matches!(
+            &completed[3],
+            Message::Assistant { tool_calls, .. }
+                if tool_calls[0].name == "shell_poll"
+        ));
+        assert!(matches!(
+            &completed[4],
+            Message::Tool { call_id, content, .. }
+                if call_id == "call_2"
+                    && content.starts_with("status: finished\n")
+                    && content.contains("exit_code: 0\n")
+                    && content.contains("output:\ndone\n")
+        ));
+        assert_eq!(completed[5].content(), "finished");
+    }
+
+    #[tokio::test]
+    async fn shell_poll_and_cancel_do_not_re_request_approval() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("shell".into()),
+                arguments: r#"{"command":"sleep 5","yield_time_ms":50}"#.into(),
+            }],
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_2".into()),
+                name: Some("shell_poll".into()),
+                arguments: r#"{"job_id":"shell-1","yield_time_ms":50}"#.into(),
+            }],
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_3".into()),
+                name: Some("shell_cancel".into()),
+                arguments: r#"{"job_id":"shell-1"}"#.into(),
+            }],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        let jobs = ShellJobManager::new(std::env::temp_dir());
+        tools.insert(ShellTool(jobs.clone()), Approval::Ask);
+        tools.insert(ShellPollTool(jobs.clone()), Approval::Allow);
+        tools.insert(ShellCancelTool(jobs), Approval::Allow);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast instead
+        // of blocking once the buffer fills.
+        drop(event_rx);
+        let (internal_tx, mut internal_rx) = mpsc::channel(16);
+        let mut agent_task = {
+            let provider = provider.clone();
+            let tools = tools.clone();
+            let config = Config::default();
+            let events = event_tx.clone();
+            let internal = internal_tx.clone();
+            tokio::spawn(async move {
+                agent(
+                    provider,
+                    &tools,
+                    &config,
+                    vec![Message::user("go".into())],
+                    0,
+                    None,
+                    None,
+                    &events,
+                    &internal,
+                )
+                .await
+            })
+        };
+        let mut approvals = 0;
+        let agent_result = loop {
+            // biased: once the agent completes, never poll its handle again
+            // while approval events are still queued (tokio panics on a
+            // re-polled, completed JoinHandle).
+            tokio::select! {
+                biased;
+                result = &mut agent_task => {
+                    // Drain queued events before asserting on approvals.
+                    while let Ok(event) = internal_rx.try_recv() {
+                        if matches!(event, InternalEvent::Approval { .. }) {
+                            approvals += 1;
+                        }
+                    }
+                    break result;
+                }
+                Some(event) = internal_rx.recv() => {
+                    if let InternalEvent::Approval { call, reply } = event {
+                        approvals += 1;
+                        assert_eq!(call.name, "shell");
+                        reply.send(ApprovalDecision::AllowOnce).ok();
+                    }
+                }
+            }
+        };
+        assert_eq!(approvals, 1, "only the shell start may ask for approval");
+        let completed = agent_result.unwrap().unwrap();
+
+        // user, three assistant/tool pairs, final assistant
+        assert_eq!(completed.len(), 8);
+        assert!(matches!(
+            &completed[2],
+            Message::Tool { content, .. } if content.starts_with("status: running\n")
+        ));
+        assert!(matches!(
+            &completed[4],
+            Message::Tool { content, .. } if content.starts_with("status: running\n")
+        ));
+        assert!(matches!(
+            &completed[6],
+            Message::Tool { content, .. } if content.starts_with("status: cancelled\n")
+        ));
+        assert_eq!(completed[7].content(), "finished");
+    }
+
+    #[tokio::test]
+    async fn cancel_active_kills_retained_shell_jobs() {
+        let mut tools = ToolRegistry::default();
+        let jobs = ShellJobManager::new(std::env::temp_dir());
+        tools.insert(ShellTool(jobs.clone()), Approval::Allow);
+        tools.insert(ShellPollTool(jobs), Approval::Allow);
+
+        let start = tools
+            .get("shell")
+            .unwrap()
+            .tool
+            .run_streamed(
+                json!({ "command": "sleep 5", "yield_time_ms": 50 }),
+                None,
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+        assert!(start.output.starts_with("status: running\n"));
+
+        let started = Instant::now();
+        tools.cancel_active().await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellation must kill the child promptly"
+        );
+
+        // Escape never delivers the job to the model again, so the retained
+        // job is reaped along with its worker.
+        let gone = tools
+            .get("shell_poll")
+            .unwrap()
+            .tool
+            .run_streamed(json!({ "job_id": "shell-1" }), None, usize::MAX)
+            .await
+            .unwrap_err();
+        assert!(gone.to_string().contains("unknown shell job"));
+    }
+
+    #[tokio::test]
+    async fn turn_end_kills_retained_shell_jobs() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("shell".into()),
+                arguments: r#"{"command":"sleep 5","yield_time_ms":50}"#.into(),
+            }],
+            vec![ResponseDelta::Text("done".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        let jobs = ShellJobManager::new(std::env::temp_dir());
+        tools.insert(ShellTool(jobs.clone()), Approval::Allow);
+        tools.insert(ShellPollTool(jobs), Approval::Allow);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast.
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+        let completed = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("go".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            &completed[2],
+            Message::Tool { content, .. } if content.starts_with("status: running\n")
+        ));
+        assert_eq!(completed[3].content(), "done");
+
+        // The model ended its turn while the job was still running: no
+        // command survives the turn unattended.
+        let gone = tools
+            .get("shell_poll")
+            .unwrap()
+            .tool
+            .run_streamed(json!({ "job_id": "shell-1" }), None, usize::MAX)
+            .await
+            .unwrap_err();
+        assert!(gone.to_string().contains("unknown shell job"));
     }
 
     #[test]

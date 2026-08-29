@@ -15,14 +15,14 @@ use serde_json::Value;
 
 use crate::{config::Config, runtime::ImageContent};
 use builtin::{
-    EditTool, ListFilesTool, ReadTool, SearchFilesTool, ShellTool, UpdatePlanTool, ViewImageTool,
-    WriteTool,
+    EditTool, ListFilesTool, ReadTool, SearchFilesTool, UpdatePlanTool, ViewImageTool, WriteTool,
 };
 use external::ExternalTool;
 use headless::HeadlessBrowser;
 use web_browser::WebBrowserTool;
 use web_search::WebSearchTool;
 
+pub use builtin::{ShellCancelTool, ShellJobManager, ShellPollTool, ShellTool};
 pub use headless::{browser_executable, prepare_runtime as prepare_browser_runtime};
 
 pub fn ripgrep_available() -> bool {
@@ -97,14 +97,23 @@ pub trait Tool: Send + Sync {
     async fn run(&self, args: Value) -> Result<ToolResult>;
     /// Runs the tool, forwarding partial output to `sink` as it appears.
     /// The sink is best effort: a dropped or capped sink is silently ignored.
+    ///
+    /// `max_output_bytes` is the runtime's output-byte budget for this call.
+    /// Tools that hand back partial output from long-lived work (shell jobs)
+    /// must keep the returned output within it, so the runtime's generic
+    /// truncation never discards data a later call should still return.
     async fn run_streamed(
         &self,
         args: Value,
         sink: Option<mpsc::UnboundedSender<String>>,
+        max_output_bytes: usize,
     ) -> Result<ToolResult> {
-        drop(sink);
+        drop((sink, max_output_bytes));
         self.run(args).await
     }
+    /// Cooperatively cancels work started by earlier, still-running calls.
+    /// The default is a no-op for tools without background work.
+    async fn cancel_active(&self) {}
     async fn shutdown(&self) {}
 }
 
@@ -151,6 +160,12 @@ impl ToolRegistry {
             .collect()
     }
 
+    pub async fn cancel_active(&self) {
+        for entry in self.tools.values() {
+            entry.tool.cancel_active().await;
+        }
+    }
+
     pub async fn shutdown(&self) {
         for entry in self.tools.values() {
             entry.tool.shutdown().await;
@@ -164,7 +179,12 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     registry.insert(ReadTool(cwd.clone()), config.tools.read);
     registry.insert(WriteTool(cwd.clone()), config.tools.write);
     registry.insert(EditTool(cwd.clone()), config.tools.edit);
-    registry.insert(ShellTool(cwd.clone()), config.tools.shell);
+    let shell_jobs = ShellJobManager::new(cwd.clone());
+    registry.insert(ShellTool(shell_jobs.clone()), config.tools.shell);
+    // Polling and cancelling can only observe or stop already-approved
+    // commands, so they never ask again.
+    registry.insert(ShellPollTool(shell_jobs.clone()), Approval::Allow);
+    registry.insert(ShellCancelTool(shell_jobs), Approval::Allow);
     let ripgrep = ripgrep_available();
     registry.insert(
         SearchFilesTool::new(cwd.clone(), ripgrep),
