@@ -29,6 +29,11 @@ pub const CANCELLED_BY_USER: &str = "cancelled by user";
 /// remainder of the marker content is the summary the context was reduced to.
 pub const COMPACTION_MARKER: &str = "Context compacted";
 const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
+/// Floor for the per-call tool output budget, in tokens (4 bytes each).
+/// Even near the context limit, a tool result always carries its control
+/// fields — e.g. a shell job's status and job_id — so the model can keep
+/// polling or cancelling instead of losing track of the command.
+const MIN_TOOL_OUTPUT_TOKENS: u64 = 32; // 128 bytes
 /// Hard cap on the tool calls one assistant message may batch. The cap
 /// resets for every assistant message, so a turn may run as many model
 /// turns as needed; only a single message is bounded.
@@ -1056,11 +1061,13 @@ async fn agent<P: Provider>(
             };
             // The streaming cap mirrors the final truncation, so the chat
             // never shows output the model context will keep beyond it.
-            let output_tokens = config
+            // The floor keeps the control envelope intact near the limit.
+            let output_tokens = (config
                 .active_model()
                 .max_context_tokens
                 .saturating_sub(used_context_tokens)
-                / 5;
+                / 5)
+            .max(MIN_TOOL_OUTPUT_TOKENS);
             let max_streamed_bytes =
                 output_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
             let result = if approved {
@@ -1647,11 +1654,20 @@ mod tests {
             vec![ResponseDelta::Text("finished".into())],
         ]));
         let mut tools = ToolRegistry::default();
-        tools.insert(SlowEcho(vec!["12345678".into(); 3]), Approval::Allow);
+        tools.insert(SlowEcho(vec!["12345678".into(); 32]), Approval::Allow);
         let mut config = Config::default();
         config.models[0].max_context_tokens = 100;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
+        // Drain events while the agent runs: with enough tool output deltas
+        // the bounded channel would fill and block the agent's senders.
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
 
         agent(
             provider,
@@ -1666,23 +1682,26 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(event_tx);
+        let events = collector.await.unwrap();
 
         internal_rx.recv().await;
         let mut streamed = String::new();
-        loop {
-            match event_rx
-                .recv()
-                .await
-                .expect("events closed before the tool result")
-            {
-                Event::ToolOutputDelta { delta, .. } => streamed.push_str(&delta),
-                Event::ToolResult { .. } => break,
-                _ => {}
+        for event in &events {
+            if let Event::ToolOutputDelta { delta, .. } = event {
+                streamed.push_str(delta);
             }
         }
-        // The budget is (100 - 80) / 5 = 4 tokens = 16 bytes: exactly two
-        // eight-byte chunks are forwarded.
-        assert_eq!(streamed, "1234567812345678");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::ToolResult { .. })),
+            "expected a tool result event"
+        );
+        // The budget is (100 - 80) / 5 = 4 tokens = 16 bytes, floored to
+        // the 32-token control envelope minimum: exactly sixteen eight-byte
+        // chunks (128 bytes) are forwarded.
+        assert_eq!(streamed, "12345678".repeat(16));
     }
 
     #[tokio::test]
@@ -1815,8 +1834,63 @@ mod tests {
 
         assert!(matches!(
             &completed[2],
+            // (100 - 50) / 5 = 10 tokens, floored to the 32-token control
+            // envelope minimum: 128 bytes.
             Message::Tool { content, .. }
-                if content.ends_with("[tool output truncated]") && content.len() <= 40
+                if content.ends_with("[tool output truncated]") && content.len() <= 128
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_output_budget_keeps_shell_control_fields_near_context_limit() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("shell".into()),
+                    arguments: r#"{"command":"sleep 5","yield_time_ms":50}"#.into(),
+                },
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 0,
+                    total_tokens: 96,
+                }),
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        let jobs = ShellJobManager::new(std::env::temp_dir());
+        tools.insert(ShellTool(jobs.clone()), Approval::Allow);
+        tools.insert(ShellPollTool(jobs), Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 100;
+        let (event_tx, event_rx) = mpsc::channel(16);
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(4);
+
+        let completed = agent(
+            provider,
+            &tools,
+            &config,
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        // (100 - 96) / 5 = 0 tokens: without the floor the envelope would
+        // be truncated to a marker with no job_id, and the command could
+        // never be polled or cancelled. The floor keeps the control fields.
+        assert!(matches!(
+            &completed[2],
+            Message::Tool { content, .. }
+                if content.starts_with("status: running\n")
+                    && content.contains("job_id: shell-1\n")
+                    && !content.ends_with("[tool output truncated]")
         ));
     }
 

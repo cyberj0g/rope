@@ -21,6 +21,19 @@ use tokio::{
 
 use super::{ExecutionPlan, PlanStatus, Tool, ToolResult};
 
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::{
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
+        },
+        Threading::{OpenProcess, PROCESS_ALL_ACCESS},
+    },
+};
+
 pub struct ReadTool(pub PathBuf);
 pub struct WriteTool(pub PathBuf);
 pub struct EditTool(pub PathBuf);
@@ -230,6 +243,9 @@ struct ShellJob {
     notify: Arc<Notify>,
     /// The worker kills the child process once this flips to true.
     cancel: watch::Sender<bool>,
+    /// Lease on the command's process tree, taken when the tree is killed
+    /// or moved to the manager's retired list on final delivery.
+    group: Option<GroupLease>,
     /// Background task owning the child process and its pipes.
     handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -243,6 +259,10 @@ pub struct ShellJobManager {
 struct ShellJobsInner {
     next_id: u64,
     jobs: HashMap<String, ShellJob>,
+    /// Tree leases of delivered jobs. Their shell has exited, but
+    /// backgrounded descendants may still run, so the lease is kept until
+    /// the turn's cleanup kills it.
+    retired: Vec<GroupLease>,
 }
 
 impl ShellJobManager {
@@ -252,6 +272,7 @@ impl ShellJobManager {
             inner: Mutex::new(ShellJobsInner {
                 next_id: 0,
                 jobs: HashMap::new(),
+                retired: Vec::new(),
             }),
         })
     }
@@ -282,6 +303,9 @@ impl ShellJobManager {
         let mut child = spawn.spawn().context("spawn shell command")?;
         let stdout = child.stdout.take().context("open command stdout")?;
         let stderr = child.stderr.take().context("open command stderr")?;
+        // Lease the process tree before the command can spawn anything, so
+        // descendants are always covered by a cancel or turn-end cleanup.
+        let group = GroupLease::new(child.id());
         let job_id = {
             let mut inner = jobs.inner.lock().unwrap();
             inner.next_id += 1;
@@ -298,6 +322,7 @@ impl ShellJobManager {
                 state: ShellJobState::Running,
                 notify: Arc::new(Notify::new()),
                 cancel: cancel_tx,
+                group,
                 handle: None,
             },
         );
@@ -319,8 +344,11 @@ impl ShellJobManager {
     }
 
     /// Waits up to `yield_time` for the job to terminate, streaming new
-    /// output to `sink` while it waits, then returns the not-yet-delivered
-    /// output capped so the full envelope fits in `budget` bytes.
+    /// output to `sink` while it waits, then returns the next not-yet-
+    /// delivered chunk capped so the full envelope fits in `budget` bytes.
+    /// Terminal jobs keep draining in budgeted chunks (marked `has_more`)
+    /// until the remainder is exhausted, so the runtime's truncation never
+    /// discards output that has not been delivered.
     async fn poll(
         &self,
         job_id: &str,
@@ -345,6 +373,16 @@ impl ShellJobManager {
                 .with_context(unknown)?
         };
         loop {
+            let notified = {
+                let inner = self.inner.lock().unwrap();
+                let job = inner.jobs.get(job_id).with_context(unknown)?;
+                job.notify.clone().notified_owned()
+            };
+            tokio::pin!(notified);
+            // Register the waiter before checking state: notify_waiters()
+            // does not retain a permit, so a signal in the gap between the
+            // check and the registration would be lost.
+            notified.as_mut().enable();
             let terminal = {
                 let inner = self.inner.lock().unwrap();
                 let job = inner.jobs.get(job_id).with_context(unknown)?;
@@ -364,13 +402,8 @@ impl ShellJobManager {
             if remaining.is_zero() {
                 break;
             }
-            let notified = {
-                let inner = self.inner.lock().unwrap();
-                let job = inner.jobs.get(job_id).with_context(unknown)?;
-                job.notify.clone().notified_owned()
-            };
             tokio::select! {
-                _ = notified => {}
+                _ = notified.as_mut() => {}
                 _ = tokio::time::sleep(remaining) => {}
             }
         }
@@ -378,44 +411,47 @@ impl ShellJobManager {
             let mut inner = self.inner.lock().unwrap();
             let job = inner.jobs.get_mut(job_id).with_context(unknown)?;
             let state = job.state;
-            if state.is_terminal() {
-                // Terminal results always carry the full remainder, so a
-                // finished or cancelled envelope never points at a job with
-                // undelivered bytes. Any overflow is made explicit by the
-                // runtime's truncation marker.
-                let output = job.buffer[job.delivered..].to_string();
-                job.delivered = job.buffer.len();
-                inner.jobs.remove(job_id);
-                ShellJobSnapshot {
-                    header: envelope_header(job_id, state),
-                    output,
-                }
-            } else {
-                // Running results must fit the call budget; the status and
-                // job_id are kept over output bytes, so the model can always
-                // keep polling or cancel, even under a tiny budget.
-                let mut header = String::new();
-                for line in [
-                    format!("status: {}\n", status_str(state)),
-                    format!("job_id: {job_id}\n"),
-                    "output:\n".to_owned(),
-                ] {
-                    if header.len() + line.len() <= budget {
-                        header.push_str(&line);
-                    }
-                }
-                let end = floor_char_boundary(
+            // The control lines always come first, so a tight budget keeps
+            // the status and job_id — the runtime floors the budget at the
+            // control envelope size, and its truncation keeps the head.
+            let mut header = envelope_header(job_id, state, false);
+            let mut end = floor_char_boundary(
+                &job.buffer,
+                job.delivered
+                    .saturating_add(budget.saturating_sub(header.len()))
+                    .min(job.buffer.len()),
+            );
+            if state.is_terminal() && end < job.buffer.len() {
+                // The remainder does not fit; reserve space for the marker
+                // and shrink the chunk, so the model knows to poll again.
+                // A running job needs no marker: its status already says
+                // more output is expected.
+                header = envelope_header(job_id, state, true);
+                end = floor_char_boundary(
                     &job.buffer,
-                    job.delivered + budget.saturating_sub(header.len()),
+                    job.delivered
+                        .saturating_add(budget.saturating_sub(header.len()))
+                        .min(job.buffer.len()),
                 );
-                let output = job.buffer[job.delivered..end].to_string();
-                job.delivered = end;
-                ShellJobSnapshot { header, output }
             }
+            let output = job.buffer[job.delivered..end].to_string();
+            job.delivered = end;
+            let drained = end == job.buffer.len();
+            if drained && state.is_terminal() {
+                // The job is fully delivered: remove it, but keep the tree
+                // lease so backgrounded descendants die with the turn.
+                let mut job = inner.jobs.remove(job_id).unwrap();
+                if let Some(group) = job.group.take() {
+                    inner.retired.push(group);
+                }
+            }
+            ShellJobSnapshot { header, output }
         })
     }
 
-    /// Asks the job's worker to kill the child process.
+    /// Asks the job's worker to kill the child process and takes the whole
+    /// process tree down immediately: a deliberate cancel must not leave
+    /// descendants behind for the turn's cleanup.
     fn request_cancel(&self, job_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let job = inner
@@ -423,6 +459,9 @@ impl ShellJobManager {
             .get_mut(job_id)
             .with_context(|| format!("unknown shell job: {job_id}"))?;
         job.cancel.send_replace(true);
+        if let Some(group) = job.group.take() {
+            group.kill();
+        }
         Ok(())
     }
 
@@ -430,14 +469,28 @@ impl ShellJobManager {
     async fn wait_terminal(&self, job_id: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
+            // Register the waiter before checking state, so a terminal
+            // transition in the gap cannot be missed (notify_waiters() does
+            // not retain a permit).
             let notified = {
                 let inner = self.inner.lock().unwrap();
                 match inner.jobs.get(job_id) {
-                    Some(job) if job.state.is_terminal() => return,
                     Some(job) => job.notify.clone().notified_owned(),
                     None => return,
                 }
             };
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let terminal = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .jobs
+                    .get(job_id)
+                    .is_some_and(|job| job.state.is_terminal())
+            };
+            if terminal {
+                return;
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return;
@@ -446,22 +499,39 @@ impl ShellJobManager {
         }
     }
 
-    /// Kills every job. Cooperative workers are given a brief grace period
-    /// to unwind; anything still stuck is aborted, which kills its child via
-    /// `kill_on_drop`. Safe to call only after any in-flight tool call has
-    /// been aborted, so no poller can lose a job it still needs.
+    /// Kills every job and its process tree. Active workers are given a
+    /// brief grace period to unwind; anything still stuck is aborted, which
+    /// kills its direct child via `kill_on_drop`. Retired tree leases of
+    /// already-delivered jobs are killed too, so backgrounded descendants
+    /// of normally finished commands never outlive the turn. Safe to call
+    /// only after any in-flight tool call has been aborted, so no poller
+    /// can lose a job it still needs.
     pub async fn cancel_all(&self) {
-        let mut handles: Vec<_> = {
+        let (mut handles, groups): (Vec<tokio::task::JoinHandle<()>>, Vec<GroupLease>) = {
             let mut inner = self.inner.lock().unwrap();
             for job in inner.jobs.values_mut() {
                 job.cancel.send_replace(true);
             }
-            inner
-                .jobs
-                .values_mut()
-                .filter_map(|job| job.handle.take())
-                .collect()
+            let mut groups = std::mem::take(&mut inner.retired);
+            for job in inner.jobs.values_mut() {
+                if let Some(group) = job.group.take() {
+                    groups.push(group);
+                }
+            }
+            (
+                inner
+                    .jobs
+                    .values_mut()
+                    .filter_map(|job| job.handle.take())
+                    .collect(),
+                groups,
+            )
         };
+        // Kill the trees before waiting on the workers: the dying pipes
+        // make the workers finish promptly.
+        for group in &groups {
+            group.kill();
+        }
         for handle in &mut handles {
             let mut wait = std::pin::Pin::new(&mut *handle);
             tokio::select! {
@@ -534,12 +604,16 @@ fn status_str(state: ShellJobState) -> &'static str {
     }
 }
 
-fn envelope_header(job_id: &str, state: ShellJobState) -> String {
+fn envelope_header(job_id: &str, state: ShellJobState, has_more: bool) -> String {
     let mut header = format!("status: {}\n", status_str(state));
     if state.is_terminal() {
         header.push_str(&format!("exit_code: {}\n", state.exit_code().unwrap_or(-1)));
     }
-    header.push_str(&format!("job_id: {job_id}\noutput:\n"));
+    header.push_str(&format!("job_id: {job_id}\n"));
+    if has_more {
+        header.push_str("has_more: true\n");
+    }
+    header.push_str("output:\n");
     header
 }
 
@@ -562,54 +636,101 @@ fn clamp_yield(millis: Option<u64>) -> Duration {
     )
 }
 
-/// Keeps a handle to the job's process group so the worker's abort path
-/// still takes the whole tree down. Disarmed once the job finishes or the
-/// group was already killed deliberately.
+/// A lease on a command's process tree: on Unix the process group id (the
+/// shell calls `setpgid(0, 0)`), on Windows a job object the shell — and
+/// everything it spawns — is assigned to. The lease is held while the job
+/// is alive and, once delivered, until the turn's cleanup, so backgrounded
+/// descendants can still be killed. `kill` takes the whole tree down;
+/// dropping the lease releases any OS resource (a Windows job handle).
+///
+/// The lease is only ever used while its shell (or one of its descendants)
+/// is plausibly still alive; by the time the turn ends the id/handle is
+/// long gone and killing it is a no-op.
 #[cfg(unix)]
-struct GroupGuard(Option<libc::pid_t>);
+struct GroupLease(libc::pid_t);
 
 #[cfg(unix)]
-impl GroupGuard {
-    fn new(pid: Option<u32>) -> Self {
-        Self(
-            pid.and_then(|pid| i32::try_from(pid).ok())
-                .filter(|pid| *pid > 0)
-                .map(|pid| pid as libc::pid_t),
-        )
+impl GroupLease {
+    fn new(pid: Option<u32>) -> Option<Self> {
+        pid.and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+            .map(GroupLease)
     }
 
-    fn kill_group(&self) {
-        if let Some(pid) = self.0 {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
+    fn kill(&self) {
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct GroupLease(HANDLE);
+
+#[cfg(windows)]
+impl GroupLease {
+    /// Creates a job object with kill-on-close, opens `pid`, and assigns it
+    /// to the job. Every process the shell spawns inherits the job, so the
+    /// job covers the whole tree.
+    fn new(pid: Option<u32>) -> Option<Self> {
+        let pid = pid.filter(|pid| *pid > 0)?;
+        unsafe {
+            let process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+            if process.is_null() {
+                return None;
+            }
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                CloseHandle(process);
+                return None;
+            }
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &mut limits as *mut _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            let assigned = AssignProcessToJobObject(job, process) != 0;
+            CloseHandle(process);
+            if assigned {
+                Some(GroupLease(job))
+            } else {
+                CloseHandle(job);
+                None
             }
         }
     }
 
-    fn disarm(&mut self) {
-        self.0 = None;
+    fn kill(&self) {
+        unsafe {
+            let _ = TerminateJobObject(self.0, 1);
+        }
     }
 }
 
-#[cfg(unix)]
-impl Drop for GroupGuard {
+#[cfg(windows)]
+impl Drop for GroupLease {
     fn drop(&mut self) {
-        self.kill_group();
+        // With kill-on-close set, closing the handle also takes the tree
+        // down if `kill` was not called first.
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
     }
 }
 
-#[cfg(not(unix))]
-struct GroupGuard;
+#[cfg(not(any(unix, windows)))]
+struct GroupLease;
 
-#[cfg(not(unix))]
-impl GroupGuard {
-    fn new(_pid: Option<u32>) -> Self {
-        Self
+#[cfg(not(any(unix, windows)))]
+impl GroupLease {
+    fn new(_pid: Option<u32>) -> Option<Self> {
+        Some(GroupLease)
     }
 
-    fn kill_group(&self) {}
-
-    fn disarm(&mut self) {}
+    fn kill(&self) {}
 }
 
 /// Background worker owning the child process: it decodes both pipes in
@@ -632,9 +753,6 @@ async fn shell_job_worker(
     let mut stdout_buf = vec![0u8; 8192];
     let mut stderr_buf = vec![0u8; 8192];
     let (mut stdout_done, mut stderr_done) = (false, false);
-    // Survives the worker being aborted, so a cancelled job's process tree
-    // cannot outlive its cancellation even on the forced-abort path.
-    let mut guard = GroupGuard::new(child.id());
     let end = loop {
         if stdout_done && stderr_done {
             break End::Exited;
@@ -667,15 +785,9 @@ async fn shell_job_worker(
         jobs.append_output(&job_id, &text);
     }
     if matches!(end, End::Cancelled) {
-        // Kill the whole process group so descendants (subshells,
-        // background jobs) cannot survive the cancellation.
-        guard.kill_group();
-        guard.disarm();
+        // The manager kills the process tree through its lease; the worker
+        // only reaps the direct child.
         child.kill().await.ok();
-    } else {
-        // A normally finished command may have backgrounded children on
-        // purpose; they are left alone.
-        guard.disarm();
     }
     let status = child.wait().await;
     let (state, trailing) = match (end, status) {
@@ -699,7 +811,7 @@ impl Tool for ShellTool {
         "shell"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the current working directory. The command keeps running in the background: this call returns once the command exits or after yield_time_ms (default 10000, max 30000). The result is a compact envelope with status, job_id, and output. While status is running, call shell_poll with the job_id until the status becomes finished or cancelled; use shell_cancel to stop a command deliberately. A finished or cancelled result includes the rest of the command output. Commands still running when the turn ends are killed together with their child processes."
+        "Run a shell command in the current working directory. The command keeps running in the background: this call returns once the command exits or after yield_time_ms (default 10000, max 30000). The result is a compact envelope with status, job_id, and output. While status is running, call shell_poll with the job_id until the status becomes finished or cancelled; use shell_cancel to stop a command deliberately. A finished or cancelled result includes the rest of the command output in chunks; when a result shows has_more, call shell_poll again with the same job_id to retrieve the remainder. Commands still running when the turn ends are killed together with their child processes."
     }
     fn schema(&self) -> Value {
         object(
@@ -761,7 +873,7 @@ impl Tool for ShellPollTool {
         "shell_poll"
     }
     fn description(&self) -> &str {
-        "Retrieve additional output from a shell job started with the shell tool. Waits up to yield_time_ms (default 10000, max 30000) and returns only output not delivered by earlier calls, or returns immediately once the job reaches a terminal status. Keep polling with the same job_id until the status becomes finished or cancelled; a finished or cancelled result includes all remaining output, after which the job is gone."
+        "Retrieve additional output from a shell job started with the shell tool. Waits up to yield_time_ms (default 10000, max 30000) and returns only output not delivered by earlier calls, or returns immediately once the job reaches a terminal status. Keep polling with the same job_id until the status becomes finished or cancelled and the result no longer shows has_more; the final chunk removes the job."
     }
     fn schema(&self) -> Value {
         object(
@@ -822,7 +934,7 @@ impl Tool for ShellCancelTool {
         "shell_cancel"
     }
     fn description(&self) -> &str {
-        "Stop a shell job started with the shell tool. Kills the command and its child processes and returns the job's remaining output with status cancelled; a job that already finished returns its remaining output with its exit status."
+        "Stop a shell job started with the shell tool. Kills the command and its child processes immediately and returns the job's remaining output with status cancelled; a job that already finished returns its remaining output with its exit status. When a result shows has_more, retrieve the rest with shell_poll."
     }
     fn schema(&self) -> Value {
         object(json!({ "job_id": { "type": "string" } }), &["job_id"])
@@ -1523,10 +1635,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_terminal_result_carries_all_remaining_output() {
+    async fn shell_terminal_result_drains_in_budgeted_chunks() {
         let tool = ShellTool(ShellJobManager::new(std::env::temp_dir()));
         let poll = ShellPollTool(tool.0.clone());
-        let result = tool
+        let first = tool
             .run_streamed(
                 json!({
                     "command": "head -c 200 /dev/zero | tr '\\0' x",
@@ -1537,10 +1649,31 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.output.starts_with("status: finished\n"));
-        // The terminal envelope ignores the call budget: nothing is left
-        // behind for a poll that would never come.
-        assert_eq!(envelope_output(&result.output), "x".repeat(200));
+        // The terminal envelope fits its budget and marks that more remains,
+        // so the runtime's truncation can never discard undelivered output.
+        assert!(first.output.starts_with("status: finished\n"));
+        assert!(first.output.contains("has_more: true\n"));
+        assert!(
+            first.output.len() <= 100,
+            "envelope must fit its budget: {:?}",
+            first.output
+        );
+        let mut delivered = envelope_output(&first.output).to_string();
+        assert!(!delivered.is_empty() && delivered.len() < 200);
+
+        // The job keeps draining until the remainder is exhausted; the
+        // final chunk removes it.
+        let next = poll
+            .run_streamed(json!({ "job_id": "shell-1" }), None, usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !next.output.contains("has_more: true"),
+            "the final chunk must not mark more output: {:?}",
+            next.output
+        );
+        delivered.push_str(envelope_output(&next.output));
+        assert_eq!(delivered, "x".repeat(200));
         let gone = poll.run(json!({ "job_id": "shell-1" })).await.unwrap_err();
         assert!(gone.to_string().contains("unknown shell job"));
     }
@@ -1557,6 +1690,8 @@ mod tests {
             )
             .await
             .unwrap();
+        // The control header (39 bytes) is kept whole; only the output is
+        // squeezed to fit the budget.
         assert!(first.output.starts_with("status: running\n"));
         assert!(
             first.output.len() <= 40,
@@ -1568,14 +1703,30 @@ mod tests {
             "the job_id must survive a tight budget: {:?}",
             first.output
         );
-        assert_eq!(envelope_output(&first.output), "");
+        let mut delivered = envelope_output(&first.output).to_string();
+        assert!("hello".starts_with(&delivered));
 
         let rest = poll
             .run_streamed(json!({ "job_id": "shell-1" }), None, usize::MAX)
             .await
             .unwrap();
         assert!(rest.output.starts_with("status: finished\n"));
-        assert_eq!(envelope_output(&rest.output), "hello");
+        delivered.push_str(envelope_output(&rest.output));
+        assert_eq!(delivered, "hello");
+
+        // Even a budget below the header size keeps the control fields; the
+        // runtime floors the budget at the header size in practice.
+        let tiny = tool
+            .run_streamed(
+                json!({ "command": "sleep 0.5", "yield_time_ms": 50 }),
+                None,
+                30,
+            )
+            .await
+            .unwrap();
+        assert!(tiny.output.contains("job_id: shell-2"));
+        assert!(tiny.output.contains("status: running"));
+        assert_eq!(envelope_output(&tiny.output), "");
     }
 
     #[tokio::test]
@@ -1615,6 +1766,45 @@ mod tests {
         // command and create the marker shortly after.
         tokio::time::sleep(Duration::from_millis(2200)).await;
         assert!(!marker.exists(), "a descendant outlived the cancellation");
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_cleanup_kills_backgrounded_descendants_of_finished_jobs() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-shell-descendants-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let marker = root.join("survived");
+
+        let manager = ShellJobManager::new(root.clone());
+        let tool = ShellTool(manager.clone());
+        let result = tool
+            .run(json!({
+                // sh exits immediately after backgrounding the descendant;
+                // the job is terminal and fully delivered, but the
+                // descendant keeps the process tree alive.
+                "command": format!(
+                    "(sleep 2 && echo survived > {}) >/dev/null 2>&1 &",
+                    marker.display()
+                )
+            }))
+            .await
+            .unwrap();
+        assert!(result.output.starts_with("status: finished\n"));
+
+        // The turn ends: every retained tree lease is killed.
+        manager.cancel_all().await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            !marker.exists(),
+            "a backgrounded descendant outlived the turn cleanup"
+        );
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 
