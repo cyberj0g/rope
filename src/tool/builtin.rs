@@ -23,14 +23,20 @@ use super::{ExecutionPlan, PlanStatus, Tool, ToolResult};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE},
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
     System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        },
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject, TerminateJobObject,
         },
-        Threading::{OpenProcess, PROCESS_ALL_ACCESS},
+        Threading::{
+            CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_ALL_ACCESS, ResumeThread,
+            THREAD_SUSPEND_RESUME,
+        },
     },
 };
 
@@ -206,6 +212,11 @@ impl Tool for EditTool {
 /// Default and cap for the model-suggested `yield_time_ms`.
 const DEFAULT_SHELL_YIELD: u64 = 10_000;
 const MAX_SHELL_YIELD: u64 = 30_000;
+/// Maximum bytes of a job's output retained in memory. The buffer is always
+/// the tail of the output stream; once it grows past this cap the oldest
+/// bytes are dropped (delivered ones first) and the drop is reported in the
+/// envelope, so a verbose command cannot grow memory without bound.
+const MAX_SHELL_RETAINED: usize = 256 * 1024;
 
 /// Terminal or in-flight state of one shell job. `None` exit codes mark
 /// signal deaths, which have no numeric code; the envelope renders them as
@@ -232,11 +243,24 @@ impl ShellJobState {
 
 /// One command started through the `shell` tool that has not been fully
 /// delivered to the model yet.
+///
+/// `buffer` is always the retained tail of the output stream, so the
+/// absolute positions (`total`, `delivered`, `streamed`) survive both
+/// compaction of delivered prefixes and dropping of the oldest retained
+/// bytes.
 struct ShellJob {
     /// Combined stdout and stderr, in arrival order.
     buffer: String,
-    /// Byte offset into `buffer` already returned by `shell`/`shell_poll`.
-    delivered: usize,
+    /// Total bytes produced so far, including discarded ones.
+    total: u64,
+    /// Absolute offset up to which output has been returned in an envelope.
+    delivered: u64,
+    /// Absolute offset up to which output has been streamed to a sink.
+    streamed: u64,
+    /// Bytes dropped from the retained buffer to bound memory.
+    discarded: u64,
+    /// Bytes of `discarded` already reported in an envelope.
+    discarded_reported: u64,
     state: ShellJobState,
     /// Signalled on new output and on the transition to a terminal state.
     /// Arc'd so waiters can hold an owned `Notified` across the unlock.
@@ -278,7 +302,7 @@ impl ShellJobManager {
     }
 
     /// Spawns `command` in the working directory and returns its job ID.
-    fn start(jobs: Arc<Self>, command: &str) -> Result<String> {
+    async fn start(jobs: Arc<Self>, command: &str) -> Result<String> {
         let working_dir = &jobs.working_dir;
         let mut spawn = Command::new("sh");
         spawn
@@ -300,12 +324,26 @@ impl ShellJobManager {
                 Ok(())
             });
         }
+        // On Unix the pre_exec hook puts the command in its own process
+        // group. On Windows the command starts suspended so its process
+        // tree can be contained by a job object before it can spawn
+        // anything or exit.
+        #[cfg(windows)]
+        spawn.creation_flags(CREATE_SUSPENDED);
         let mut child = spawn.spawn().context("spawn shell command")?;
         let stdout = child.stdout.take().context("open command stdout")?;
         let stderr = child.stderr.take().context("open command stderr")?;
         // Lease the process tree before the command can spawn anything, so
         // descendants are always covered by a cancel or turn-end cleanup.
-        let group = GroupLease::new(child.id());
+        // Containment failure fails the call: an uncontained command is
+        // worse than no command.
+        let group = match GroupLease::lease_tree(child.id()) {
+            Ok(group) => group,
+            Err(error) => {
+                child.kill().await.ok();
+                return Err(error).context("contain the shell process tree");
+            }
+        };
         let job_id = {
             let mut inner = jobs.inner.lock().unwrap();
             inner.next_id += 1;
@@ -318,11 +356,15 @@ impl ShellJobManager {
             job_id.clone(),
             ShellJob {
                 buffer: String::new(),
+                total: 0,
                 delivered: 0,
+                streamed: 0,
+                discarded: 0,
+                discarded_reported: 0,
                 state: ShellJobState::Running,
                 notify: Arc::new(Notify::new()),
                 cancel: cancel_tx,
-                group,
+                group: Some(group),
                 handle: None,
             },
         );
@@ -343,7 +385,8 @@ impl ShellJobManager {
         Ok(job_id)
     }
 
-    /// Waits up to `yield_time` for the job to terminate, streaming new
+    /// Waits up to `yield_time` for the job to terminate — or until enough
+    /// output has arrived to fill the response budget — streaming new
     /// output to `sink` while it waits, then returns the next not-yet-
     /// delivered chunk capped so the full envelope fits in `budget` bytes.
     /// Terminal jobs keep draining in budgeted chunks (marked `has_more`)
@@ -362,16 +405,6 @@ impl ShellJobManager {
             inner.jobs.get(job_id).with_context(unknown)?;
         }
         let deadline = Instant::now() + yield_time;
-        // Live streaming starts where earlier calls stopped, so the UI never
-        // sees output twice.
-        let mut sink_cursor = {
-            let inner = self.inner.lock().unwrap();
-            inner
-                .jobs
-                .get(job_id)
-                .map(|job| job.delivered)
-                .with_context(unknown)?
-        };
         loop {
             let notified = {
                 let inner = self.inner.lock().unwrap();
@@ -383,19 +416,30 @@ impl ShellJobManager {
             // does not retain a permit, so a signal in the gap between the
             // check and the registration would be lost.
             notified.as_mut().enable();
-            let terminal = {
-                let inner = self.inner.lock().unwrap();
-                let job = inner.jobs.get(job_id).with_context(unknown)?;
-                if job.buffer.len() > sink_cursor {
-                    let fresh = job.buffer[sink_cursor..].to_string();
+            let (terminal, full) = {
+                let mut inner = self.inner.lock().unwrap();
+                let job = inner.jobs.get_mut(job_id).with_context(unknown)?;
+                // Live streaming starts where the previous call stopped;
+                // the job remembers the absolute offset, so compaction of
+                // the buffer cannot shift the cursor, and the UI never
+                // sees output twice.
+                if job.total > job.streamed {
+                    let buffer_start = job.total - job.buffer.len() as u64;
+                    let from = job.streamed.max(buffer_start);
+                    let fresh = job.buffer[(from - buffer_start) as usize..].to_string();
                     if let Some(sink) = sink {
                         sink.send(fresh).ok();
                     }
-                    sink_cursor = job.buffer.len();
+                    job.streamed = job.total;
                 }
-                job.state.is_terminal()
+                let terminal = job.state.is_terminal();
+                // No point waiting longer: the envelope cannot carry more
+                // than the budget, and a verbose command would only fill
+                // the retained buffer.
+                let full = job.total - job.delivered >= budget as u64;
+                (terminal, full)
             };
-            if terminal {
+            if terminal || full {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -411,31 +455,37 @@ impl ShellJobManager {
             let mut inner = self.inner.lock().unwrap();
             let job = inner.jobs.get_mut(job_id).with_context(unknown)?;
             let state = job.state;
+            let buffer_start = job.total - job.buffer.len() as u64;
+            let start = (job.delivered - buffer_start) as usize;
             // The control lines always come first, so a tight budget keeps
             // the status and job_id — the runtime floors the budget at the
             // control envelope size, and its truncation keeps the head.
-            let mut header = envelope_header(job_id, state, false);
+            let discarded = job.discarded.saturating_sub(job.discarded_reported);
+            let mut header = envelope_header(job_id, state, false, discarded);
             let mut end = floor_char_boundary(
                 &job.buffer,
-                job.delivered
-                    .saturating_add(budget.saturating_sub(header.len()))
-                    .min(job.buffer.len()),
+                start
+                    + budget
+                        .saturating_sub(header.len())
+                        .min(job.buffer.len() - start),
             );
             if state.is_terminal() && end < job.buffer.len() {
                 // The remainder does not fit; reserve space for the marker
                 // and shrink the chunk, so the model knows to poll again.
                 // A running job needs no marker: its status already says
                 // more output is expected.
-                header = envelope_header(job_id, state, true);
+                header = envelope_header(job_id, state, true, discarded);
                 end = floor_char_boundary(
                     &job.buffer,
-                    job.delivered
-                        .saturating_add(budget.saturating_sub(header.len()))
-                        .min(job.buffer.len()),
+                    start
+                        + budget
+                            .saturating_sub(header.len())
+                            .min(job.buffer.len() - start),
                 );
             }
-            let output = job.buffer[job.delivered..end].to_string();
-            job.delivered = end;
+            let output = job.buffer[start..end].to_string();
+            job.delivered = buffer_start + end as u64;
+            job.discarded_reported = job.discarded;
             let drained = end == job.buffer.len();
             if drained && state.is_terminal() {
                 // The job is fully delivered: remove it, but keep the tree
@@ -553,8 +603,25 @@ impl ShellJobManager {
         }
         {
             let mut inner = self.inner.lock().unwrap();
-            if let Some(job) = inner.jobs.get_mut(job_id) {
-                job.buffer.push_str(text);
+            let Some(job) = inner.jobs.get_mut(job_id) else {
+                return;
+            };
+            job.total += text.len() as u64;
+            job.buffer.push_str(text);
+            // Bound retained memory: the buffer is always the tail of the
+            // stream, so once it grows past the cap drop the oldest bytes —
+            // already-delivered ones first, then the oldest undelivered
+            // ones, which are counted as discarded and reported later.
+            if job.buffer.len() > MAX_SHELL_RETAINED {
+                let cut = floor_char_boundary(&job.buffer, job.buffer.len() - MAX_SHELL_RETAINED);
+                if cut > 0 {
+                    let start_after = (job.total - job.buffer.len() as u64) + cut as u64;
+                    if start_after > job.delivered {
+                        job.discarded += start_after - job.delivered;
+                        job.delivered = start_after;
+                    }
+                    job.buffer.drain(..cut);
+                }
             }
         }
         self.signal(job_id);
@@ -604,12 +671,15 @@ fn status_str(state: ShellJobState) -> &'static str {
     }
 }
 
-fn envelope_header(job_id: &str, state: ShellJobState, has_more: bool) -> String {
+fn envelope_header(job_id: &str, state: ShellJobState, has_more: bool, discarded: u64) -> String {
     let mut header = format!("status: {}\n", status_str(state));
     if state.is_terminal() {
         header.push_str(&format!("exit_code: {}\n", state.exit_code().unwrap_or(-1)));
     }
     header.push_str(&format!("job_id: {job_id}\n"));
+    if discarded > 0 {
+        header.push_str(&format!("note: {discarded} bytes of output discarded\n"));
+    }
     if has_more {
         header.push_str("has_more: true\n");
     }
@@ -651,10 +721,13 @@ struct GroupLease(libc::pid_t);
 
 #[cfg(unix)]
 impl GroupLease {
-    fn new(pid: Option<u32>) -> Option<Self> {
+    /// Takes a lease on the command's process tree. On Unix the group id
+    /// was set by the spawn's pre_exec hook, so this only needs the pid.
+    fn lease_tree(pid: Option<u32>) -> Result<Self> {
         pid.and_then(|pid| i32::try_from(pid).ok())
             .filter(|pid| *pid > 0)
             .map(GroupLease)
+            .context("shell has no process group")
     }
 
     fn kill(&self) {
@@ -667,39 +740,69 @@ impl GroupLease {
 #[cfg(windows)]
 struct GroupLease(HANDLE);
 
+/// # Send + Sync safety
+/// A Win32 HANDLE is an index into the per-process handle table, not a
+/// pointer into process memory, so sharing the value across threads cannot
+/// create a data race. Every operation made through it here
+/// (TerminateJobObject, CloseHandle) is a thread-safe kernel call, and the
+/// lease exclusively owns the handle: it is created once, never duplicated,
+/// and closed exactly once, in `Drop`.
+#[cfg(windows)]
+unsafe impl Send for GroupLease {}
+#[cfg(windows)]
+unsafe impl Sync for GroupLease {}
+
 #[cfg(windows)]
 impl GroupLease {
-    /// Creates a job object with kill-on-close, opens `pid`, and assigns it
-    /// to the job. Every process the shell spawns inherits the job, so the
-    /// job covers the whole tree.
-    fn new(pid: Option<u32>) -> Option<Self> {
-        let pid = pid.filter(|pid| *pid > 0)?;
+    /// Creates a kill-on-close job object and contains the shell in it.
+    /// The shell is still suspended at this point, so it has exactly one
+    /// thread and has not spawned or exited anything: assignment here is
+    /// atomic with respect to containment — no descendant can escape. The
+    /// shell is only resumed once it is inside the job.
+    fn lease_tree(pid: Option<u32>) -> Result<Self> {
+        let pid = pid
+            .filter(|pid| *pid > 0)
+            .context("shell has no process id")?;
         unsafe {
-            let process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
-            if process.is_null() {
-                return None;
-            }
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if job.is_null() {
-                CloseHandle(process);
-                return None;
+                bail!("create job object");
             }
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let _ = SetInformationJobObject(
+            if SetInformationJobObject(
                 job,
                 JobObjectExtendedLimitInformation,
                 &mut limits as *mut _ as *const std::ffi::c_void,
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
+            ) == 0
+            {
+                CloseHandle(job);
+                bail!("set job object limits");
+            }
+            let thread = match open_sole_thread(pid) {
+                Some(thread) => thread,
+                None => {
+                    CloseHandle(job);
+                    bail!("open the shell's suspended thread");
+                }
+            };
+            let process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+            if process.is_null() {
+                CloseHandle(thread);
+                CloseHandle(job);
+                bail!("open shell process");
+            }
             let assigned = AssignProcessToJobObject(job, process) != 0;
             CloseHandle(process);
-            if assigned {
-                Some(GroupLease(job))
-            } else {
+            if !assigned {
+                CloseHandle(thread);
                 CloseHandle(job);
-                None
+                bail!("assign shell to job object");
             }
+            ResumeThread(thread);
+            CloseHandle(thread);
+            Ok(GroupLease(job))
         }
     }
 
@@ -708,6 +811,36 @@ impl GroupLease {
             let _ = TerminateJobObject(self.0, 1);
         }
     }
+}
+
+/// Opens the one thread of a suspended process. A second thread would mean
+/// the process already ran and may have escaped containment, so `None` is
+/// returned unless it has exactly one.
+#[cfg(windows)]
+unsafe fn open_sole_thread(pid: u32) -> Option<HANDLE> {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut thread_ids = Vec::new();
+    if Thread32First(snapshot, &mut entry) != 0 {
+        loop {
+            if entry.th32OwnerProcessID == pid {
+                thread_ids.push(entry.th32ThreadID);
+            }
+            if Thread32Next(snapshot, &mut entry) == 0 {
+                break;
+            }
+        }
+    }
+    CloseHandle(snapshot);
+    (thread_ids.len() == 1)
+        .then(|| OpenThread(THREAD_SUSPEND_RESUME, 0, thread_ids[0]))
+        .filter(|handle| !handle.is_null())
 }
 
 #[cfg(windows)]
@@ -726,8 +859,8 @@ struct GroupLease;
 
 #[cfg(not(any(unix, windows)))]
 impl GroupLease {
-    fn new(_pid: Option<u32>) -> Option<Self> {
-        Some(GroupLease)
+    fn lease_tree(_pid: Option<u32>) -> Result<Self> {
+        Ok(GroupLease)
     }
 
     fn kill(&self) {}
@@ -811,7 +944,7 @@ impl Tool for ShellTool {
         "shell"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the current working directory. The command keeps running in the background: this call returns once the command exits or after yield_time_ms (default 10000, max 30000). The result is a compact envelope with status, job_id, and output. While status is running, call shell_poll with the job_id until the status becomes finished or cancelled; use shell_cancel to stop a command deliberately. A finished or cancelled result includes the rest of the command output in chunks; when a result shows has_more, call shell_poll again with the same job_id to retrieve the remainder. Commands still running when the turn ends are killed together with their child processes."
+        "Run a shell command in the current working directory. The command keeps running in the background: this call returns once the command exits, after yield_time_ms (default 10000, max 30000), or when the output budget fills. The result is a compact envelope with status, job_id, and output. While status is running, call shell_poll with the job_id until the status becomes finished or cancelled; use shell_cancel to stop a command deliberately. A finished or cancelled result includes the rest of the command output in chunks; when a result shows has_more, call shell_poll again with the same job_id to retrieve the remainder. Output beyond the retention limit is discarded and reported as a discard note in the envelope. Commands still running when the turn ends are killed together with their child processes."
     }
     fn schema(&self) -> Value {
         object(
@@ -843,7 +976,7 @@ impl Tool for ShellTool {
             yield_time_ms: Option<u64>,
         }
         let args: Args = serde_json::from_value(args)?;
-        let job_id = ShellJobManager::start(self.0.clone(), &args.command)?;
+        let job_id = ShellJobManager::start(self.0.clone(), &args.command).await?;
         let snapshot = self
             .0
             .poll(
@@ -1638,7 +1771,10 @@ mod tests {
     async fn shell_terminal_result_drains_in_budgeted_chunks() {
         let tool = ShellTool(ShellJobManager::new(std::env::temp_dir()));
         let poll = ShellPollTool(tool.0.clone());
-        let first = tool
+        // Each chunk fits the budget; terminal chunks that still have a
+        // remainder mark has_more, so the runtime's truncation can never
+        // discard output that has not been delivered.
+        let mut result = tool
             .run_streamed(
                 json!({
                     "command": "head -c 200 /dev/zero | tr '\\0' x",
@@ -1649,31 +1785,146 @@ mod tests {
             )
             .await
             .unwrap();
-        // The terminal envelope fits its budget and marks that more remains,
-        // so the runtime's truncation can never discard undelivered output.
-        assert!(first.output.starts_with("status: finished\n"));
-        assert!(first.output.contains("has_more: true\n"));
+        let mut delivered = String::new();
+        let mut saw_has_more = false;
+        let mut polls = 0;
+        loop {
+            assert!(
+                result.output.len() <= 100,
+                "envelope must fit its budget: {:?}",
+                result.output
+            );
+            delivered.push_str(envelope_output(&result.output));
+            if result.output.contains("has_more: true\n") {
+                saw_has_more = true;
+            }
+            if result.output.starts_with("status: finished\n")
+                && !result.output.contains("has_more: true\n")
+            {
+                break;
+            }
+            polls += 1;
+            assert!(polls < 20, "command should have drained");
+            result = poll
+                .run_streamed(json!({ "job_id": "shell-1" }), None, 100)
+                .await
+                .unwrap();
+        }
+        // 200 bytes can never fit one 100-byte envelope, so at least one
+        // terminal chunk had to announce a remainder.
+        assert!(saw_has_more, "expected a has_more chunk: {delivered:?}");
+        assert_eq!(delivered, "x".repeat(200));
+        let gone = poll.run(json!({ "job_id": "shell-1" })).await.unwrap_err();
+        assert!(gone.to_string().contains("unknown shell job"));
+    }
+
+    #[tokio::test]
+    async fn shell_poll_returns_as_soon_as_the_budget_is_full() {
+        let tool = ShellTool(ShellJobManager::new(std::env::temp_dir()));
+        let cancel = ShellCancelTool(tool.0.clone());
+        // The command emits far more than the budget immediately, then
+        // stays alive: the call must return with a full chunk instead of
+        // waiting out the 5-second yield.
+        let started = Instant::now();
+        let first = tool
+            .run_streamed(
+                json!({
+                    "command": "head -c 100000 /dev/zero | tr '\\0' x; sleep 5",
+                    "yield_time_ms": 5000
+                }),
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "poll must return when the budget is full, not wait out the yield: {elapsed:?}"
+        );
+        assert!(first.output.starts_with("status: running\n"));
         assert!(
             first.output.len() <= 100,
             "envelope must fit its budget: {:?}",
             first.output
         );
-        let mut delivered = envelope_output(&first.output).to_string();
-        assert!(!delivered.is_empty() && delivered.len() < 200);
+        assert!(
+            envelope_output(&first.output) == "x".repeat(60),
+            "the chunk must be full: {:?}",
+            first.output
+        );
+        // The command is still running; stop it for the test.
+        let cancelled = cancel.run(json!({ "job_id": "shell-1" })).await.unwrap();
+        assert!(cancelled.output.starts_with("status: cancelled\n"));
+    }
 
-        // The job keeps draining until the remainder is exhausted; the
-        // final chunk removes it.
-        let next = poll
-            .run_streamed(json!({ "job_id": "shell-1" }), None, usize::MAX)
+    #[tokio::test]
+    async fn shell_verbose_output_is_bounded_and_discards_are_noted() {
+        let tool = ShellTool(ShellJobManager::new(std::env::temp_dir()));
+        let poll = ShellPollTool(tool.0.clone());
+        // Produce more than MAX_SHELL_RETAINED (256 KiB) in one go.
+        let first = tool
+            .run_streamed(
+                json!({
+                    "command": "head -c 300000 /dev/zero | tr '\\0' x",
+                    "yield_time_ms": 500
+                }),
+                None,
+                100,
+            )
             .await
             .unwrap();
+        // The command is done by now; the final drain uses a budget large
+        // enough to take the whole retained tail.
+        let mut result = poll
+            .run_streamed(
+                json!({ "job_id": "shell-1", "yield_time_ms": 1000 }),
+                None,
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+        let mut polls = 0;
+        loop {
+            if result.output.starts_with("status: finished\n")
+                && !result.output.contains("has_more: true\n")
+            {
+                break;
+            }
+            polls += 1;
+            assert!(polls < 5, "command should have drained");
+            result = poll
+                .run_streamed(
+                    json!({ "job_id": "shell-1", "yield_time_ms": 1000 }),
+                    None,
+                    usize::MAX,
+                )
+                .await
+                .unwrap();
+        }
+        let mut discarded = 0u64;
+        for envelope in [&first.output, &result.output] {
+            let header = envelope.split("output:\n").next().unwrap_or_default();
+            let note = header.lines().find_map(|line| {
+                line.strip_prefix("note: ")
+                    .and_then(|rest| rest.split(" bytes of output discarded").next())
+                    .and_then(|n| n.parse::<u64>().ok())
+            });
+            discarded += note.unwrap_or(0);
+        }
+        let delivered =
+            envelope_output(&first.output).len() + envelope_output(&result.output).len();
+        // The retained buffer never holds more than the cap, so some of the
+        // 300000 bytes had to be discarded — and the discard is reported.
         assert!(
-            !next.output.contains("has_more: true"),
-            "the final chunk must not mark more output: {:?}",
-            next.output
+            discarded > 0,
+            "expected discards for output beyond the retention cap"
         );
-        delivered.push_str(envelope_output(&next.output));
-        assert_eq!(delivered, "x".repeat(200));
+        assert_eq!(
+            delivered + discarded as usize,
+            300_000,
+            "every byte is delivered or discarded exactly once"
+        );
         let gone = poll.run(json!({ "job_id": "shell-1" })).await.unwrap_err();
         assert!(gone.to_string().contains("unknown shell job"));
     }

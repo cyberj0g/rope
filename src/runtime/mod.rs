@@ -32,7 +32,9 @@ const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
 /// Floor for the per-call tool output budget, in tokens (4 bytes each).
 /// Even near the context limit, a tool result always carries its control
 /// fields — e.g. a shell job's status and job_id — so the model can keep
-/// polling or cancelling instead of losing track of the command.
+/// polling or cancelling instead of losing track of the command. The floor
+/// is clamped to the remaining context, so the result can never push the
+/// next model request past max_context_tokens.
 const MIN_TOOL_OUTPUT_TOKENS: u64 = 32; // 128 bytes
 /// Hard cap on the tool calls one assistant message may batch. The cap
 /// resets for every assistant message, so a turn may run as many model
@@ -1061,13 +1063,13 @@ async fn agent<P: Provider>(
             };
             // The streaming cap mirrors the final truncation, so the chat
             // never shows output the model context will keep beyond it.
-            // The floor keeps the control envelope intact near the limit.
-            let output_tokens = (config
+            // The floor keeps the control envelope intact near the limit,
+            // clamped so the result never exceeds the remaining context.
+            let remaining = config
                 .active_model()
                 .max_context_tokens
-                .saturating_sub(used_context_tokens)
-                / 5)
-            .max(MIN_TOOL_OUTPUT_TOKENS);
+                .saturating_sub(used_context_tokens);
+            let output_tokens = (remaining / 5).max(MIN_TOOL_OUTPUT_TOKENS).min(remaining);
             let max_streamed_bytes =
                 output_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
             let result = if approved {
@@ -1145,7 +1147,9 @@ fn available_context_tokens(
 }
 
 /// Forwards partial tool output to the UI until the streamed byte budget is
-/// exhausted. The sender is dropped when the tool finishes, which ends the loop.
+/// exhausted. A delta larger than the remaining allowance is sliced at a
+/// character boundary, so one large delta can never overshoot the cap. The
+/// sender is dropped when the tool finishes, which ends the loop.
 async fn forward_tool_output_deltas(
     call_id: String,
     mut deltas: mpsc::UnboundedReceiver<String>,
@@ -1154,19 +1158,42 @@ async fn forward_tool_output_deltas(
 ) {
     let mut forwarded = 0usize;
     while let Some(delta) = deltas.recv().await {
+        let remaining = max_bytes - forwarded;
+        if delta.len() <= remaining {
+            let length = delta.len();
+            events
+                .send(Event::ToolOutputDelta {
+                    call_id: call_id.clone(),
+                    delta,
+                })
+                .await
+                .ok();
+            forwarded += length;
+        } else {
+            let end = floor_char_boundary(&delta, remaining);
+            if end > 0 {
+                events
+                    .send(Event::ToolOutputDelta {
+                        call_id: call_id.clone(),
+                        delta: delta[..end].to_string(),
+                    })
+                    .await
+                    .ok();
+            }
+            forwarded = max_bytes;
+        }
         if forwarded >= max_bytes {
             break;
         }
-        let length = delta.len();
-        events
-            .send(Event::ToolOutputDelta {
-                call_id: call_id.clone(),
-                delta,
-            })
-            .await
-            .ok();
-        forwarded = forwarded.saturating_add(length);
     }
+}
+
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut end = index.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn truncate_tool_output(mut output: String, max_tokens: u64) -> String {
@@ -1174,11 +1201,16 @@ fn truncate_tool_output(mut output: String, max_tokens: u64) -> String {
     if output.len() <= max_bytes {
         return output;
     }
-    let mut end = max_bytes.saturating_sub(TOOL_OUTPUT_TRUNCATED.len());
-    while !output.is_char_boundary(end) {
-        end -= 1;
+    // The cap is a hard budget: when even the marker no longer fits, keep
+    // the head up to the cap instead of overshooting it.
+    if max_bytes <= TOOL_OUTPUT_TRUNCATED.len() {
+        output.truncate(floor_char_boundary(&output, max_bytes));
+        return output;
     }
-    output.truncate(end);
+    output.truncate(floor_char_boundary(
+        &output,
+        max_bytes - TOOL_OUTPUT_TRUNCATED.len(),
+    ));
     output.push_str(TOOL_OUTPUT_TRUNCATED);
     output
 }
@@ -1698,10 +1730,70 @@ mod tests {
                 .any(|event| matches!(event, Event::ToolResult { .. })),
             "expected a tool result event"
         );
-        // The budget is (100 - 80) / 5 = 4 tokens = 16 bytes, floored to
-        // the 32-token control envelope minimum: exactly sixteen eight-byte
-        // chunks (128 bytes) are forwarded.
-        assert_eq!(streamed, "12345678".repeat(16));
+        // The budget is (100 - 80) / 5 = 4 tokens, floored to 32 and
+        // clamped to the 20 remaining tokens: 80 bytes, so exactly ten
+        // eight-byte chunks are forwarded.
+        assert_eq!(streamed, "12345678".repeat(10));
+    }
+
+    #[tokio::test]
+    async fn streaming_cap_slices_an_oversized_delta() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("slow_echo".into()),
+                    arguments: "{}".into(),
+                },
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 0,
+                    total_tokens: 80,
+                }),
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        // One 1000-byte delta, far larger than the 80-byte budget.
+        tools.insert(SlowEcho(vec!["a".repeat(1_000)]), Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 100;
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+        let collector = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+
+        agent(
+            provider,
+            &tools,
+            &config,
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+        drop(event_tx);
+        let events = collector.await.unwrap();
+
+        let streamed: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolOutputDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        // The final delta is sliced to the remaining allowance, so the
+        // cap holds exactly.
+        assert_eq!(streamed, "a".repeat(80));
     }
 
     #[tokio::test]
@@ -1835,7 +1927,8 @@ mod tests {
         assert!(matches!(
             &completed[2],
             // (100 - 50) / 5 = 10 tokens, floored to the 32-token control
-            // envelope minimum: 128 bytes.
+            // envelope minimum, which still fits the 50 remaining tokens:
+            // 128 bytes.
             Message::Tool { content, .. }
                 if content.ends_with("[tool output truncated]") && content.len() <= 128
         ));
@@ -1843,6 +1936,60 @@ mod tests {
 
     #[tokio::test]
     async fn tool_output_budget_keeps_shell_control_fields_near_context_limit() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("shell".into()),
+                    arguments: r#"{"command":"sleep 5","yield_time_ms":50}"#.into(),
+                },
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 0,
+                    total_tokens: 64,
+                }),
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        let jobs = ShellJobManager::new(std::env::temp_dir());
+        tools.insert(ShellTool(jobs.clone()), Approval::Allow);
+        tools.insert(ShellPollTool(jobs), Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 100;
+        let (event_tx, event_rx) = mpsc::channel(16);
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(4);
+
+        let completed = agent(
+            provider,
+            &tools,
+            &config,
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        // (100 - 64) / 5 = 7 tokens: without the floor the 128-byte
+        // envelope would be truncated and lose the job_id, and the command
+        // could never be polled or cancelled. The floor keeps the control
+        // fields while still fitting the remaining context.
+        assert!(matches!(
+            &completed[2],
+            Message::Tool { content, .. }
+                if content.starts_with("status: running\n")
+                    && content.contains("job_id: shell-1\n")
+                    && !content.ends_with("[tool output truncated]")
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_output_budget_never_exceeds_the_remaining_context() {
         let provider = Arc::new(MockProvider::new(vec![
             vec![
                 ResponseDelta::ToolCall {
@@ -1882,15 +2029,13 @@ mod tests {
         .await
         .unwrap();
 
-        // (100 - 96) / 5 = 0 tokens: without the floor the envelope would
-        // be truncated to a marker with no job_id, and the command could
-        // never be polled or cancelled. The floor keeps the control fields.
+        // Only 4 tokens (16 bytes) remain: the floor clamps to them, so the
+        // result keeps the head of the envelope and can never push the next
+        // model request past max_context_tokens.
         assert!(matches!(
             &completed[2],
             Message::Tool { content, .. }
-                if content.starts_with("status: running\n")
-                    && content.contains("job_id: shell-1\n")
-                    && !content.ends_with("[tool output truncated]")
+                if content.starts_with("status: running\n") && content.len() <= 16
         ));
     }
 
