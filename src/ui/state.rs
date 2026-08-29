@@ -5,7 +5,9 @@ use std::{
 
 use crate::{
     project::ProjectState,
-    runtime::{CANCELLED_BY_USER, Event, ImageContent, Message, ToolCall, UserPrompt},
+    runtime::{
+        CANCELLED_BY_USER, COMPACTION_MARKER, Event, ImageContent, Message, ToolCall, UserPrompt,
+    },
     tool::ExecutionPlan,
 };
 
@@ -113,6 +115,9 @@ pub enum ChatBlock {
         model: String,
         kind: MessageKind,
         expanded: bool,
+        /// For the System "context compacted" marker: what the context was
+        /// compacted to, rendered as a collapsible section under the message.
+        summary: Option<String>,
     },
     Thinking {
         content: String,
@@ -766,6 +771,7 @@ impl UiState {
             model: String::new(),
             kind: MessageKind::User,
             expanded: true,
+            summary: None,
         });
     }
 
@@ -779,6 +785,7 @@ impl UiState {
             model: String::new(),
             kind: MessageKind::Error,
             expanded: true,
+            summary: None,
         });
     }
 
@@ -922,6 +929,12 @@ impl UiState {
                 expanded,
                 ..
             }
+            | ChatBlock::Message {
+                kind: MessageKind::System,
+                summary: Some(_),
+                expanded,
+                ..
+            }
             | ChatBlock::Thinking { expanded, .. }
             | ChatBlock::Tool { expanded, .. },
         ) = self.blocks.get_mut(index)
@@ -934,6 +947,12 @@ impl UiState {
         if let Some(
             ChatBlock::Message {
                 kind: MessageKind::User | MessageKind::Assistant,
+                expanded,
+                ..
+            }
+            | ChatBlock::Message {
+                kind: MessageKind::System,
+                summary: Some(_),
                 expanded,
                 ..
             }
@@ -1071,6 +1090,7 @@ impl UiState {
                             model: self.response_model.clone(),
                             kind: MessageKind::Assistant,
                             expanded: true,
+                            summary: None,
                         });
                         let block = self.blocks.len() - 1;
                         self.assistant = Some(block);
@@ -1194,14 +1214,15 @@ impl UiState {
             Event::CompactionStarted => {
                 self.notice = Some("compacting context".into());
             }
-            Event::ContextCompacted => {
+            Event::ContextCompacted { summary } => {
                 let block = ChatBlock::Message {
                     label: "System".into(),
-                    content: "Context compacted".into(),
+                    content: "context compacted".into(),
                     images: Vec::new(),
                     model: String::new(),
                     kind: MessageKind::System,
-                    expanded: true,
+                    expanded: false,
+                    summary: Some(summary),
                 };
                 let before_user = self.blocks.iter().rposition(|block| {
                     matches!(
@@ -1217,7 +1238,9 @@ impl UiState {
                 } else {
                     self.blocks.push(block);
                 }
-                self.notice = Some("context compacted".into());
+                if self.notice.as_deref() == Some("compacting context") {
+                    self.notice = None;
+                }
             }
             Event::GenerationFinished => {
                 self.finish_reasoning();
@@ -1268,6 +1291,7 @@ impl UiState {
                     model: String::new(),
                     kind: MessageKind::System,
                     expanded: true,
+                    summary: None,
                 });
                 self.generating = false;
                 self.connecting = false;
@@ -1295,6 +1319,7 @@ impl UiState {
                 self.generated_bytes = 0;
                 self.reported_generation_duration = Duration::ZERO;
                 self.reported_output_tokens = 0;
+                self.notice = None;
                 self.set_error(error);
             }
         }
@@ -1333,19 +1358,34 @@ impl UiState {
         }
     }
 
+    /// Splits a persisted compaction marker into its label and embedded summary.
+    fn compaction_marker(content: String) -> (String, Option<String>) {
+        let summary = content
+            .strip_prefix(format!("{COMPACTION_MARKER}\n").as_str())
+            .map(str::to_owned);
+        match summary {
+            Some(summary) => ("context compacted".into(), Some(summary)),
+            None => (content, None),
+        }
+    }
+
     fn set_history(&mut self, messages: Vec<Message>) {
         self.blocks.clear();
         self.tool_calls.clear();
         for message in messages {
             match message {
-                Message::System { content } => self.blocks.push(ChatBlock::Message {
-                    label: "System".into(),
-                    content,
-                    images: Vec::new(),
-                    model: String::new(),
-                    kind: MessageKind::System,
-                    expanded: true,
-                }),
+                Message::System { content } => {
+                    let (content, summary) = Self::compaction_marker(content);
+                    self.blocks.push(ChatBlock::Message {
+                        label: "System".into(),
+                        content,
+                        images: Vec::new(),
+                        model: String::new(),
+                        kind: MessageKind::System,
+                        expanded: false,
+                        summary,
+                    });
+                }
                 Message::User { content, images } => self.blocks.push(ChatBlock::Message {
                     label: "You".into(),
                     content,
@@ -1353,6 +1393,7 @@ impl UiState {
                     model: String::new(),
                     kind: MessageKind::User,
                     expanded: true,
+                    summary: None,
                 }),
                 Message::Assistant {
                     content,
@@ -1376,6 +1417,7 @@ impl UiState {
                             model,
                             kind: MessageKind::Assistant,
                             expanded: true,
+                            summary: None,
                         });
                     }
                     for call in tool_calls {
@@ -1471,6 +1513,10 @@ fn collapsible(block: &ChatBlock) -> bool {
         block,
         ChatBlock::Message {
             kind: MessageKind::User | MessageKind::Assistant,
+            ..
+        } | ChatBlock::Message {
+            kind: MessageKind::System,
+            summary: Some(_),
             ..
         } | ChatBlock::Thinking { .. }
             | ChatBlock::Tool { .. }
@@ -1646,21 +1692,78 @@ mod tests {
             tokens: 750,
             max_tokens: 1000,
         });
-        state.apply(Event::ContextCompacted);
+        state.apply(Event::CompactionStarted);
+        assert_eq!(state.notice.as_deref(), Some("compacting context"));
+        state.apply(Event::ContextCompacted {
+            summary: "dense summary".into(),
+        });
 
         assert_eq!(state.context_tokens, 750);
+        assert!(state.notice.is_none());
         assert!(matches!(
             &state.blocks[0],
             ChatBlock::Message {
                 kind: MessageKind::System,
                 content,
+                summary,
+                expanded,
                 ..
-            } if content == "Context compacted"
+            } if content == "context compacted"
+                && summary.as_deref() == Some("dense summary")
+                && !expanded
         ));
         assert!(matches!(
             state.blocks[1],
             ChatBlock::Message {
                 kind: MessageKind::User,
+                ..
+            }
+        ));
+
+        state.select(0);
+        state.toggle_selected();
+        assert!(matches!(
+            state.blocks[0],
+            ChatBlock::Message {
+                kind: MessageKind::System,
+                summary: Some(_),
+                expanded: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn loaded_history_restores_compaction_markers_with_summaries() {
+        let mut state = UiState::new();
+        state.apply(Event::History(vec![
+            Message::user("old turn".into()),
+            Message::system(format!("{COMPACTION_MARKER}\nsummarized the early turns")),
+            Message::user("continue".into()),
+        ]));
+
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Message {
+                label,
+                kind: MessageKind::System,
+                content,
+                summary,
+                expanded,
+                ..
+            } if label == "System"
+                && content == "context compacted"
+                && summary.as_deref() == Some("summarized the early turns")
+                && !expanded
+        ));
+
+        state.toggle(1);
+        assert!(matches!(
+            state.blocks[1],
+            ChatBlock::Message {
+                kind: MessageKind::System,
+                summary: Some(_),
+                expanded: true,
                 ..
             }
         ));

@@ -38,8 +38,8 @@
 - iterative model → tool → model execution
 - immediate Escape cancellation with force-killed child processes, preserved partial output, failed in-flight tools, and a persisted cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
-- configurable context fill tracking and automatic continuation compaction
-- preserved visible transcripts with persisted `Context compacted` markers
+- configurable context fill tracking and automatic continuation compaction that replays the persisted summary into model context
+- preserved visible transcripts with persisted `Context compacted` markers whose summary stays in history as a collapsed chat section
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - tool approval controls in the composer with paused execution timing across batched calls, session-persisted approvals, and decision markers retained in conversation history
 - built-in `read`, `write`, `edit`, `shell`, `search_files`, and `list_files` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks

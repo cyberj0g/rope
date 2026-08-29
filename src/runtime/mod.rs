@@ -19,12 +19,15 @@ use crate::{
     config::{Config, Startup},
     project::ProjectState,
     provider::{Provider, ResponseDelta, Usage},
-    session::Session,
+    session::{Session, SessionMeta},
     tool::{Approval, ExecutionPlan, ToolDefinition, ToolRegistry},
 };
 pub use message::{ImageContent, Message, ToolCall};
 
 pub const CANCELLED_BY_USER: &str = "cancelled by user";
+/// Prefix of the persisted System marker for a compacted context. The
+/// remainder of the marker content is the summary the context was reduced to.
+pub const COMPACTION_MARKER: &str = "Context compacted";
 const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -163,7 +166,9 @@ pub enum Event {
         seconds: u64,
     },
     CompactionStarted,
-    ContextCompacted,
+    ContextCompacted {
+        summary: String,
+    },
     GenerationFinished,
     GenerationCancelled,
     Saved,
@@ -296,7 +301,7 @@ async fn run<P: Provider>(
                 Command::Submit(prompt) if generation.is_none() => {
                     let persist_from = messages.len();
                     messages.push(Message::user_with_images(prompt.content, prompt.images));
-                    let request_messages = request_context(&messages, &session);
+                    let request_messages = request_context(&messages, &session.meta);
                     let context_tokens = session.meta.context_tokens;
                     let generate_title = session.needs_title();
                     let current_plan = session.meta.plan.clone();
@@ -412,15 +417,16 @@ async fn run<P: Provider>(
                     }
                     let mut persisted = Vec::new();
                     if let Some(compaction) = compaction {
+                        let marker =
+                            Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
                         session.meta.compaction_summary = Some(compaction.summary);
                         session.meta.compacted_through = compaction.through;
-                        let marker = Message::system("Context compacted".into());
                         messages.push(marker.clone());
                         persisted.push(marker);
                     }
                     messages.extend(completed.clone());
                     persisted.extend(completed);
-                    let projected = request_context(&messages, &session);
+                    let projected = request_context(&messages, &session.meta);
                     if projected.iter().any(is_ejected_web_result) {
                         session.meta.context_tokens = estimate_tokens(&projected);
                         send_context(&events, &session, &config).await;
@@ -548,13 +554,13 @@ async fn send_context(events: &mpsc::Sender<Event>, session: &Session, config: &
         .ok();
 }
 
-fn request_context(messages: &[Message], session: &Session) -> Vec<Message> {
-    let mut context = if let Some(summary) = &session.meta.compaction_summary {
+fn request_context(messages: &[Message], meta: &SessionMeta) -> Vec<Message> {
+    let mut context = if let Some(summary) = &meta.compaction_summary {
         let mut context = vec![Message::system(format!(
             "Conversation summary for continuation:\n{summary}"
         ))];
         context.extend(
-            messages[session.meta.compacted_through.min(messages.len())..]
+            messages[meta.compacted_through.min(messages.len())..]
                 .iter()
                 .filter(|message| !is_compaction_marker(message))
                 .cloned(),
@@ -621,7 +627,7 @@ fn strip_tool_diffs(messages: &mut [Message]) -> usize {
 }
 
 fn is_compaction_marker(message: &Message) -> bool {
-    matches!(message, Message::System { content } if content == "Context compacted")
+    matches!(message, Message::System { content } if content.starts_with(COMPACTION_MARKER))
 }
 
 fn eject_consumed_web_results(messages: &mut [Message]) -> usize {
@@ -791,8 +797,14 @@ async fn compact<P: Provider>(
     if summary.trim().is_empty() {
         bail!("compaction returned an empty summary");
     }
-    events.send(Event::ContextCompacted).await.ok();
-    Ok(summary.trim().to_owned())
+    let summary = summary.trim().to_owned();
+    events
+        .send(Event::ContextCompacted {
+            summary: summary.clone(),
+        })
+        .await
+        .ok();
+    Ok(summary)
 }
 
 async fn generate_session_title<P: Provider>(
@@ -1816,6 +1828,16 @@ mod tests {
             event_rx.recv().await,
             Some(Event::CompactionStarted)
         ));
+        loop {
+            match event_rx.recv().await {
+                Some(Event::ContextCompacted { summary }) => {
+                    assert_eq!(summary, "Earlier requirements and decisions");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("events closed before compaction finished"),
+            }
+        }
         assert!(matches!(
             internal_rx.recv().await,
             Some(InternalEvent::Usage(Usage {
@@ -1823,5 +1845,40 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn request_context_projects_the_summary_and_drops_markers() {
+        let summary = "dense summary";
+        let meta = SessionMeta {
+            name: "test".into(),
+            title: None,
+            plan: None,
+            created_at: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            cost_complete: true,
+            context_tokens: 0,
+            compaction_summary: Some(summary.into()),
+            compacted_through: 2,
+            approved_tools: Vec::new(),
+        };
+        let messages = vec![
+            Message::user("old turn".into()),
+            Message::system(format!("{COMPACTION_MARKER}\n{summary}")),
+            Message::user("continue".into()),
+            Message::assistant("done".into(), "model".into(), String::new(), Vec::new()),
+        ];
+
+        let context = request_context(&messages, &meta);
+
+        assert_eq!(context.len(), 3);
+        assert!(matches!(
+            &context[0],
+            Message::System { content }
+                if content == "Conversation summary for continuation:\ndense summary"
+        ));
+        assert_eq!(context[1], Message::user("continue".into()));
+        assert!(context.iter().all(|message| !is_compaction_marker(message)));
     }
 }

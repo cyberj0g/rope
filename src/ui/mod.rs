@@ -355,6 +355,7 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
                 | Event::ToolResult { .. }
                 | Event::Retrying { .. }
                 | Event::CompactionStarted
+                | Event::ContextCompacted { .. }
                 | Event::GenerationFinished
                 | Event::GenerationCancelled
                 | Event::Saved
@@ -637,6 +638,7 @@ fn push_tool_decision(state: &mut UiState, label: &str, content: String) {
         model: String::new(),
         kind: MessageKind::System,
         expanded: true,
+        summary: None,
     });
 }
 
@@ -1418,19 +1420,22 @@ fn draw(
     chat_height
 }
 
-fn draw_model_picker(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
-    let Some(picker) = &state.model_picker else {
-        return;
-    };
-    let screen = frame.area();
+fn modal_area(screen: Rect) -> Rect {
     let width = screen.width.saturating_sub(4).min(84);
     let height = screen.height.saturating_sub(4).min(24);
-    let area = Rect::new(
+    Rect::new(
         screen.x + screen.width.saturating_sub(width) / 2,
         screen.y + screen.height.saturating_sub(height) / 2,
         width,
         height,
-    );
+    )
+}
+
+fn draw_model_picker(frame: &mut ratatui::Frame, config: &Config, state: &UiState) {
+    let Some(picker) = &state.model_picker else {
+        return;
+    };
+    let area = modal_area(frame.area());
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1990,6 +1995,7 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                 model,
                 kind,
                 expanded,
+                summary,
             } => {
                 let color = match kind {
                     MessageKind::User => Color::Cyan,
@@ -2041,6 +2047,21 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
                                 ));
                             }
                         }
+                    }
+                } else if let Some(summary) = summary {
+                    header_lines.push((index, lines.len()));
+                    lines.push(section_header(
+                        format!(
+                            "{} System: {} · {}",
+                            if *expanded { "▾" } else { "▸" },
+                            content,
+                            size_label(summary.chars().count()),
+                        ),
+                        color,
+                        state.selected() == Some(index),
+                    ));
+                    if *expanded {
+                        lines.extend(markdown(summary).into_iter().map(pad_line));
                     }
                 } else {
                     lines.push(Line::styled(
@@ -3179,6 +3200,142 @@ mod tests {
         assert_eq!(diff, expected);
         state.open_fullscreen_tool_diff(diff);
         assert_eq!(state.fullscreen_diff(), expected);
+    }
+
+    #[test]
+    fn compaction_marker_renders_a_collapsed_summary_section() {
+        let mut state = UiState::new();
+        state.push_user("continue".into());
+        state.apply(Event::ContextCompacted {
+            summary: "dense summary".into(),
+        });
+        let area = Rect::new(0, 3, 80, 12);
+
+        let layout = chat_layout(&state, area);
+        let header = layout.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(header, "▸ System: context compacted · 13 chars");
+        assert_eq!(chat_hit_test(&state, area, area.y), Some(0));
+        assert!(
+            !layout
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("dense summary"))
+        );
+
+        state.select(0);
+        state.toggle_selected();
+        let layout = chat_layout(&state, area);
+        let header = layout.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(header, "▾ System: context compacted · 13 chars");
+        assert_eq!(layout.lines[1].to_string(), " dense summary");
+    }
+
+    #[tokio::test]
+    async fn clicking_the_compaction_header_toggles_its_summary() {
+        let mut state = UiState::new();
+        state.apply(Event::ContextCompacted {
+            summary: "summary".into(),
+        });
+        let area = Rect::new(0, 3, 80, 12);
+        let input = Rect::new(0, 20, 80, 3);
+        let (commands, _events) = mpsc::channel(1);
+        let mouse = |kind| MouseEvent {
+            kind,
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            &mut state,
+            MouseAreas {
+                body: area,
+                conversation: area,
+                side: None,
+                git: None,
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+        handle_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            &mut state,
+            MouseAreas {
+                body: area,
+                conversation: area,
+                side: None,
+                git: None,
+                plan: None,
+                input,
+            },
+            &commands,
+        )
+        .await
+        .unwrap();
+
+        assert!(!state.conversation_focused());
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                kind: MessageKind::System,
+                summary,
+                expanded: true,
+                ..
+            } if summary.as_deref() == Some("summary")
+        ));
+    }
+
+    #[test]
+    fn compaction_summary_renders_in_chat_when_expanded() {
+        use ratatui::backend::TestBackend;
+
+        let page = Rect::new(0, 0, 100, 30);
+        let mut state = UiState::new();
+        state.git_panel = false;
+        state.apply(Event::ContextCompacted {
+            summary: (0..60)
+                .map(|line| format!("summary line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(page.width, page.height)).unwrap();
+        let mut images = ImageRenderer::new();
+        let mut render = |state: &UiState| {
+            terminal
+                .draw(|frame| {
+                    draw(frame, &Config::default(), state, 0, &mut images);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..page.height)
+                .map(|row| {
+                    (0..page.width)
+                        .map(|column| buffer[(column, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let collapsed = render(&state);
+        assert!(collapsed.contains("System: context compacted"));
+        assert!(!collapsed.contains("summary line 0"));
+
+        state.toggle(0);
+        let expanded = render(&state);
+        assert!(expanded.contains("summary line 0"));
     }
 
     #[test]
