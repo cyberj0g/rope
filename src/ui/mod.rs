@@ -352,6 +352,7 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
                 | Event::ToolCallFinished { .. }
                 | Event::ToolStarted { .. }
                 | Event::ApprovalRequested(_)
+                | Event::ToolOutputDelta { .. }
                 | Event::ToolResult { .. }
                 | Event::Retrying { .. }
                 | Event::CompactionStarted
@@ -3973,6 +3974,47 @@ mod tests {
         apply_runtime_event(
             &mut state,
             Event::TextDelta("new streamed content ".repeat(30)),
+            area,
+            before.lines.len(),
+        );
+        let after = chat_layout(&state, area);
+
+        assert_eq!(after.offset, before.offset);
+        assert!(state.scroll > old_scroll);
+    }
+
+    #[test]
+    fn tool_output_deltas_preserve_a_scrolled_chat_viewport() {
+        let mut state = UiState::new();
+        let area = Rect::new(0, 0, 24, 6);
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("old content ".repeat(30)));
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("shell".into()),
+            arguments: "{}".into(),
+        });
+        state.apply(Event::ToolCallFinished {
+            index: 0,
+            call: crate::runtime::ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({}),
+            },
+        });
+        state.apply(Event::ToolStarted {
+            call_id: "call_1".into(),
+        });
+        state.scroll = 4;
+        let before = chat_layout(&state, area);
+        let old_scroll = state.scroll;
+
+        apply_runtime_event(
+            &mut state,
+            Event::ToolOutputDelta {
+                call_id: "call_1".into(),
+                delta: "streamed output ".repeat(30),
+            },
             area,
             before.lines.len(),
         );

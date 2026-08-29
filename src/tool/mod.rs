@@ -7,6 +7,8 @@ mod web_search;
 use std::{collections::BTreeMap, path::PathBuf, process::Stdio, sync::Arc};
 
 use anyhow::{Result, bail};
+use tokio::sync::mpsc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -93,6 +95,16 @@ pub trait Tool: Send + Sync {
         false
     }
     async fn run(&self, args: Value) -> Result<ToolResult>;
+    /// Runs the tool, forwarding partial output to `sink` as it appears.
+    /// The sink is best effort: a dropped or capped sink is silently ignored.
+    async fn run_streamed(
+        &self,
+        args: Value,
+        sink: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<ToolResult> {
+        drop(sink);
+        self.run(args).await
+    }
     async fn shutdown(&self) {}
 }
 

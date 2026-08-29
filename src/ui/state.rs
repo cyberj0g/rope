@@ -1178,6 +1178,20 @@ impl UiState {
                 self.tool_running = true;
                 self.set_tool_status(&call_id, ToolStatus::Running);
             }
+            Event::ToolOutputDelta { call_id, delta } => {
+                if let Some(block) = self.tool_calls.get(&call_id).copied()
+                    && let ChatBlock::Tool {
+                        output,
+                        status,
+                        counter,
+                        ..
+                    } = &mut self.blocks[block]
+                    && matches!(status, ToolStatus::Running)
+                {
+                    counter.push(&delta);
+                    output.get_or_insert_with(String::new).push_str(&delta);
+                }
+            }
             Event::ToolResult {
                 call_id,
                 output,
@@ -1195,6 +1209,9 @@ impl UiState {
                         ..
                     } = &mut self.blocks[block]
                 {
+                    // The counter already tallied streamed deltas; recount
+                    // from the final (possibly truncated) output.
+                    *counter = ToolCounter::default();
                     counter.push(&output);
                     elapsed.finish();
                     *block_output = Some(output);
@@ -1279,8 +1296,11 @@ impl UiState {
                         )
                     {
                         *status = ToolStatus::Failed;
-                        counter.push(CANCELLED_BY_USER);
-                        *output = Some(CANCELLED_BY_USER.into());
+                        // Keep any output the tool already streamed.
+                        if output.is_none() {
+                            *output = Some(CANCELLED_BY_USER.into());
+                            counter.push(CANCELLED_BY_USER);
+                        }
                         elapsed.finish();
                     }
                 }
@@ -1889,6 +1909,111 @@ mod tests {
                 expanded: false,
                 ..
             } if output == "contents"
+        ));
+    }
+
+    #[test]
+    fn tool_output_deltas_stream_into_the_running_block() {
+        let mut state = UiState::new();
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("shell".into()),
+            arguments: r#"{"command":"build"}"#.into(),
+        });
+        state.apply(Event::ToolCallFinished {
+            index: 0,
+            call: ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: json!({}),
+            },
+        });
+        state.apply(Event::ToolStarted {
+            call_id: "call_1".into(),
+        });
+        state.apply(Event::ToolOutputDelta {
+            call_id: "call_1".into(),
+            delta: "step one\n".into(),
+        });
+        state.apply(Event::ToolOutputDelta {
+            call_id: "call_1".into(),
+            delta: "step two".into(),
+        });
+
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool {
+                output: Some(output),
+                status: ToolStatus::Running,
+                counter,
+                ..
+            } if output == "step one\nstep two" && counter.label() == "2 lines"
+        ));
+
+        state.apply(Event::ToolResult {
+            call_id: "call_1".into(),
+            output: "final\nresult".into(),
+            success: true,
+            diff: None,
+        });
+
+        // The counter recounts the final output instead of stacking on the
+        // streamed character count.
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool {
+                output: Some(output),
+                status: ToolStatus::Done,
+                counter,
+                ..
+            } if output == "final\nresult" && counter.label() == "2 lines"
+        ));
+
+        // A delta arriving after the result is ignored.
+        state.apply(Event::ToolOutputDelta {
+            call_id: "call_1".into(),
+            delta: "late".into(),
+        });
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool { output: Some(output), .. } if output == "final\nresult"
+        ));
+    }
+
+    #[test]
+    fn cancellation_preserves_streamed_tool_output() {
+        let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("shell".into()),
+            arguments: "{}".into(),
+        });
+        state.apply(Event::ToolCallFinished {
+            index: 0,
+            call: ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: json!({}),
+            },
+        });
+        state.apply(Event::ToolStarted {
+            call_id: "call_1".into(),
+        });
+        state.apply(Event::ToolOutputDelta {
+            call_id: "call_1".into(),
+            delta: "partial output".into(),
+        });
+
+        state.apply(Event::GenerationCancelled);
+
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool {
+                output: Some(output),
+                status: ToolStatus::Failed,
+                ..
+            } if output == "partial output"
         ));
     }
 

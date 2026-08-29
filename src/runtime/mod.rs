@@ -160,6 +160,10 @@ pub enum Event {
         call_id: String,
     },
     ApprovalRequested(ToolCall),
+    ToolOutputDelta {
+        call_id: String,
+        delta: String,
+    },
     ToolResult {
         call_id: String,
         output: String,
@@ -1030,6 +1034,15 @@ async fn agent<P: Provider>(
                     decision.await.unwrap_or(ApprovalDecision::Deny) != ApprovalDecision::Deny
                 }
             };
+            // The streaming cap mirrors the final truncation, so the chat
+            // never shows output the model context will keep beyond it.
+            let output_tokens = config
+                .active_model()
+                .max_context_tokens
+                .saturating_sub(used_context_tokens)
+                / 5;
+            let max_streamed_bytes =
+                output_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
             let result = if approved {
                 events
                     .send(Event::ToolStarted {
@@ -1037,7 +1050,20 @@ async fn agent<P: Provider>(
                     })
                     .await
                     .ok();
-                entry.tool.run(call.arguments.clone()).await
+                let (delta_tx, delta_rx) = mpsc::unbounded_channel();
+                let forward = tokio::spawn(forward_tool_output_deltas(
+                    call.id.clone(),
+                    delta_rx,
+                    max_streamed_bytes,
+                    events.clone(),
+                ));
+                let result = entry
+                    .tool
+                    .run_streamed(call.arguments.clone(), Some(delta_tx))
+                    .await;
+                // Let in-flight deltas land before the final result.
+                forward.await.ok();
+                result
             } else {
                 bail_tool_denied(&call.name)
             };
@@ -1045,11 +1071,6 @@ async fn agent<P: Provider>(
                 Ok(result) => (result.output, result.image, result.diff, true),
                 Err(error) => (format!("Error: {error:#}"), None, None, false),
             };
-            let output_tokens = config
-                .active_model()
-                .max_context_tokens
-                .saturating_sub(used_context_tokens)
-                / 5;
             let output = truncate_tool_output(output, output_tokens);
             events
                 .send(Event::ToolResult {
@@ -1094,6 +1115,31 @@ fn available_context_tokens(
         .active_model()
         .max_context_tokens
         .saturating_sub(estimate_tokens(&context))
+}
+
+/// Forwards partial tool output to the UI until the streamed byte budget is
+/// exhausted. The sender is dropped when the tool finishes, which ends the loop.
+async fn forward_tool_output_deltas(
+    call_id: String,
+    mut deltas: mpsc::UnboundedReceiver<String>,
+    max_bytes: usize,
+    events: mpsc::Sender<Event>,
+) {
+    let mut forwarded = 0usize;
+    while let Some(delta) = deltas.recv().await {
+        if forwarded >= max_bytes {
+            break;
+        }
+        let length = delta.len();
+        events
+            .send(Event::ToolOutputDelta {
+                call_id: call_id.clone(),
+                delta,
+            })
+            .await
+            .ok();
+        forwarded = forwarded.saturating_add(length);
+    }
 }
 
 fn truncate_tool_output(mut output: String, max_tokens: u64) -> String {
@@ -1284,6 +1330,43 @@ mod tests {
         }
     }
 
+    struct SlowEcho(Vec<String>);
+
+    #[async_trait]
+    impl Tool for SlowEcho {
+        fn name(&self) -> &str {
+            "slow_echo"
+        }
+        fn description(&self) -> &str {
+            "echo in chunks"
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(&self, _args: Value) -> Result<ToolResult> {
+            self.run_streamed(_args, None).await
+        }
+        async fn run_streamed(
+            &self,
+            _args: Value,
+            sink: Option<mpsc::UnboundedSender<String>>,
+        ) -> Result<ToolResult> {
+            let mut output = String::new();
+            for chunk in &self.0 {
+                if let Some(sink) = &sink {
+                    sink.send(chunk.clone()).ok();
+                }
+                output.push_str(chunk);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Ok(ToolResult {
+                output,
+                image: None,
+                diff: None,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn runtime_streams_mock_response_without_a_terminal() {
         let provider = Arc::new(MockProvider::new(vec![vec![
@@ -1449,6 +1532,134 @@ mod tests {
             event_rx.recv().await,
             Some(Event::ToolCallFinished { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_streams_tool_output_deltas_before_the_result() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("slow_echo".into()),
+                arguments: "{}".into(),
+            }],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(
+            SlowEcho(vec!["al".into(), "pha".into(), "beta".into()]),
+            Approval::Allow,
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        let completed = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            &completed[2],
+            Message::Tool { content, .. } if content == "alphabeta"
+        ));
+
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                let done = matches!(&event, Event::ToolResult { .. });
+                events.push(event);
+                if done {
+                    break;
+                }
+            }
+            events
+        })
+        .await
+        .expect("tool result event");
+
+        let sequence: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolStarted { call_id } if call_id == "call_1" => Some("started"),
+                Event::ToolOutputDelta { call_id, .. } if call_id == "call_1" => Some("delta"),
+                Event::ToolResult { call_id, .. } if call_id == "call_1" => Some("result"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sequence, ["started", "delta", "delta", "delta", "result"]);
+        let streamed: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolOutputDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "alphabeta");
+    }
+
+    #[tokio::test]
+    async fn tool_output_streaming_stops_at_the_truncation_cap() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("slow_echo".into()),
+                    arguments: "{}".into(),
+                },
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 0,
+                    total_tokens: 80,
+                }),
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(SlowEcho(vec!["12345678".into(); 3]), Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 100;
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (internal_tx, mut internal_rx) = mpsc::channel(2);
+
+        agent(
+            provider,
+            &tools,
+            &config,
+            vec![Message::user("run it".into())],
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        internal_rx.recv().await;
+        let mut streamed = String::new();
+        loop {
+            match event_rx
+                .recv()
+                .await
+                .expect("events closed before the tool result")
+            {
+                Event::ToolOutputDelta { delta, .. } => streamed.push_str(&delta),
+                Event::ToolResult { .. } => break,
+                _ => {}
+            }
+        }
+        // The budget is (100 - 80) / 5 = 4 tokens = 16 bytes: exactly two
+        // eight-byte chunks are forwarded.
+        assert_eq!(streamed, "1234567812345678");
     }
 
     #[tokio::test]

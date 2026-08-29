@@ -36,20 +36,21 @@
 ## Tools
 
 - iterative model → tool → model execution, with the 64 tool call cap applied per assistant message so long turns keep running instead of failing after a fixed number of model turns
-- immediate Escape cancellation with force-killed child processes, preserved partial output, failed in-flight tools, and a persisted cancellation marker
+- immediate Escape cancellation with force-killed child processes, preserved partial model and command output, failed in-flight tools, and a persisted cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
 - configurable context fill tracking and automatic continuation compaction that replays the persisted summary into model context
 - preserved visible transcripts with persisted `Context compacted` markers whose summary stays in history as a collapsed chat section
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - tool approval controls in the composer with paused execution timing across batched calls, session-persisted approvals, and decision markers retained in conversation history
 - built-in `read`, `write`, `edit`, `shell`, `search_files`, and `list_files` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks
+- live `shell` output read from both pipes as the command runs, with stdout and stderr interleaved in arrival order and a UTF-8-safe decoder for split multi-byte sequences
+- per-call tool output capped at roughly one fifth of the available model context with an explicit truncation marker, and live `shell` output streaming bounded by the same cap
 - persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes
 - Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a shared headless Chromium context, version-matched browser identity, a process-lifetime profile, automatic cookie-popup opt-out via DuckDuckGo AutoConsent, and a `ROPE_BROWSER` override
 - text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links, a shared browser session, and no model-controlled truncation
 - reproducible, checksum-verified Node, Patchright, and AutoConsent runtime embedding with lazy versioned extraction on first browser use
 - eager Patchright extraction plus Chrome/Chromium diagnostics during first-run setup, including `ROPE_BROWSER` override guidance
 - automatic post-consumption `web_browser` result ejection from model context while retaining the full visible and persisted transcript
-- per-call tool output capped at roughly one fifth of the available model context with an explicit truncation marker
 - multimodal `view_image` tool advertised only by vision-enabled model profiles
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
 - executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`
@@ -66,8 +67,8 @@ External tools receive their function arguments as JSON on stdin and must return
 - original soft line breaks preserved when rendering user messages
 - sequential duplicate filtering in persistent prompt history
 - CommonMark/GFM rendering with inline emphasis, links, aligned tables, and syntax-colored fenced code blocks
-- streamed tool-call arguments, line-break-preserving results, and approval prompts
-- live tool counters that switch from characters to lines after the first literal or escaped line break
+- streamed tool-call arguments, live shell output while the command runs, line-break-preserving results, and approval prompts
+- live tool counters that switch from characters to lines after the first literal or escaped line break, counting streamed output as it arrives
 - streamed and persisted reasoning blocks (`reasoning` and legacy `reasoning_content`)
 - collapsible messages plus collapsed-by-default thinking and tool sections; right-clicking anywhere in an expanded section collapses it
 - live elapsed time on thinking and tool calls with compact duration units

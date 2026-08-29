@@ -1,6 +1,7 @@
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
+    process::Stdio,
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,7 +10,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use similar::TextDiff;
-use tokio::process::Command;
+use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
 
 use super::{ExecutionPlan, PlanStatus, Tool, ToolResult};
 
@@ -192,6 +193,13 @@ impl Tool for ShellTool {
         object(json!({ "command": { "type": "string" } }), &["command"])
     }
     async fn run(&self, args: Value) -> Result<ToolResult> {
+        self.run_streamed(args, None).await
+    }
+    async fn run_streamed(
+        &self,
+        args: Value,
+        sink: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<ToolResult> {
         #[derive(Deserialize)]
         struct Args {
             command: String,
@@ -202,19 +210,102 @@ impl Tool for ShellTool {
             .kill_on_drop(true)
             .arg("-c")
             .arg(args.command)
-            .current_dir(&self.0);
-        let output = command.output().await?;
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        if !output.status.success() {
-            bail!("command exited with {}\n{text}", output.status);
+            .current_dir(&self.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().context("spawn shell command")?;
+        let mut stdout = child.stdout.take().context("open command stdout")?;
+        let mut stderr = child.stderr.take().context("open command stderr")?;
+        let mut output = String::new();
+        let mut stdout_leftover = Vec::new();
+        let mut stderr_leftover = Vec::new();
+        let mut stdout_buf = vec![0u8; 8192];
+        let mut stderr_buf = vec![0u8; 8192];
+        let (mut stdout_done, mut stderr_done) = (false, false);
+        while !stdout_done || !stderr_done {
+            tokio::select! {
+                read = stdout.read(&mut stdout_buf), if !stdout_done => match read {
+                    Ok(0) => stdout_done = true,
+                    Ok(len) => stream_decode(
+                        &mut stdout_leftover,
+                        &stdout_buf[..len],
+                        &mut output,
+                        &sink,
+                    ),
+                    Err(error) => return Err(error).context("read command stdout"),
+                },
+                read = stderr.read(&mut stderr_buf), if !stderr_done => match read {
+                    Ok(0) => stderr_done = true,
+                    Ok(len) => stream_decode(
+                        &mut stderr_leftover,
+                        &stderr_buf[..len],
+                        &mut output,
+                        &sink,
+                    ),
+                    Err(error) => return Err(error).context("read command stderr"),
+                },
+            }
+        }
+        let status = child.wait().await?;
+        // Flush any trailing partial sequence held back for a read that
+        // never comes.
+        for leftover in [&mut stdout_leftover, &mut stderr_leftover] {
+            let text = String::from_utf8_lossy(leftover).into_owned();
+            leftover.clear();
+            if !text.is_empty() {
+                output.push_str(&text);
+                if let Some(sink) = &sink {
+                    sink.send(text).ok();
+                }
+            }
+        }
+        if !status.success() {
+            bail!("command exited with {status}\n{output}");
         }
         Ok(ToolResult {
-            output: text,
+            output,
             image: None,
             diff: None,
         })
     }
+}
+
+/// Decodes the settleable prefix of a pipe read, appends it to `output`,
+/// forwards it to `sink`, and carries any trailing partial multi-byte
+/// sequence into `leftover` for the next read.
+fn stream_decode(
+    leftover: &mut Vec<u8>,
+    chunk: &[u8],
+    output: &mut String,
+    sink: &Option<mpsc::UnboundedSender<String>>,
+) {
+    let text = decode_utf8(leftover, chunk);
+    if text.is_empty() {
+        return;
+    }
+    output.push_str(&text);
+    if let Some(sink) = sink {
+        sink.send(text).ok();
+    }
+}
+
+/// Decodes the longest prefix of `leftover + chunk` that can be settled now,
+/// carrying at most the trailing incomplete character (three bytes) into
+/// `leftover`. Invalid bytes are emitted lossy once they can no longer join
+/// a pending sequence.
+fn decode_utf8(leftover: &mut Vec<u8>, chunk: &[u8]) -> String {
+    leftover.extend_from_slice(chunk);
+    // A valid UTF-8 sequence is at most four bytes, so only the tail can
+    // still change.
+    let min_take = leftover.len().saturating_sub(4);
+    let take = (min_take..=leftover.len())
+        .rev()
+        .find(|end| std::str::from_utf8(&leftover[..*end]).is_ok())
+        .unwrap_or(min_take);
+    let text = String::from_utf8_lossy(&leftover[..take]).into_owned();
+    leftover.drain(..take);
+    text
 }
 
 #[async_trait]
@@ -648,6 +739,71 @@ mod tests {
         }
 
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_streams_output_while_the_command_runs() {
+        let tool = ShellTool(std::env::temp_dir().clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut run = Box::pin(tool.run_streamed(
+            json!({ "command": "printf a; sleep 0.2; printf b; sleep 0.2; printf c >&2" }),
+            Some(tx),
+        ));
+        let mut streamed = String::new();
+        let (result, streamed_before_finish) = loop {
+            tokio::select! {
+                result = &mut run => break (result, streamed.len()),
+                Some(delta) = rx.recv() => streamed.push_str(&delta),
+            }
+        };
+        let result = result.unwrap();
+        while let Ok(delta) = rx.try_recv() {
+            streamed.push_str(&delta);
+        }
+
+        assert!(
+            streamed_before_finish > 0,
+            "expected output while the command was still running"
+        );
+        assert_eq!(streamed, "abc");
+        assert_eq!(result.output, "abc");
+    }
+
+    #[tokio::test]
+    async fn shell_reports_nonzero_exit_with_the_collected_output() {
+        let tool = ShellTool(std::env::temp_dir().clone());
+        let error = tool
+            .run(json!({ "command": "echo boom; exit 3" }))
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("exited with"));
+        assert!(message.contains("boom"));
+    }
+
+    #[test]
+    fn utf8_decoder_carries_partial_characters_across_reads() {
+        let mut leftover: Vec<u8> = Vec::new();
+        let bytes = "héllo".as_bytes();
+
+        assert_eq!(decode_utf8(&mut leftover, &bytes[..2]), "h");
+        assert_eq!(leftover, vec![0xC3]);
+        assert_eq!(decode_utf8(&mut leftover, &bytes[2..]), "éllo");
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn utf8_decoder_emits_invalid_bytes_lossy_once_settled() {
+        let mut leftover: Vec<u8> = Vec::new();
+
+        assert_eq!(decode_utf8(&mut leftover, &[0xFF, 0x61]), "");
+        assert_eq!(
+            decode_utf8(&mut leftover, &[0x62, 0x63, 0x64, 0x65]),
+            "\u{FFFD}a"
+        );
+        assert_eq!(decode_utf8(&mut leftover, &[0x66]), "bcdef");
+        assert!(leftover.is_empty());
     }
 
     #[test]
