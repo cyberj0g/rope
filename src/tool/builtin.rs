@@ -106,19 +106,49 @@ impl Tool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a UTF-8 file"
+        "Read a UTF-8 file, optionally selecting a line range"
     }
     fn schema(&self) -> Value {
-        object(json!({ "path": { "type": "string" } }), &["path"])
+        object(
+            json!({
+                "path": { "type": "string" },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based line to start reading from (default: 1)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of lines to return (default: read to end)"
+                }
+            }),
+            &["path"],
+        )
     }
     async fn run(&self, args: Value) -> Result<ToolResult> {
         #[derive(Deserialize)]
         struct Args {
             path: String,
+            offset: Option<usize>,
+            limit: Option<usize>,
         }
         let args: Args = serde_json::from_value(args)?;
+        let offset = args.offset.unwrap_or(1);
+        if offset == 0 {
+            bail!("offset must be at least 1");
+        }
+        if args.limit == Some(0) {
+            bail!("limit must be at least 1");
+        }
+        let content = tokio::fs::read_to_string(path(&self.0, &args.path)).await?;
+        let output = content
+            .split_inclusive('\n')
+            .skip(offset - 1)
+            .take(args.limit.unwrap_or(usize::MAX))
+            .collect();
         Ok(ToolResult {
-            output: tokio::fs::read_to_string(path(&self.0, &args.path)).await?,
+            output,
             image: None,
             diff: None,
         })
@@ -1491,6 +1521,51 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[tokio::test]
+    async fn read_selects_line_ranges() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-read-range-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("lines.txt"), "one\ntwo\nthree\nfour")
+            .await
+            .unwrap();
+        let read = ReadTool(root.clone());
+
+        assert_eq!(
+            read.run(json!({ "path": "lines.txt" }))
+                .await
+                .unwrap()
+                .output,
+            "one\ntwo\nthree\nfour"
+        );
+        assert_eq!(
+            read.run(json!({ "path": "lines.txt", "offset": 2, "limit": 2 }))
+                .await
+                .unwrap()
+                .output,
+            "two\nthree\n"
+        );
+        assert_eq!(
+            read.run(json!({ "path": "lines.txt", "offset": 4 }))
+                .await
+                .unwrap()
+                .output,
+            "four"
+        );
+
+        let schema = read.schema();
+        assert_eq!(schema["properties"]["offset"]["minimum"], 1);
+        assert_eq!(schema["properties"]["limit"]["minimum"], 1);
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[tokio::test]
     async fn write_and_edit_return_only_their_file_diff() {

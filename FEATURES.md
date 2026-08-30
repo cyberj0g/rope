@@ -35,6 +35,7 @@
 
 ## Tools
 
+- UTF-8 file reads with optional 1-based line offsets and line limits
 - iterative model → tool → model execution, with the 64 tool call cap applied per assistant message so long turns keep running instead of failing after a fixed number of model turns
 - immediate Escape cancellation with force-killed command process trees, preserved partial model and command output, failed in-flight tools, and a persisted cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
