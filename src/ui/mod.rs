@@ -142,6 +142,119 @@ struct MouseAreas {
     input: Rect,
 }
 
+/// Per-block memoized chat rendering. Layouts cost O(total chat text) when
+/// cold, so each block's wrapped body lines are cached and only rebuilt when
+/// the block's revision, width, or expansion changes.
+struct ChatRenderCache {
+    generation: u64,
+    blocks: Vec<RenderedBlock>,
+}
+
+impl ChatRenderCache {
+    fn new() -> Self {
+        Self {
+            generation: 0,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Keeps the cache aligned with `UiState::blocks`. A generation change
+    /// (history reload, compaction insert) misaligns per-index entries, so
+    /// the cache is dropped then.
+    fn sync(&mut self, state: &UiState) {
+        if self.generation != state.layout_generation {
+            self.blocks.clear();
+            self.generation = state.layout_generation;
+        }
+        if self.blocks.len() != state.blocks.len() {
+            self.blocks
+                .resize(state.blocks.len(), RenderedBlock::default());
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct RenderedBlock {
+    revision: u64,
+    width: u16,
+    image_max_height: u16,
+    expanded: bool,
+    /// Wrapped body lines (everything below the header, without the
+    /// separator), valid while `revision`, `width`, `image_max_height`, and
+    /// `expanded` match the block.
+    lines: Vec<Line<'static>>,
+    /// `(image index, row within `lines`, cell width, cell height)` for each
+    /// reserved image placeholder.
+    images: Vec<(usize, u16, u16, u16)>,
+    /// `chars().count()` of the block's displayed body text, for the
+    /// `N chars` header labels.
+    char_count: usize,
+    /// Parsed tool-argument summary, for the tool header.
+    argument_summary: String,
+}
+
+/// Memoized diff line rendering for the git pane and fullscreen diff, which
+/// would otherwise re-color every line of the diff on each frame.
+struct DiffMemo {
+    generation: u64,
+    fullscreen: bool,
+    lines: Vec<Line<'static>>,
+}
+
+impl Default for DiffMemo {
+    fn default() -> Self {
+        // A generation no state can match until the first `get`.
+        Self {
+            generation: u64::MAX,
+            fullscreen: false,
+            lines: Vec::new(),
+        }
+    }
+}
+
+impl DiffMemo {
+    fn get(&mut self, state: &UiState, fullscreen: bool) -> &Vec<Line<'static>> {
+        if self.generation != state.diff_generation || self.fullscreen != fullscreen {
+            self.lines = if fullscreen {
+                if state.fullscreen_tool_diff.is_some() || state.project.git_available {
+                    diff_lines(state.fullscreen_diff())
+                } else {
+                    vec![Line::styled(
+                        " not a Git repository",
+                        Style::default().fg(Color::DarkGray),
+                    )]
+                }
+            } else {
+                diff_lines(&state.project.git_diff)
+            };
+            self.generation = state.diff_generation;
+            self.fullscreen = fullscreen;
+        }
+        &self.lines
+    }
+}
+
+/// Everything the frame loop memoizes between redraws.
+struct RenderState {
+    chat: ChatRenderCache,
+    diff: DiffMemo,
+    images: ImageRenderer,
+}
+
+/// A raw (pre-wrapping) image placeholder: `(image index, line, cell width,
+/// cell height)`.
+type RawImageCell = (usize, usize, u16, u16);
+
+impl RenderState {
+    fn new() -> Self {
+        Self {
+            chat: ChatRenderCache::new(),
+            diff: DiffMemo::default(),
+            images: ImageRenderer::new(),
+        }
+    }
+}
+
 const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/new",
@@ -213,7 +326,7 @@ pub async fn run(
 ) -> Result<SessionSummary> {
     let mut history = PromptHistory::load().await?;
     let mut terminal = TerminalGuard::new()?;
-    let mut images = ImageRenderer::new();
+    let mut renders = RenderState::new();
     let mut state = UiState::new();
     state.recent_models.clone_from(&config.recent_models);
     state.recent_commands.clone_from(&config.recent_commands);
@@ -221,71 +334,82 @@ pub async fn run(
     let (input_load_tx, mut input_load_rx) = mpsc::unbounded_channel();
     let mut chat_height = 0;
     let mut chat_size = None;
+    let mut needs_redraw = true;
     loop {
-        if !images.detected && state.has_chat_images() {
-            images.detect();
-            state.image_cell_size = images.font_size();
-        }
         let size = terminal.terminal.size()?;
-        state.expire_toast();
-        if state.git_fullscreen_diff {
-            state.git_diff_scroll = state
-                .git_diff_scroll
-                .min(git_diff_max_scroll(&state, size.height));
-        }
+        let toast_expired = state.expire_toast();
         let page = Rect::new(0, 0, size.width, size.height);
-        let body = page_areas(page, &state)[1];
-        let (git, plan) = side_areas(body, &state);
-        if let Some(area) = git {
-            state.git_status_scroll = state
-                .git_status_scroll
-                .min(git_status_max_scroll(&state, area.height));
-            state.git_panel_diff_scroll = state
-                .git_panel_diff_scroll
-                .min(git_panel_diff_max_scroll(&state, area.height));
-        }
-        if let Some(area) = plan {
-            state.plan_scroll = state.plan_scroll.min(plan_max_scroll(&state, area.height));
-        }
         let chat = conversation_viewport_area(page, &state);
-        let current_chat_size = (chat.width, chat.height);
-        if state.git_fullscreen_diff && chat_size != Some(current_chat_size) {
-            chat_height = chat_layout(&state, chat).lines.len();
+        // Redraw when something changed, or while the display contains
+        // anything that ticks on its own (live timers, speed, toasts).
+        if needs_redraw || state.is_live() || toast_expired {
+            if !renders.images.detected && state.has_chat_images() {
+                renders.images.detect();
+                state.image_cell_size = renders.images.font_size();
+            }
+            if state.git_fullscreen_diff {
+                state.git_diff_scroll = state.git_diff_scroll.min(git_diff_max_scroll(
+                    &state,
+                    size.height,
+                    &mut renders.diff,
+                ));
+            }
+            let body = page_areas(page, &state)[1];
+            let (git, plan) = side_areas(body, &state);
+            if let Some(area) = git {
+                state.git_status_scroll = state
+                    .git_status_scroll
+                    .min(git_status_max_scroll(&state, area.height));
+                state.git_panel_diff_scroll = state.git_panel_diff_scroll.min(
+                    git_panel_diff_max_scroll(&state, area.height, &mut renders.diff),
+                );
+            }
+            if let Some(area) = plan {
+                state.plan_scroll = state.plan_scroll.min(plan_max_scroll(&state, area.height));
+            }
+            let current_chat_size = (chat.width, chat.height);
+            if state.git_fullscreen_diff && chat_size != Some(current_chat_size) {
+                chat_height = chat_layout(&state, chat, &mut renders.chat).lines.len();
+            }
+            state.scroll = state.scroll.min(state.chat_scroll_max);
+            if !state.git_fullscreen_diff {
+                ensure_selected_visible(&mut state, chat, &mut renders.chat);
+            }
+            let mut rendered_chat_height = 0;
+            terminal.terminal.draw(|frame| {
+                rendered_chat_height = draw(frame, &config, &state, chat_height, &mut renders)
+            })?;
+            if !state.git_fullscreen_diff {
+                chat_height = rendered_chat_height;
+            }
+            chat_size = Some(current_chat_size);
+            set_chat_scroll_max(&mut state, chat.height, chat_height);
+            needs_redraw = false;
         }
-        state.scroll = state.scroll.min(state.chat_scroll_max);
-        if !state.git_fullscreen_diff {
-            ensure_selected_visible(&mut state, chat);
-        }
-        let mut rendered_chat_height = 0;
-        terminal.terminal.draw(|frame| {
-            rendered_chat_height = draw(frame, &config, &state, chat_height, &mut images)
-        })?;
-        if !state.git_fullscreen_diff {
-            chat_height = rendered_chat_height;
-        }
-        chat_size = Some(current_chat_size);
-        set_chat_scroll_max(&mut state, chat.height, chat_height);
         tokio::select! {
             event = events.recv() => if let Some(event) = event {
                 let history_loaded = matches!(&event, Event::History(_));
-                chat_height = apply_runtime_event(&mut state, event, chat, chat_height);
+                chat_height = apply_runtime_event(&mut state, event, chat, chat_height, &mut renders);
                 if history_loaded && let Some(request) = request.take() {
                     submit(request, Vec::new(), &mut state, &mut history, &commands).await?;
                 }
+                needs_redraw = true;
             },
             load = input_load_rx.recv() => if let Some(load) = load {
                 apply_input_load(load, &config, &mut state);
+                needs_redraw = true;
             },
             _ = tokio::time::sleep(Duration::from_millis(25)) => {
                 while event::poll(Duration::ZERO)? {
                     match event::read()? {
                         TerminalEvent::Key(key) if key.kind == KeyEventKind::Press => {
                             let page = Rect::new(0, 0, size.width, size.height);
-                            if handle_key(key, page, &config, &mut state, &mut history, &commands, &input_load_tx).await? {
+                            if handle_key(key, page, &config, &mut state, &mut history, &commands, &input_load_tx, &mut renders).await? {
                                 let (reply, summary) = tokio::sync::oneshot::channel();
                                 commands.send(Command::Shutdown(reply)).await?;
                                 return summary.await.context("runtime stopped before shutdown");
                             }
+                            needs_redraw = true;
                         }
                         TerminalEvent::Mouse(mouse) => {
                             let size = terminal.terminal.size()?;
@@ -306,7 +430,9 @@ pub async fn run(
                                     input,
                                 },
                                 &commands,
+                                &mut renders,
                             ).await?;
+                            needs_redraw = true;
                         }
                         TerminalEvent::Paste(text) => {
                             let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -321,12 +447,16 @@ pub async fn run(
                                 search.cursor += text.len();
                                 search.current = 0;
                                 let area = conversation_viewport_area(page, &state);
-                                search_chat(&mut state, area, false);
+                                search_chat(&mut state, area, false, &mut renders.chat);
                             } else {
                                 history.reset_navigation();
                                 state.insert_paste(&text, config.paste_collapse_chars);
                                 state.palette_selected = 0;
                             }
+                            needs_redraw = true;
+                        }
+                        TerminalEvent::Resize(_, _) => {
+                            needs_redraw = true;
                         }
                         _ => {}
                     }
@@ -336,7 +466,13 @@ pub async fn run(
     }
 }
 
-fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height: usize) -> usize {
+fn apply_runtime_event(
+    state: &mut UiState,
+    event: Event,
+    chat: Rect,
+    old_height: usize,
+    renders: &mut RenderState,
+) -> usize {
     let preserve_viewport = old_height > 0
         && state.scroll > 0
         && matches!(
@@ -363,7 +499,7 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
                 | Event::Error(_)
         );
     state.apply(event);
-    let new_height = chat_layout(state, chat).lines.len();
+    let new_height = chat_layout(state, chat, &mut renders.chat).lines.len();
     if preserve_viewport {
         if new_height >= old_height {
             let delta = u16::try_from(new_height - old_height).unwrap_or(u16::MAX);
@@ -377,6 +513,7 @@ fn apply_runtime_event(state: &mut UiState, event: Event, chat: Rect, old_height
     new_height
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_key(
     key: KeyEvent,
     screen: Rect,
@@ -385,11 +522,12 @@ async fn handle_key(
     history: &mut PromptHistory,
     commands: &mpsc::Sender<Command>,
     input_loads: &mpsc::UnboundedSender<InputLoad>,
+    renders: &mut RenderState,
 ) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
-    if handle_fullscreen_diff_key(key, state, screen.height) {
+    if handle_fullscreen_diff_key(key, state, screen.height, &mut renders.diff) {
         return Ok(false);
     }
     if let Some(call) = &state.approval {
@@ -438,18 +576,18 @@ async fn handle_key(
         let area = conversation_viewport_area(screen, state);
         match key.code {
             KeyCode::Esc => state.search = None,
-            KeyCode::F(3) | KeyCode::Enter => search_chat(state, area, true),
+            KeyCode::F(3) | KeyCode::Enter => search_chat(state, area, true, &mut renders.chat),
             KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
                 let search = state.search.as_mut().unwrap();
                 search.delete_word_back();
                 search.current = 0;
-                search_chat(state, area, false);
+                search_chat(state, area, false, &mut renders.chat);
             }
             KeyCode::Backspace => {
                 let search = state.search.as_mut().unwrap();
                 search.backspace();
                 search.current = 0;
-                search_chat(state, area, false);
+                search_chat(state, area, false, &mut renders.chat);
             }
             KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
                 state.search.as_mut().unwrap().move_word_left();
@@ -463,7 +601,7 @@ async fn handle_key(
                 let search = state.search.as_mut().unwrap();
                 search.insert_char(character);
                 search.current = 0;
-                search_chat(state, area, false);
+                search_chat(state, area, false, &mut renders.chat);
             }
             _ => {}
         }
@@ -489,7 +627,11 @@ async fn handle_key(
             KeyCode::Down => state.select_next(),
             KeyCode::Enter | KeyCode::Char(' ') => {
                 state.toggle_selected();
-                clamp_chat_scroll(state, conversation_viewport_area(screen, state));
+                clamp_chat_scroll(
+                    state,
+                    conversation_viewport_area(screen, state),
+                    &mut renders.chat,
+                );
             }
             KeyCode::PageUp => scroll_chat_up(state, 8),
             KeyCode::PageDown => scroll_chat_down(state, 8),
@@ -632,6 +774,7 @@ async fn handle_key(
 }
 
 fn push_tool_decision(state: &mut UiState, label: &str, content: String) {
+    state.render_revisions.push(0);
     state.blocks.push(ChatBlock::Message {
         label: label.into(),
         content,
@@ -757,7 +900,12 @@ fn filtered_model_indices(config: &Config, state: &UiState) -> Vec<usize> {
     indices
 }
 
-fn handle_fullscreen_diff_key(key: KeyEvent, state: &mut UiState, screen_height: u16) -> bool {
+fn handle_fullscreen_diff_key(
+    key: KeyEvent,
+    state: &mut UiState,
+    screen_height: u16,
+    diff: &mut DiffMemo,
+) -> bool {
     if !state.git_fullscreen_diff {
         return false;
     }
@@ -770,7 +918,7 @@ fn handle_fullscreen_diff_key(key: KeyEvent, state: &mut UiState, screen_height:
             state.git_diff_scroll = state
                 .git_diff_scroll
                 .saturating_add(8)
-                .min(git_diff_max_scroll(state, screen_height))
+                .min(git_diff_max_scroll(state, screen_height, diff))
         }
         _ => {}
     }
@@ -987,6 +1135,7 @@ async fn handle_mouse(
     state: &mut UiState,
     areas: MouseAreas,
     commands: &mpsc::Sender<Command>,
+    renders: &mut RenderState,
 ) -> Result<()> {
     if state.model_picker.is_some() {
         return Ok(());
@@ -1005,10 +1154,15 @@ async fn handle_mouse(
                 state.git_diff_scroll = state.git_diff_scroll.saturating_sub(3)
             }
             MouseEventKind::ScrollDown => {
-                state.git_diff_scroll = state
-                    .git_diff_scroll
-                    .saturating_add(3)
-                    .min(git_diff_max_scroll(state, conversation.height))
+                state.git_diff_scroll =
+                    state
+                        .git_diff_scroll
+                        .saturating_add(3)
+                        .min(git_diff_max_scroll(
+                            state,
+                            conversation.height,
+                            &mut renders.diff,
+                        ))
             }
             _ => {}
         }
@@ -1099,10 +1253,15 @@ async fn handle_mouse(
                 state.git_panel_diff_scroll = state.git_panel_diff_scroll.saturating_sub(3);
             }
             MouseEventKind::ScrollDown if state.git_diff_mode => {
-                state.git_panel_diff_scroll = state
-                    .git_panel_diff_scroll
-                    .saturating_add(3)
-                    .min(git_panel_diff_max_scroll(state, area.height));
+                state.git_panel_diff_scroll =
+                    state
+                        .git_panel_diff_scroll
+                        .saturating_add(3)
+                        .min(git_panel_diff_max_scroll(
+                            state,
+                            area.height,
+                            &mut renders.diff,
+                        ));
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let row = mouse.row.saturating_sub(area.y + 1) as usize;
@@ -1149,19 +1308,33 @@ async fn handle_mouse(
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Right) => {
-            if let Some(index) = chat_section_hit_test(state, conversation, mouse.row) {
+            if let Some(index) =
+                chat_section_hit_test(state, conversation, mouse.row, &mut renders.chat)
+            {
                 state.collapse(index);
-                clamp_chat_scroll(state, conversation);
+                clamp_chat_scroll(state, conversation, &mut renders.chat);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(diff) = chat_diff_hit_test(state, conversation, mouse.column, mouse.row) {
+            if let Some(diff) = chat_diff_hit_test(
+                state,
+                conversation,
+                mouse.column,
+                mouse.row,
+                &mut renders.chat,
+            ) {
                 state.text_selection = None;
                 state.selection_anchor = None;
                 state.open_fullscreen_tool_diff(diff);
                 return Ok(());
             }
-            let point = chat_point(state, conversation, mouse.column, mouse.row);
+            let point = chat_point(
+                state,
+                conversation,
+                mouse.column,
+                mouse.row,
+                &mut renders.chat,
+            );
             state.selection_anchor = Some(point);
             state.text_selection = Some(TextSelection {
                 start: point,
@@ -1172,23 +1345,37 @@ async fn handle_mouse(
             if let Some(start) = state.selection_anchor {
                 state.text_selection = Some(TextSelection {
                     start,
-                    end: chat_point(state, conversation, mouse.column, mouse.row),
+                    end: chat_point(
+                        state,
+                        conversation,
+                        mouse.column,
+                        mouse.row,
+                        &mut renders.chat,
+                    ),
                 });
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if let Some(start) = state.selection_anchor.take() {
-                let end = chat_point(state, conversation, mouse.column, mouse.row);
+                let end = chat_point(
+                    state,
+                    conversation,
+                    mouse.column,
+                    mouse.row,
+                    &mut renders.chat,
+                );
                 if start == end {
                     state.text_selection = None;
-                    if let Some(index) = chat_hit_test(state, conversation, mouse.row) {
+                    if let Some(index) =
+                        chat_hit_test(state, conversation, mouse.row, &mut renders.chat)
+                    {
                         state.focus_input();
                         state.toggle(index);
-                        clamp_chat_scroll(state, conversation);
+                        clamp_chat_scroll(state, conversation, &mut renders.chat);
                     }
                 } else {
                     state.text_selection = Some(TextSelection { start, end });
-                    let layout = chat_layout(state, conversation);
+                    let layout = chat_layout(state, conversation, &mut renders.chat);
                     let selected = selected_text(&layout.lines, TextSelection { start, end });
                     if !selected.is_empty() {
                         copy_to_clipboard(&selected)?;
@@ -1204,8 +1391,14 @@ async fn handle_mouse(
     Ok(())
 }
 
-fn chat_point(state: &UiState, area: Rect, column: u16, row: u16) -> TextPoint {
-    let layout = chat_layout(state, area);
+fn chat_point(
+    state: &UiState,
+    area: Rect,
+    column: u16,
+    row: u16,
+    cache: &mut ChatRenderCache,
+) -> TextPoint {
+    let layout = chat_layout(state, area, cache);
     TextPoint {
         row: (layout.offset + row.saturating_sub(area.y))
             .min(layout.lines.len().saturating_sub(1) as u16),
@@ -1329,10 +1522,10 @@ fn draw(
     config: &Config,
     state: &UiState,
     hidden_chat_height: usize,
-    images: &mut ImageRenderer,
+    renders: &mut RenderState,
 ) -> usize {
     if state.git_fullscreen_diff {
-        draw_fullscreen_git(frame, state);
+        draw_fullscreen_git(frame, state, &mut renders.diff);
         return hidden_chat_height;
     }
     let [header, body, input] = page_areas(frame.area(), state);
@@ -1346,10 +1539,10 @@ fn draw(
     );
 
     let (chat, side) = git_split(body, state);
-    let chat_height = draw_chat(frame, state, chat, images);
+    let chat_height = draw_chat(frame, state, chat, renders);
     if let Some(side) = side {
         let (git, plan) = side_split(side, state);
-        draw_git(frame, state, git);
+        draw_git(frame, state, git, &mut renders.diff);
         if let Some(plan) = plan {
             draw_plan(frame, state, plan);
         }
@@ -1506,19 +1699,11 @@ fn model_picker_item(model: &ModelConfig, state: &UiState) -> ListItem<'static> 
     ]))
 }
 
-fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
+fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState, diff: &mut DiffMemo) {
     let tool_diff = state.fullscreen_tool_diff.is_some();
-    let lines = if tool_diff || state.project.git_available {
-        diff_lines(state.fullscreen_diff())
-    } else {
-        vec![Line::styled(
-            " not a Git repository",
-            Style::default().fg(Color::DarkGray),
-        )]
-    };
     frame.render_widget(Clear, frame.area());
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(diff.get(state, true).as_slice())
             .scroll((state.git_diff_scroll, 0))
             .block(Block::default().borders(Borders::ALL).title(if tool_diff {
                 " tool diff · Esc to close "
@@ -1529,12 +1714,8 @@ fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState) {
     );
 }
 
-fn git_diff_max_scroll(state: &UiState, height: u16) -> u16 {
-    let line_count = if state.fullscreen_tool_diff.is_some() || state.project.git_available {
-        state.fullscreen_diff().lines().count().max(1)
-    } else {
-        1
-    };
+fn git_diff_max_scroll(state: &UiState, height: u16, diff: &mut DiffMemo) -> u16 {
+    let line_count = diff.get(state, true).len().max(1);
     let visible = height.saturating_sub(2).max(1) as usize;
     line_count.saturating_sub(visible).min(u16::MAX as usize) as u16
 }
@@ -1557,20 +1738,14 @@ fn git_status_title(state: &UiState, height: u16) -> String {
     format!(" git status · {}-{end}/{total} ", offset + 1)
 }
 
-fn git_panel_diff_max_scroll(state: &UiState, height: u16) -> u16 {
+fn git_panel_diff_max_scroll(state: &UiState, height: u16, diff: &mut DiffMemo) -> u16 {
+    let line_count = diff.get(state, false).len().max(1);
     let visible = height.saturating_sub(3).max(1) as usize;
-    state
-        .project
-        .git_diff
-        .lines()
-        .count()
-        .max(1)
-        .saturating_sub(visible)
-        .min(u16::MAX as usize) as u16
+    line_count.saturating_sub(visible).min(u16::MAX as usize) as u16
 }
 
-fn git_panel_diff_title(state: &UiState, height: u16) -> String {
-    let total = state.project.git_diff.lines().count().max(1);
+fn git_panel_diff_title(state: &UiState, height: u16, diff: &mut DiffMemo) -> String {
+    let total = diff.get(state, false).len().max(1);
     let visible = height.saturating_sub(3).max(1) as usize;
     let offset = (state.git_panel_diff_scroll as usize).min(total.saturating_sub(visible));
     let end = (offset + visible).min(total);
@@ -1673,11 +1848,11 @@ fn draw_command_palette(frame: &mut ratatui::Frame, state: &UiState, input: Rect
     );
 }
 
-fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
+fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect, diff: &mut DiffMemo) {
     if state.git_diff_mode {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(git_panel_diff_title(state, area.height));
+            .title(git_panel_diff_title(state, area.height, diff));
         let inner = block.inner(area);
         frame.render_widget(block, area);
         if inner.height == 0 {
@@ -1692,7 +1867,7 @@ fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
         );
         if inner.height > 1 {
             frame.render_widget(
-                Paragraph::new(diff_lines(&state.project.git_diff))
+                Paragraph::new(diff.get(state, false).as_slice())
                     .scroll((state.git_panel_diff_scroll, 0))
                     .wrap(Wrap { trim: false }),
                 Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1),
@@ -1844,9 +2019,9 @@ fn draw_chat(
     frame: &mut ratatui::Frame,
     state: &UiState,
     area: Rect,
-    renderer: &mut ImageRenderer,
+    renders: &mut RenderState,
 ) -> usize {
-    let layout = chat_layout(state, area);
+    let layout = chat_layout(state, area, &mut renders.chat);
     let height = layout.lines.len();
     frame.render_widget(
         Paragraph::new(layout.lines)
@@ -1873,7 +2048,7 @@ fn draw_chat(
         };
         let position =
             SignedPosition::from((0, top.clamp(i16::MIN as i32, i16::MAX as i32) as i16));
-        if !renderer.render(
+        if !renders.images.render(
             frame,
             content,
             Size::new(image.width, image.height),
@@ -1895,8 +2070,8 @@ fn wrapped_input_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
     wrap_chat_lines(state.input_lines(), width).0
 }
 
-fn chat_max_scroll(state: &UiState, area: Rect) -> u16 {
-    max_chat_scroll(chat_layout(state, area).lines.len(), area.height)
+fn chat_max_scroll(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> u16 {
+    max_chat_scroll(chat_layout(state, area, cache).lines.len(), area.height)
 }
 
 fn max_chat_scroll(height: usize, visible: u16) -> u16 {
@@ -1910,8 +2085,8 @@ fn set_chat_scroll_max(state: &mut UiState, visible: u16, height: usize) {
     state.scroll = state.scroll.min(state.chat_scroll_max);
 }
 
-fn clamp_chat_scroll(state: &mut UiState, area: Rect) {
-    let max = chat_max_scroll(state, area);
+fn clamp_chat_scroll(state: &mut UiState, area: Rect, cache: &mut ChatRenderCache) {
+    let max = chat_max_scroll(state, area, cache);
     state.chat_scroll_max = max;
     state.scroll = state.scroll.min(max);
 }
@@ -1928,8 +2103,8 @@ fn scroll_chat_down(state: &mut UiState, amount: u16) {
     state.scroll = state.scroll.saturating_sub(amount);
 }
 
-fn search_chat(state: &mut UiState, area: Rect, next: bool) {
-    let layout = chat_layout(state, area);
+fn search_chat(state: &mut UiState, area: Rect, next: bool, cache: &mut ChatRenderCache) {
+    let layout = chat_layout(state, area, cache);
     let total = layout.search_matches.len();
     let Some(search) = &mut state.search else {
         return;
@@ -1979,249 +2154,77 @@ struct SearchMatch {
     end: u16,
 }
 
-fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
+fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> ChatLayout {
+    cache.sync(state);
+    let width = area.width.saturating_sub(2).max(1);
     let mut lines = Vec::new();
-    let mut header_lines = Vec::new();
-    let mut section_lines = Vec::new();
-    let mut diff_header_lines = Vec::new();
-    let mut image_lines = Vec::new();
+    let mut headers = Vec::new();
+    let mut sections = Vec::new();
+    let mut diff_buttons = Vec::new();
+    let mut images = Vec::new();
+    let mut row = 0u16;
     for (index, block) in state.blocks.iter().enumerate() {
-        let start = lines.len();
-        let header_count = header_lines.len();
-        match block {
-            ChatBlock::Message {
-                label,
-                content,
-                images,
-                model,
-                kind,
-                expanded,
-                summary,
-            } => {
-                let color = match kind {
-                    MessageKind::User => Color::Cyan,
-                    MessageKind::Assistant => Color::Blue,
-                    MessageKind::System => Color::Magenta,
-                    MessageKind::Error => Color::Red,
-                };
-                if matches!(kind, MessageKind::User | MessageKind::Assistant) {
-                    header_lines.push((index, lines.len()));
-                    let header = format!("{} {label}", if *expanded { "▾" } else { "▸" });
-                    if matches!(kind, MessageKind::Assistant) && !model.is_empty() {
-                        lines.push(assistant_header(
-                            header,
-                            model,
-                            color,
-                            state.selected() == Some(index),
-                        ));
-                    } else {
-                        lines.push(section_header(
-                            header,
-                            color,
-                            state.selected() == Some(index),
-                        ));
-                    }
-                    if *expanded {
-                        let rendered = if matches!(kind, MessageKind::User) {
-                            markdown_preserving_breaks(content)
-                        } else {
-                            markdown(content)
-                        };
-                        lines.extend(rendered.into_iter().map(pad_line));
-                        for (image_index, image) in images.iter().enumerate() {
-                            if let Some(font_size) = state.image_cell_size
-                                && image.width > 0
-                                && image.height > 0
-                            {
-                                let (width, height) = image_cell_area(image, area, font_size);
-                                image_lines.push((index, image_index, lines.len(), width, height));
-                                lines.extend((0..height).map(|_| Line::default()));
-                            } else {
-                                let dimensions = if image.width == 0 || image.height == 0 {
-                                    String::new()
-                                } else {
-                                    format!(" · {}×{}", image.width, image.height)
-                                };
-                                lines.push(Line::styled(
-                                    format!(" Image{dimensions}"),
-                                    Style::default().fg(Color::Cyan),
-                                ));
-                            }
-                        }
-                    }
-                } else if let Some(summary) = summary {
-                    header_lines.push((index, lines.len()));
-                    lines.push(section_header(
-                        format!(
-                            "{} System: {} · {}",
-                            if *expanded { "▾" } else { "▸" },
-                            content,
-                            size_label(summary.chars().count()),
-                        ),
-                        color,
-                        state.selected() == Some(index),
-                    ));
-                    if *expanded {
-                        lines.extend(markdown(summary).into_iter().map(pad_line));
-                    }
-                } else {
-                    lines.push(Line::styled(
-                        label.clone(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ));
-                    lines.extend(markdown(content).into_iter().map(pad_line));
-                }
-            }
-            ChatBlock::Thinking {
-                content,
-                expanded,
-                elapsed,
-            } => {
-                header_lines.push((index, lines.len()));
-                lines.push(section_header(
-                    format!(
-                        "{} Thinking · {}{}",
-                        if *expanded { "▾" } else { "▸" },
-                        size_label(content.chars().count()),
-                        elapsed_label(elapsed.value()),
-                    ),
-                    Color::DarkGray,
-                    state.selected() == Some(index),
-                ));
-                if *expanded {
-                    lines.extend(markdown(content).into_iter().map(|line| {
-                        pad_line(
-                            line.style(
-                                Style::default()
-                                    .fg(Color::DarkGray)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
-                        )
-                    }));
-                }
-            }
-            ChatBlock::Tool {
-                name,
-                arguments,
-                output,
-                diff,
-                status,
-                expanded,
-                counter,
-                elapsed,
-                ..
-            } => {
-                header_lines.push((index, lines.len()));
-                let color = tool_color(*status);
-                let selected = state.selected() == Some(index);
-                let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-                if selected {
-                    style = style.bg(Color::DarkGray).fg(Color::White);
-                }
-                let prefix = format!(
-                    "{} Tool: {}",
-                    if *expanded { "▾" } else { "▸" },
-                    if name.is_empty() { "…" } else { name },
-                );
-                let mut header = Line::from(Span::styled(prefix.clone(), style));
-                if diff.is_some() {
-                    let start = prefix.chars().count() as u16 + 1;
-                    diff_header_lines.push((index, lines.len(), start, start + 6));
-                    header.spans.push(Span::raw(" ").style(style));
-                    let button_style = if selected {
-                        style.add_modifier(Modifier::UNDERLINED)
-                    } else {
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                    };
-                    header.spans.push(Span::styled("[diff]", button_style));
-                    header.spans.push(Span::raw(" ").style(style));
-                }
-                header.spans.push(Span::styled(
-                    format!(
-                        "{} · {} · {}{}",
-                        argument_summary(arguments),
-                        tool_status(*status),
-                        counter.label(),
-                        elapsed_label(elapsed.value()),
-                    ),
-                    style,
-                ));
-                lines.push(header);
-                if *expanded {
-                    lines.push(Line::styled(
-                        " arguments",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                    lines.extend(arguments.lines().map(|line| {
-                        Line::styled(format!(" {line}"), Style::default().fg(Color::Cyan))
-                    }));
-                    if let Some(output) = output {
-                        lines.push(Line::styled(
-                            " output",
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                        lines.extend(
-                            markdown_preserving_breaks(output)
-                                .into_iter()
-                                .map(|line| pad_line(line.style(Style::default().fg(Color::Gray)))),
-                        );
-                    }
-                }
-            }
+        let section_start = row;
+        let selected = state.selected() == Some(index);
+        let entry = cache
+            .blocks
+            .get_mut(index)
+            .expect("cache synced with blocks");
+        render_block_body(block, index, state, width, area, entry);
+        let (header, diff_span) = block_header(block, entry, selected);
+        let header = wrap_chat_lines(header, width).0;
+        let header_row = row;
+        let header_height = u16::try_from(header.len()).unwrap_or(u16::MAX).max(1);
+        lines.extend(header.iter().cloned());
+        row = row.saturating_add(header_height);
+        for (image_index, offset, cell_width, cell_height) in entry.images.iter().copied() {
+            images.push(ChatImagePlacement {
+                block: index,
+                index: image_index,
+                row: row.saturating_add(offset),
+                width: cell_width,
+                height: cell_height,
+            });
         }
-        if header_lines.len() > header_count {
-            section_lines.push((index, start, lines.len()));
-        }
+        let body_rows = u16::try_from(entry.lines.len()).unwrap_or(0);
+        lines.extend(entry.lines.iter().cloned());
+        row = row.saturating_add(body_rows);
+        let section_end = row;
         lines.push(Line::default());
+        row = row.saturating_add(1);
+        if has_block_header(block) {
+            headers.push((index, header_row, header_height));
+            sections.push((index, section_start, section_end));
+        }
+        if let Some((start, end)) = diff_span {
+            diff_buttons.extend(
+                (start..end).map(|column| (index, header_row + column / width, column % width)),
+            );
+        }
     }
     lines.push(Line::default());
+    row = row.saturating_add(1);
     if let Some(notice) = &state.notice {
-        lines.push(Line::styled(
-            format!(" {notice}"),
-            Style::default().fg(Color::Green),
-        ));
+        let notice = wrap_chat_lines(
+            vec![Line::styled(
+                format!(" {notice}"),
+                Style::default().fg(Color::Green),
+            )],
+            width,
+        )
+        .0;
+        row = row.saturating_add(u16::try_from(notice.len()).unwrap_or(0));
+        lines.extend(notice);
     }
-    let width = area.width.saturating_sub(2).max(1);
-    let (mut lines, starts) = wrap_chat_lines(lines, width);
-    let content_height = lines.len() as u16;
+    // The last section reaches the bottom of the chat, matching how the
+    // trailing blank rows belong to the final block.
+    if let Some(section) = sections.last_mut() {
+        section.2 = row;
+    }
+    let content_height = row;
     let offset = content_height
         .saturating_sub(area.height)
         .saturating_sub(state.scroll);
-    let headers = header_lines
-        .into_iter()
-        .map(|(block, line)| {
-            let row = starts[line];
-            let end = starts.get(line + 1).copied().unwrap_or(content_height);
-            (block, row, end.saturating_sub(row).max(1))
-        })
-        .collect();
-    let sections = section_lines
-        .into_iter()
-        .map(|(block, start, end)| {
-            let start = starts[start];
-            let end = starts.get(end).copied().unwrap_or(content_height);
-            (block, start, end)
-        })
-        .collect();
-    let diff_buttons = diff_header_lines
-        .into_iter()
-        .flat_map(|(block, line, start, end)| {
-            let row = starts[line];
-            (start..end).map(move |column| (block, row + column / width, column % width))
-        })
-        .collect();
-    let images = image_lines
-        .into_iter()
-        .map(|(block, index, line, width, height)| ChatImagePlacement {
-            block,
-            index,
-            row: starts[line],
-            width,
-            height,
-        })
-        .collect();
     let search_matches = state
         .search
         .as_ref()
@@ -2245,6 +2248,285 @@ fn chat_layout(state: &UiState, area: Rect) -> ChatLayout {
         search_matches,
         images,
         offset,
+    }
+}
+
+fn render_block_body(
+    block: &ChatBlock,
+    index: usize,
+    state: &UiState,
+    width: u16,
+    area: Rect,
+    entry: &mut RenderedBlock,
+) {
+    let image_max_height = area.height.saturating_sub(2).clamp(1, 16);
+    let expanded = match block {
+        ChatBlock::Message { expanded, .. } => *expanded,
+        ChatBlock::Thinking { expanded, .. } => *expanded,
+        ChatBlock::Tool { expanded, .. } => *expanded,
+    };
+    if entry.revision != state.render_revisions[index]
+        || entry.width != width
+        || entry.image_max_height != image_max_height
+        || entry.expanded != expanded
+    {
+        entry.revision = state.render_revisions[index];
+        entry.width = width;
+        entry.image_max_height = image_max_height;
+        entry.expanded = expanded;
+        match block {
+            ChatBlock::Message { kind, summary, .. } => {
+                entry.char_count = match (kind, summary) {
+                    (MessageKind::System, Some(summary)) => summary.chars().count(),
+                    _ => 0,
+                };
+                entry.argument_summary.clear();
+            }
+            ChatBlock::Thinking { content, .. } => {
+                entry.char_count = content.chars().count();
+                entry.argument_summary.clear();
+            }
+            ChatBlock::Tool { arguments, .. } => {
+                entry.char_count = 0;
+                entry.argument_summary = argument_summary(arguments);
+            }
+        }
+        let (raw, raw_images) = block_body_lines(block, state, area);
+        let (wrapped, starts) = wrap_chat_lines(raw, width);
+        entry.images = raw_images
+            .into_iter()
+            .map(|(image_index, raw_line, cell_width, cell_height)| {
+                (image_index, starts[raw_line], cell_width, cell_height)
+            })
+            .collect();
+        entry.lines = wrapped;
+    }
+}
+
+fn block_body_lines(
+    block: &ChatBlock,
+    state: &UiState,
+    area: Rect,
+) -> (Vec<Line<'static>>, Vec<RawImageCell>) {
+    let mut lines = Vec::new();
+    let mut images = Vec::new();
+    match block {
+        ChatBlock::Message {
+            content,
+            images: block_images,
+            kind,
+            expanded,
+            summary,
+            ..
+        } => match kind {
+            MessageKind::User | MessageKind::Assistant => {
+                if *expanded {
+                    let rendered = if matches!(kind, MessageKind::User) {
+                        markdown_preserving_breaks(content)
+                    } else {
+                        markdown(content)
+                    };
+                    lines.extend(rendered.into_iter().map(pad_line));
+                    for (image_index, image) in block_images.iter().enumerate() {
+                        if let Some(font_size) = state.image_cell_size
+                            && image.width > 0
+                            && image.height > 0
+                        {
+                            let (cell_width, cell_height) = image_cell_area(image, area, font_size);
+                            images.push((image_index, lines.len(), cell_width, cell_height));
+                            lines.extend((0..cell_height).map(|_| Line::default()));
+                        } else {
+                            let dimensions = if image.width == 0 || image.height == 0 {
+                                String::new()
+                            } else {
+                                format!(" · {}×{}", image.width, image.height)
+                            };
+                            lines.push(Line::styled(
+                                format!(" Image{dimensions}"),
+                                Style::default().fg(Color::Cyan),
+                            ));
+                        }
+                    }
+                }
+            }
+            MessageKind::System => {
+                if let Some(summary) = summary {
+                    if *expanded {
+                        lines.extend(markdown(summary).into_iter().map(pad_line));
+                    }
+                } else {
+                    lines.extend(markdown(content).into_iter().map(pad_line));
+                }
+            }
+            MessageKind::Error => {
+                lines.extend(markdown(content).into_iter().map(pad_line));
+            }
+        },
+        ChatBlock::Thinking {
+            content, expanded, ..
+        } => {
+            if *expanded {
+                lines.extend(markdown(content).into_iter().map(|line| {
+                    pad_line(
+                        line.style(
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::ITALIC),
+                        ),
+                    )
+                }));
+            }
+        }
+        ChatBlock::Tool {
+            arguments,
+            output,
+            expanded,
+            ..
+        } => {
+            if *expanded {
+                lines.push(Line::styled(
+                    " arguments",
+                    Style::default().fg(Color::DarkGray),
+                ));
+                lines.extend(arguments.lines().map(|line| {
+                    Line::styled(format!(" {line}"), Style::default().fg(Color::Cyan))
+                }));
+                if let Some(output) = output {
+                    lines.push(Line::styled(
+                        " output",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    lines.extend(
+                        markdown_preserving_breaks(output)
+                            .into_iter()
+                            .map(|line| pad_line(line.style(Style::default().fg(Color::Gray)))),
+                    );
+                }
+            }
+        }
+    }
+    (lines, images)
+}
+
+fn block_header(
+    block: &ChatBlock,
+    entry: &RenderedBlock,
+    selected: bool,
+) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
+    match block {
+        ChatBlock::Message {
+            label,
+            content,
+            model,
+            kind,
+            expanded,
+            summary,
+            ..
+        } => {
+            let color = match kind {
+                MessageKind::User => Color::Cyan,
+                MessageKind::Assistant => Color::Blue,
+                MessageKind::System => Color::Magenta,
+                MessageKind::Error => Color::Red,
+            };
+            let line = match kind {
+                MessageKind::User | MessageKind::Assistant => {
+                    let header = format!("{} {label}", if *expanded { "▾" } else { "▸" });
+                    if matches!(kind, MessageKind::Assistant) && !model.is_empty() {
+                        assistant_header(header, model, color, selected)
+                    } else {
+                        section_header(header, color, selected)
+                    }
+                }
+                MessageKind::System if summary.is_some() => section_header(
+                    format!(
+                        "{} System: {} · {}",
+                        if *expanded { "▾" } else { "▸" },
+                        content,
+                        size_label(entry.char_count),
+                    ),
+                    color,
+                    selected,
+                ),
+                MessageKind::System | MessageKind::Error => Line::styled(
+                    label.clone(),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            };
+            (vec![line], None)
+        }
+        ChatBlock::Thinking {
+            expanded, elapsed, ..
+        } => (
+            vec![section_header(
+                format!(
+                    "{} Thinking · {}{}",
+                    if *expanded { "▾" } else { "▸" },
+                    size_label(entry.char_count),
+                    elapsed_label(elapsed.value()),
+                ),
+                Color::DarkGray,
+                selected,
+            )],
+            None,
+        ),
+        ChatBlock::Tool {
+            name,
+            diff,
+            status,
+            expanded,
+            counter,
+            elapsed,
+            ..
+        } => {
+            let color = tool_color(*status);
+            let mut style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+            if selected {
+                style = style.bg(Color::DarkGray).fg(Color::White);
+            }
+            let prefix = format!(
+                "{} Tool: {}",
+                if *expanded { "▾" } else { "▸" },
+                if name.is_empty() { "…" } else { name },
+            );
+            let mut header = Line::from(Span::styled(prefix.clone(), style));
+            let mut diff_span = None;
+            if diff.is_some() {
+                let start = prefix.chars().count() as u16 + 1;
+                diff_span = Some((start, start + 6));
+                header.spans.push(Span::raw(" ").style(style));
+                let button_style = if selected {
+                    style.add_modifier(Modifier::UNDERLINED)
+                } else {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                };
+                header.spans.push(Span::styled("[diff]", button_style));
+                header.spans.push(Span::raw(" ").style(style));
+            }
+            header.spans.push(Span::styled(
+                format!(
+                    "{} · {} · {}{}",
+                    entry.argument_summary,
+                    tool_status(*status),
+                    counter.label(),
+                    elapsed_label(elapsed.value()),
+                ),
+                style,
+            ));
+            (vec![header], diff_span)
+        }
+    }
+}
+
+fn has_block_header(block: &ChatBlock) -> bool {
+    match block {
+        ChatBlock::Message { kind, summary, .. } => {
+            matches!(kind, MessageKind::User | MessageKind::Assistant)
+                || (matches!(kind, MessageKind::System) && summary.is_some())
+        }
+        ChatBlock::Thinking { .. } | ChatBlock::Tool { .. } => true,
     }
 }
 
@@ -2410,8 +2692,13 @@ fn selected_text(lines: &[Line<'_>], selection: TextSelection) -> String {
     selected.join("\n")
 }
 
-fn chat_hit_test(state: &UiState, area: Rect, screen_row: u16) -> Option<usize> {
-    let layout = chat_layout(state, area);
+fn chat_hit_test(
+    state: &UiState,
+    area: Rect,
+    screen_row: u16,
+    cache: &mut ChatRenderCache,
+) -> Option<usize> {
+    let layout = chat_layout(state, area, cache);
     let row = layout.offset + screen_row.saturating_sub(area.y);
     layout
         .headers
@@ -2419,8 +2706,13 @@ fn chat_hit_test(state: &UiState, area: Rect, screen_row: u16) -> Option<usize> 
         .find_map(|(block, start, height)| (row >= start && row < start + height).then_some(block))
 }
 
-fn chat_section_hit_test(state: &UiState, area: Rect, screen_row: u16) -> Option<usize> {
-    let layout = chat_layout(state, area);
+fn chat_section_hit_test(
+    state: &UiState,
+    area: Rect,
+    screen_row: u16,
+    cache: &mut ChatRenderCache,
+) -> Option<usize> {
+    let layout = chat_layout(state, area, cache);
     let row = layout.offset + screen_row.saturating_sub(area.y);
     layout
         .sections
@@ -2433,8 +2725,9 @@ fn chat_diff_hit_test(
     area: Rect,
     screen_column: u16,
     screen_row: u16,
+    cache: &mut ChatRenderCache,
 ) -> Option<String> {
-    let layout = chat_layout(state, area);
+    let layout = chat_layout(state, area, cache);
     let row = layout.offset + screen_row.saturating_sub(area.y);
     let column = screen_column.saturating_sub(area.x + 1);
     let block =
@@ -2452,11 +2745,11 @@ fn chat_diff_hit_test(
     }
 }
 
-fn ensure_selected_visible(state: &mut UiState, area: Rect) {
+fn ensure_selected_visible(state: &mut UiState, area: Rect, cache: &mut ChatRenderCache) {
     let Some(selected) = state.selected() else {
         return;
     };
-    let layout = chat_layout(state, area);
+    let layout = chat_layout(state, area, cache);
     let Some((_, row, height)) = layout
         .headers
         .into_iter()
@@ -3153,20 +3446,25 @@ mod tests {
 
     #[test]
     fn collapsed_section_header_is_mouse_hittable() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.apply(Event::ResponseStarted);
         state.apply(Event::ReasoningDelta("hidden details".into()));
         let area = Rect::new(0, 3, 80, 12);
 
-        let layout = chat_layout(&state, area);
+        let layout = chat_layout(&state, area, &mut renders.chat);
         assert!(layout.lines[0].spans[0].content.starts_with("▸ Thinking"));
-        assert_eq!(chat_hit_test(&state, area, area.y), Some(0));
+        assert_eq!(
+            chat_hit_test(&state, area, area.y, &mut renders.chat),
+            Some(0)
+        );
     }
 
     #[test]
     fn tool_diff_button_uses_the_persisted_call_diff() {
         let expected = "--- a/file.txt\n+++ b/file.txt\n-old\n+new\n";
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.apply(Event::History(vec![
             crate::runtime::Message::assistant(
                 String::new(),
@@ -3186,7 +3484,7 @@ mod tests {
             ),
         ]));
         let area = Rect::new(2, 3, 80, 12);
-        let layout = chat_layout(&state, area);
+        let layout = chat_layout(&state, area, &mut renders.chat);
         assert!(layout.lines[0].to_string().contains("[diff]"));
         assert!(layout.lines[0].to_string().contains("[diff] (file.txt)"));
         let (_, row, column) = layout.diff_buttons[0];
@@ -3195,6 +3493,7 @@ mod tests {
             area,
             area.x + 1 + column,
             area.y + row - layout.offset,
+            &mut renders.chat,
         )
         .unwrap();
 
@@ -3205,6 +3504,7 @@ mod tests {
 
     #[test]
     fn compaction_marker_renders_a_collapsed_summary_section() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.push_user("continue".into());
         state.apply(Event::ContextCompacted {
@@ -3212,14 +3512,17 @@ mod tests {
         });
         let area = Rect::new(0, 3, 80, 12);
 
-        let layout = chat_layout(&state, area);
+        let layout = chat_layout(&state, area, &mut renders.chat);
         let header = layout.lines[0]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(header, "▸ System: context compacted · 13 chars");
-        assert_eq!(chat_hit_test(&state, area, area.y), Some(0));
+        assert_eq!(
+            chat_hit_test(&state, area, area.y, &mut renders.chat),
+            Some(0)
+        );
         assert!(
             !layout
                 .lines
@@ -3229,7 +3532,7 @@ mod tests {
 
         state.select(0);
         state.toggle_selected();
-        let layout = chat_layout(&state, area);
+        let layout = chat_layout(&state, area, &mut renders.chat);
         let header = layout.lines[0]
             .spans
             .iter()
@@ -3242,6 +3545,7 @@ mod tests {
     #[tokio::test]
     async fn clicking_the_compaction_header_toggles_its_summary() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.apply(Event::ContextCompacted {
             summary: "summary".into(),
         });
@@ -3267,6 +3571,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3282,6 +3587,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3312,11 +3618,11 @@ mod tests {
                 .join("\n"),
         });
         let mut terminal = Terminal::new(TestBackend::new(page.width, page.height)).unwrap();
-        let mut images = ImageRenderer::new();
+        let mut renders = RenderState::new();
         let mut render = |state: &UiState| {
             terminal
                 .draw(|frame| {
-                    draw(frame, &Config::default(), state, 0, &mut images);
+                    draw(frame, &Config::default(), state, 0, &mut renders);
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();
@@ -3342,13 +3648,14 @@ mod tests {
     #[test]
     fn update_plan_tool_calls_are_rendered_in_chat() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.apply(Event::ToolCallDelta {
             index: 0,
             name: Some("update_plan".into()),
             arguments: r#"{"plan":[]}"#.into(),
         });
 
-        let layout = chat_layout(&state, Rect::new(0, 3, 80, 12));
+        let layout = chat_layout(&state, Rect::new(0, 3, 80, 12), &mut renders.chat);
         let text = layout.lines[0]
             .spans
             .iter()
@@ -3360,6 +3667,7 @@ mod tests {
 
     #[test]
     fn expanded_tool_output_preserves_line_breaks() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.tools_expanded = true;
         state.apply(Event::History(vec![
@@ -3381,7 +3689,7 @@ mod tests {
             ),
         ]));
 
-        let text = chat_layout(&state, Rect::new(0, 3, 80, 20))
+        let text = chat_layout(&state, Rect::new(0, 3, 80, 20), &mut renders.chat)
             .lines
             .iter()
             .map(|line| line.to_string())
@@ -3399,6 +3707,7 @@ mod tests {
     #[tokio::test]
     async fn clicking_a_section_keeps_focus_in_the_composer() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.apply(Event::ResponseStarted);
         state.apply(Event::ReasoningDelta("details".into()));
         let area = Rect::new(0, 3, 80, 12);
@@ -3423,6 +3732,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3438,6 +3748,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3451,6 +3762,7 @@ mod tests {
 
     #[tokio::test]
     async fn right_clicking_section_content_collapses_it() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.push_user("first line\nsecond line".into());
         let area = Rect::new(0, 3, 80, 12);
@@ -3473,6 +3785,7 @@ mod tests {
                 input: Rect::new(0, 20, 80, 3),
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3506,6 +3819,7 @@ mod tests {
 
     #[test]
     fn git_panel_diff_viewport_accounts_for_fixed_back_row() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.project.git_diff = (1..=8)
             .map(|line| format!("line {line}"))
@@ -3514,13 +3828,17 @@ mod tests {
         state.project.git_diff_path = Some("src/main.rs".into());
         state.git_panel_diff_scroll = 3;
 
-        assert_eq!(git_panel_diff_max_scroll(&state, 5), 6);
-        assert_eq!(git_panel_diff_title(&state, 5), " 4-5/8 · src/main.rs ");
+        assert_eq!(git_panel_diff_max_scroll(&state, 5, &mut renders.diff), 6);
+        assert_eq!(
+            git_panel_diff_title(&state, 5, &mut renders.diff),
+            " 4-5/8 · src/main.rs "
+        );
     }
 
     #[tokio::test]
     async fn git_status_mouse_scroll_preserves_file_hit_testing() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.project.git_available = true;
         state.project.git_files = (0..8)
             .map(|index| crate::project::GitFile {
@@ -3552,6 +3870,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3569,6 +3888,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3595,6 +3915,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3612,6 +3933,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3625,6 +3947,7 @@ mod tests {
 
     #[tokio::test]
     async fn dragging_git_splitter_changes_panel_width() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.project.git_available = true;
         let body = Rect::new(0, 3, 120, 20);
@@ -3651,6 +3974,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3668,6 +3992,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3685,6 +4010,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3697,6 +4023,7 @@ mod tests {
     #[tokio::test]
     async fn plan_pane_defaults_to_half_height_and_has_a_draggable_split() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.plan_panel = true;
         let body = Rect::new(0, 3, 120, 20);
         let (conversation, side) = git_split(body, &state);
@@ -3726,6 +4053,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3743,6 +4071,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3758,6 +4087,7 @@ mod tests {
                 input,
             },
             &commands,
+            &mut renders,
         )
         .await
         .unwrap();
@@ -3934,24 +4264,25 @@ mod tests {
     #[test]
     fn chat_search_starts_at_the_first_match_and_wraps() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.push_user("Needle one".into());
         state.push_user("two needle needle".into());
         state.start_search();
         state.search.as_mut().unwrap().query = "needle".into();
         let area = Rect::new(0, 0, 40, 5);
 
-        search_chat(&mut state, area, false);
+        search_chat(&mut state, area, false, &mut renders.chat);
         assert_eq!(state.search.as_ref().unwrap().total, 3);
         assert_eq!(state.search.as_ref().unwrap().current, 0);
 
-        search_chat(&mut state, area, true);
+        search_chat(&mut state, area, true, &mut renders.chat);
         assert_eq!(state.search.as_ref().unwrap().current, 1);
-        search_chat(&mut state, area, true);
+        search_chat(&mut state, area, true, &mut renders.chat);
         assert_eq!(state.search.as_ref().unwrap().current, 2);
-        search_chat(&mut state, area, true);
+        search_chat(&mut state, area, true, &mut renders.chat);
         assert_eq!(state.search.as_ref().unwrap().current, 0);
 
-        let layout = chat_layout(&state, area);
+        let layout = chat_layout(&state, area, &mut renders.chat);
         let found = layout.search_matches[0];
         assert!(
             layout.lines[found.row as usize]
@@ -3963,12 +4294,13 @@ mod tests {
 
     #[test]
     fn streaming_preserves_a_scrolled_chat_viewport() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         let area = Rect::new(0, 0, 24, 6);
         state.apply(Event::ResponseStarted);
         state.apply(Event::TextDelta("old content ".repeat(30)));
         state.scroll = 4;
-        let before = chat_layout(&state, area);
+        let before = chat_layout(&state, area, &mut renders.chat);
         let old_scroll = state.scroll;
 
         apply_runtime_event(
@@ -3976,8 +4308,9 @@ mod tests {
             Event::TextDelta("new streamed content ".repeat(30)),
             area,
             before.lines.len(),
+            &mut renders,
         );
-        let after = chat_layout(&state, area);
+        let after = chat_layout(&state, area, &mut renders.chat);
 
         assert_eq!(after.offset, before.offset);
         assert!(state.scroll > old_scroll);
@@ -3986,6 +4319,7 @@ mod tests {
     #[test]
     fn tool_output_deltas_preserve_a_scrolled_chat_viewport() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         let area = Rect::new(0, 0, 24, 6);
         state.apply(Event::ResponseStarted);
         state.apply(Event::TextDelta("old content ".repeat(30)));
@@ -4006,7 +4340,7 @@ mod tests {
             call_id: "call_1".into(),
         });
         state.scroll = 4;
-        let before = chat_layout(&state, area);
+        let before = chat_layout(&state, area, &mut renders.chat);
         let old_scroll = state.scroll;
 
         apply_runtime_event(
@@ -4017,8 +4351,9 @@ mod tests {
             },
             area,
             before.lines.len(),
+            &mut renders,
         );
-        let after = chat_layout(&state, area);
+        let after = chat_layout(&state, area, &mut renders.chat);
 
         assert_eq!(after.offset, before.offset);
         assert!(state.scroll > old_scroll);
@@ -4026,17 +4361,21 @@ mod tests {
 
     #[test]
     fn collapsing_content_clamps_chat_scroll_immediately() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         let area = Rect::new(0, 0, 24, 6);
         state.apply(Event::ResponseStarted);
         state.apply(Event::TextDelta("old content ".repeat(60)));
-        state.scroll = chat_max_scroll(&state, area);
+        state.scroll = chat_max_scroll(&state, area, &mut renders.chat);
         assert!(state.scroll > 0);
 
         state.toggle(0);
-        clamp_chat_scroll(&mut state, area);
+        clamp_chat_scroll(&mut state, area, &mut renders.chat);
 
-        assert_eq!(state.scroll, chat_max_scroll(&state, area));
+        assert_eq!(
+            state.scroll,
+            chat_max_scroll(&state, area, &mut renders.chat)
+        );
         assert_eq!(state.scroll, 0);
         scroll_chat_down(&mut state, 3);
         assert_eq!(state.scroll, 0);
@@ -4048,16 +4387,16 @@ mod tests {
 
         let page = Rect::new(0, 0, 40, 20);
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.apply(Event::ResponseStarted);
         state.apply(Event::TextDelta("old content ".repeat(80)));
         let chat = conversation_viewport_area(page, &state);
         state.scroll = 4;
-        let before = chat_layout(&state, chat);
+        let before = chat_layout(&state, chat, &mut renders.chat);
         state.open_fullscreen_tool_diff("--- a/file\n+++ b/file\n-old\n+new\n".into());
 
         let mut terminal = Terminal::new(TestBackend::new(page.width, page.height)).unwrap();
         let mut hidden_chat_height = 0;
-        let mut images = ImageRenderer::new();
         terminal
             .draw(|frame| {
                 hidden_chat_height = draw(
@@ -4065,7 +4404,7 @@ mod tests {
                     &Config::default(),
                     &state,
                     before.lines.len(),
-                    &mut images,
+                    &mut renders,
                 )
             })
             .unwrap();
@@ -4076,14 +4415,19 @@ mod tests {
             Event::TextDelta("new streamed content ".repeat(40)),
             chat,
             hidden_chat_height,
+            &mut renders,
         );
-        let after = chat_layout(&state, chat);
+        let after = chat_layout(&state, chat, &mut renders.chat);
         assert_eq!(after.offset, before.offset);
 
         state.close_fullscreen_git_diff();
-        clamp_chat_scroll(&mut state, chat);
-        assert!(!chat_layout(&state, chat).lines.is_empty());
-        assert!(state.scroll <= chat_max_scroll(&state, chat));
+        clamp_chat_scroll(&mut state, chat, &mut renders.chat);
+        assert!(
+            !chat_layout(&state, chat, &mut renders.chat)
+                .lines
+                .is_empty()
+        );
+        assert!(state.scroll <= chat_max_scroll(&state, chat, &mut renders.chat));
     }
 
     #[test]
@@ -4114,10 +4458,10 @@ mod tests {
         state.apply(Event::GenerationCancelled);
 
         let mut terminal = Terminal::new(TestBackend::new(page.width, page.height)).unwrap();
-        let mut images = ImageRenderer::new();
+        let mut renders = RenderState::new();
         terminal
             .draw(|frame| {
-                draw(frame, &Config::default(), &state, 0, &mut images);
+                draw(frame, &Config::default(), &state, 0, &mut renders);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -4141,6 +4485,7 @@ mod tests {
     #[test]
     fn escape_closes_diff_without_changing_active_generation() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.generating = true;
         state.open_fullscreen_tool_diff("diff".into());
 
@@ -4148,6 +4493,7 @@ mod tests {
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             &mut state,
             20,
+            &mut renders.diff,
         ));
         assert!(!state.git_fullscreen_diff);
         assert!(state.generating);
@@ -4155,19 +4501,21 @@ mod tests {
 
     #[test]
     fn streaming_follows_chat_at_the_bottom() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         let area = Rect::new(0, 0, 24, 6);
         state.apply(Event::ResponseStarted);
         state.apply(Event::TextDelta("old content ".repeat(30)));
-        let before = chat_layout(&state, area);
+        let before = chat_layout(&state, area, &mut renders.chat);
 
         apply_runtime_event(
             &mut state,
             Event::TextDelta("new streamed content ".repeat(30)),
             area,
             before.lines.len(),
+            &mut renders,
         );
-        let after = chat_layout(&state, area);
+        let after = chat_layout(&state, area, &mut renders.chat);
 
         assert_eq!(state.scroll, 0);
         assert!(after.offset > before.offset);
@@ -4183,9 +4531,10 @@ mod tests {
 
     #[test]
     fn message_content_is_padded_but_its_header_is_not() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.push_user("hello".into());
-        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10));
+        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10), &mut renders.chat);
         let text = layout
             .lines
             .iter()
@@ -4204,6 +4553,7 @@ mod tests {
     #[test]
     fn user_image_attachments_are_visible_in_chat_history() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.push_user_with_images(
             String::new(),
             vec![ImageContent {
@@ -4214,7 +4564,7 @@ mod tests {
                 height: 480,
             }],
         );
-        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10));
+        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10), &mut renders.chat);
         let text = layout
             .lines
             .iter()
@@ -4227,6 +4577,7 @@ mod tests {
 
     #[test]
     fn terminal_images_reserve_scaled_chat_rows() {
+        let mut renders = RenderState::new();
         let mut state = UiState::new();
         state.image_cell_size = Some((10, 20));
         state.push_user_with_images(
@@ -4240,7 +4591,7 @@ mod tests {
             }],
         );
 
-        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10));
+        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10), &mut renders.chat);
         assert_eq!(layout.images.len(), 1);
         assert_eq!(layout.images[0].width, 22);
         assert_eq!(layout.images[0].height, 8);
@@ -4309,15 +4660,19 @@ mod tests {
     #[test]
     fn fullscreen_diff_scroll_stops_at_the_last_visible_line() {
         let mut state = UiState::new();
+        let mut renders = RenderState::new();
         state.project.git_available = true;
 
-        assert_eq!(git_diff_max_scroll(&state, 10), 0);
+        assert_eq!(git_diff_max_scroll(&state, 10, &mut renders.diff), 0);
 
         state.project.git_diff = (0..10)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(git_diff_max_scroll(&state, 5), 7);
+        // The app mutates the diff only through ProjectChanged, which
+        // invalidates the memo; mirror that here.
+        state.diff_generation += 1;
+        assert_eq!(git_diff_max_scroll(&state, 5, &mut renders.diff), 7);
     }
 
     #[test]
@@ -4381,11 +4736,11 @@ mod tests {
         state.model = "gpt-5.6-sol".into();
         state.model_picker = Some(state::ModelPicker::default());
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        let mut images = ImageRenderer::new();
+        let mut renders = RenderState::new();
 
         terminal
             .draw(|frame| {
-                draw(frame, &config, &state, 0, &mut images);
+                draw(frame, &config, &state, 0, &mut renders);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();

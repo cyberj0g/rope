@@ -140,6 +140,16 @@ pub enum ChatBlock {
 pub struct UiState {
     pub input: String,
     pub blocks: Vec<ChatBlock>,
+    /// Content revision per block, parallel to `blocks`. Bumped whenever a
+    /// mutation changes what a block renders, so the render cache only
+    /// re-renders the blocks that actually changed.
+    pub render_revisions: Vec<u64>,
+    /// Bumped whenever a diff source (git diff, fullscreen tool diff)
+    /// changes, so rendered diff lines can be memoized.
+    pub diff_generation: u64,
+    /// Bumped whenever the block list changes structure (rebuilt or
+    /// inserted into), so the per-index render cache can be dropped.
+    pub layout_generation: u64,
     pub generating: bool,
     pub connecting: bool,
     pub waiting: bool,
@@ -350,6 +360,22 @@ impl UiState {
             text_selection: None,
             selection_anchor: None,
             toast: None,
+            render_revisions: Vec::new(),
+            diff_generation: 0,
+            layout_generation: 0,
+        }
+    }
+
+    /// Appends a block with a fresh render revision.
+    fn push_block(&mut self, block: ChatBlock) {
+        self.render_revisions.push(0);
+        self.blocks.push(block);
+    }
+
+    /// Marks the block at `index` as changed so the render cache re-renders it.
+    fn bump_render(&mut self, index: usize) {
+        if let Some(revision) = self.render_revisions.get_mut(index) {
+            *revision += 1;
         }
     }
 
@@ -764,7 +790,7 @@ impl UiState {
     }
 
     pub fn push_user_with_images(&mut self, content: String, images: Vec<ImageContent>) {
-        self.blocks.push(ChatBlock::Message {
+        self.push_block(ChatBlock::Message {
             label: "You".into(),
             content,
             images,
@@ -778,7 +804,7 @@ impl UiState {
     pub fn set_error(&mut self, error: impl Into<String>) {
         let error = error.into();
         self.error = Some(error.clone());
-        self.blocks.push(ChatBlock::Message {
+        self.push_block(ChatBlock::Message {
             label: "Error".into(),
             content: error,
             images: Vec::new(),
@@ -791,19 +817,35 @@ impl UiState {
 
     pub fn toggle_thinking_default(&mut self) {
         self.thinking_expanded = !self.thinking_expanded;
-        for block in &mut self.blocks {
-            if let ChatBlock::Thinking { expanded, .. } = block {
+        let changed = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block, ChatBlock::Thinking { .. }))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in changed {
+            if let ChatBlock::Thinking { expanded, .. } = &mut self.blocks[index] {
                 *expanded = self.thinking_expanded;
             }
+            self.bump_render(index);
         }
     }
 
     pub fn toggle_tools_default(&mut self) {
         self.tools_expanded = !self.tools_expanded;
-        for block in &mut self.blocks {
-            if let ChatBlock::Tool { expanded, .. } = block {
+        let changed = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| matches!(block, ChatBlock::Tool { .. }))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in changed {
+            if let ChatBlock::Tool { expanded, .. } = &mut self.blocks[index] {
                 *expanded = self.tools_expanded;
             }
+            self.bump_render(index);
         }
     }
 
@@ -818,18 +860,21 @@ impl UiState {
         self.fullscreen_tool_diff = None;
         self.project.git_diff_path = None;
         self.project.git_diff.clear();
+        self.diff_generation = self.diff_generation.wrapping_add(1);
     }
 
     pub fn open_fullscreen_tool_diff(&mut self, diff: String) {
         self.git_fullscreen_diff = true;
         self.git_diff_scroll = 0;
         self.fullscreen_tool_diff = Some(diff);
+        self.diff_generation = self.diff_generation.wrapping_add(1);
     }
 
     pub fn close_fullscreen_git_diff(&mut self) {
         self.git_fullscreen_diff = false;
         self.git_diff_scroll = 0;
         self.fullscreen_tool_diff = None;
+        self.diff_generation = self.diff_generation.wrapping_add(1);
     }
 
     pub fn fullscreen_diff(&self) -> &str {
@@ -845,18 +890,34 @@ impl UiState {
         });
     }
 
-    pub fn expire_toast(&mut self) {
+    /// Expires the toast if its time is up. Returns whether it did, so the
+    /// caller knows a redraw is needed.
+    pub fn expire_toast(&mut self) -> bool {
         if self
             .toast
             .as_ref()
             .is_some_and(|toast| Instant::now() >= toast.expires)
         {
             self.toast = None;
+            return true;
         }
+        false
     }
 
     pub fn toast(&self) -> Option<&str> {
         self.toast.as_ref().map(|toast| toast.message.as_str())
+    }
+
+    /// Whether the display contains anything that changes over time (live
+    /// elapsed timers, generation speed, pending image loads, an expiring
+    /// toast), so the event loop keeps redrawing without new events.
+    pub fn is_live(&self) -> bool {
+        self.generating
+            || self.connecting
+            || self.waiting
+            || self.tool_running
+            || self.image_loading()
+            || self.toast.is_some()
     }
 
     pub fn conversation_focused(&self) -> bool {
@@ -940,6 +1001,7 @@ impl UiState {
         ) = self.blocks.get_mut(index)
         {
             *expanded = !*expanded;
+            self.bump_render(index);
         }
     }
 
@@ -961,6 +1023,7 @@ impl UiState {
         ) = self.blocks.get_mut(index)
         {
             *expanded = false;
+            self.bump_render(index);
         }
     }
 
@@ -994,7 +1057,10 @@ impl UiState {
                 self.model = model;
                 self.reasoning_effort = reasoning_effort;
             }
-            Event::ProjectChanged(project) => self.project = project,
+            Event::ProjectChanged(project) => {
+                self.project = project;
+                self.diff_generation = self.diff_generation.wrapping_add(1);
+            }
             Event::PlanChanged(plan) => {
                 if plan.is_some() {
                     self.plan_panel = true;
@@ -1063,7 +1129,7 @@ impl UiState {
                 let block = match self.reasoning {
                     Some(block) => block,
                     None => {
-                        self.blocks.push(ChatBlock::Thinking {
+                        self.push_block(ChatBlock::Thinking {
                             content: String::new(),
                             expanded: self.thinking_expanded,
                             elapsed: Elapsed::started(),
@@ -1076,6 +1142,7 @@ impl UiState {
                 if let ChatBlock::Thinking { content, .. } = &mut self.blocks[block] {
                     content.push_str(&delta);
                 }
+                self.bump_render(block);
             }
             Event::TextDelta(delta) => {
                 self.generated_bytes += delta.len();
@@ -1083,7 +1150,7 @@ impl UiState {
                 let block = match self.assistant {
                     Some(block) => block,
                     None => {
-                        self.blocks.push(ChatBlock::Message {
+                        self.push_block(ChatBlock::Message {
                             label: "Assistant".into(),
                             content: String::new(),
                             images: Vec::new(),
@@ -1100,6 +1167,7 @@ impl UiState {
                 if let ChatBlock::Message { content, .. } = &mut self.blocks[block] {
                     content.push_str(&delta);
                 }
+                self.bump_render(block);
             }
             Event::ToolCallDelta {
                 index,
@@ -1111,7 +1179,7 @@ impl UiState {
                 let block = match self.tool_drafts.get(&index).copied() {
                     Some(block) => block,
                     None => {
-                        self.blocks.push(ChatBlock::Tool {
+                        self.push_block(ChatBlock::Tool {
                             call_id: None,
                             name: String::new(),
                             arguments: String::new(),
@@ -1140,6 +1208,7 @@ impl UiState {
                     counter.push(&arguments);
                     block_arguments.push_str(&arguments);
                 }
+                self.bump_render(block);
             }
             Event::ToolCallFinished { index, call } => {
                 if let Some(block) = self.tool_drafts.remove(&index) {
@@ -1158,6 +1227,7 @@ impl UiState {
                         *status = ToolStatus::Pending;
                     }
                     self.tool_calls.insert(call.id, block);
+                    self.bump_render(block);
                 }
             }
             Event::ApprovalRequested(call) => {
@@ -1179,7 +1249,7 @@ impl UiState {
                 self.set_tool_status(&call_id, ToolStatus::Running);
             }
             Event::ToolOutputDelta { call_id, delta } => {
-                if let Some(block) = self.tool_calls.get(&call_id).copied()
+                let changed = if let Some(block) = self.tool_calls.get(&call_id).copied()
                     && let ChatBlock::Tool {
                         output,
                         status,
@@ -1190,6 +1260,12 @@ impl UiState {
                 {
                     counter.push(&delta);
                     output.get_or_insert_with(String::new).push_str(&delta);
+                    Some(block)
+                } else {
+                    None
+                };
+                if let Some(block) = changed {
+                    self.bump_render(block);
                 }
             }
             Event::ToolResult {
@@ -1199,7 +1275,7 @@ impl UiState {
                 diff,
             } => {
                 self.tool_running = false;
-                if let Some(block) = self.tool_calls.get(&call_id).copied()
+                let changed = if let Some(block) = self.tool_calls.get(&call_id).copied()
                     && let ChatBlock::Tool {
                         output: block_output,
                         diff: block_diff,
@@ -1221,6 +1297,12 @@ impl UiState {
                     } else {
                         ToolStatus::Failed
                     };
+                    Some(block)
+                } else {
+                    None
+                };
+                if let Some(block) = changed {
+                    self.bump_render(block);
                 }
             }
             Event::Retrying { seconds } => {
@@ -1255,6 +1337,8 @@ impl UiState {
                     })
                     .unwrap_or_else(|| self.blocks.len());
                 self.blocks.insert(index, block);
+                self.render_revisions.insert(index, 0);
+                self.layout_generation = self.layout_generation.wrapping_add(1);
                 // Inserting before the current user shifts every later
                 // block: re-index the stored positions so the active
                 // tool's deltas and result still land on its block.
@@ -1283,7 +1367,8 @@ impl UiState {
             }
             Event::GenerationCancelled => {
                 self.finish_reasoning();
-                for block in &mut self.blocks {
+                let mut changed = Vec::new();
+                for (index, block) in self.blocks.iter_mut().enumerate() {
                     if let ChatBlock::Tool {
                         output,
                         status,
@@ -1304,11 +1389,15 @@ impl UiState {
                         if output.is_none() {
                             *output = Some(CANCELLED_BY_USER.into());
                             counter.push(CANCELLED_BY_USER);
+                            changed.push(index);
                         }
                         elapsed.finish();
                     }
                 }
-                self.blocks.push(ChatBlock::Message {
+                for index in changed {
+                    self.bump_render(index);
+                }
+                self.push_block(ChatBlock::Message {
                     label: "System".into(),
                     content: CANCELLED_BY_USER.into(),
                     images: Vec::new(),
@@ -1425,12 +1514,14 @@ impl UiState {
 
     fn set_history(&mut self, messages: Vec<Message>) {
         self.blocks.clear();
+        self.render_revisions.clear();
+        self.layout_generation = self.layout_generation.wrapping_add(1);
         self.tool_calls.clear();
         for message in messages {
             match message {
                 Message::System { content } => {
                     let (content, summary) = Self::compaction_marker(content);
-                    self.blocks.push(ChatBlock::Message {
+                    self.push_block(ChatBlock::Message {
                         label: "System".into(),
                         content,
                         images: Vec::new(),
@@ -1440,7 +1531,7 @@ impl UiState {
                         summary,
                     });
                 }
-                Message::User { content, images } => self.blocks.push(ChatBlock::Message {
+                Message::User { content, images } => self.push_block(ChatBlock::Message {
                     label: "You".into(),
                     content,
                     images,
@@ -1457,14 +1548,14 @@ impl UiState {
                     response_items: _,
                 } => {
                     if !reasoning.is_empty() {
-                        self.blocks.push(ChatBlock::Thinking {
+                        self.push_block(ChatBlock::Thinking {
                             content: reasoning,
                             expanded: self.thinking_expanded,
                             elapsed: Elapsed::default(),
                         });
                     }
                     if !content.is_empty() {
-                        self.blocks.push(ChatBlock::Message {
+                        self.push_block(ChatBlock::Message {
                             label: "Assistant".into(),
                             content,
                             images: Vec::new(),
@@ -1477,7 +1568,7 @@ impl UiState {
                     for call in tool_calls {
                         let mut counter = ToolCounter::default();
                         counter.push(&call.arguments.to_string());
-                        self.blocks.push(ChatBlock::Tool {
+                        self.push_block(ChatBlock::Tool {
                             call_id: Some(call.id.clone()),
                             name: call.name,
                             arguments: serde_json::to_string_pretty(&call.arguments)
