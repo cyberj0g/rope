@@ -2164,6 +2164,14 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
     let mut images = Vec::new();
     let mut row = 0u16;
     for (index, block) in state.blocks.iter().enumerate() {
+        let decorated = is_decorated_message(block);
+        let previous_decorated = index
+            .checked_sub(1)
+            .is_some_and(|previous| is_decorated_message(&state.blocks[previous]));
+        if decorated && !previous_decorated {
+            lines.push(Line::default());
+            row = row.saturating_add(1);
+        }
         let section_start = row;
         let selected = state.selected() == Some(index);
         let entry = cache
@@ -2190,8 +2198,10 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
         lines.extend(entry.lines.iter().cloned());
         row = row.saturating_add(body_rows);
         let section_end = row;
-        lines.push(Line::default());
-        row = row.saturating_add(1);
+        if decorated {
+            lines.push(Line::default());
+            row = row.saturating_add(1);
+        }
         if has_block_header(block) {
             headers.push((index, header_row, header_height));
             sections.push((index, section_start, section_end));
@@ -2319,7 +2329,7 @@ fn block_body_lines(
             summary,
             ..
         } => match kind {
-            MessageKind::User | MessageKind::Assistant => {
+            MessageKind::User | MessageKind::Assistant | MessageKind::Status => {
                 if *expanded {
                     let rendered = if matches!(kind, MessageKind::User) {
                         markdown_preserving_breaks(content)
@@ -2426,11 +2436,12 @@ fn block_header(
             let color = match kind {
                 MessageKind::User => Color::Cyan,
                 MessageKind::Assistant => Color::Blue,
+                MessageKind::Status => Color::Yellow,
                 MessageKind::System => Color::Magenta,
                 MessageKind::Error => Color::Red,
             };
             let line = match kind {
-                MessageKind::User | MessageKind::Assistant => {
+                MessageKind::User | MessageKind::Assistant | MessageKind::Status => {
                     let header = format!("{} {label}", if *expanded { "▾" } else { "▸" });
                     if matches!(kind, MessageKind::Assistant) && !model.is_empty() {
                         assistant_header(header, model, color, selected)
@@ -2523,11 +2534,30 @@ fn block_header(
 fn has_block_header(block: &ChatBlock) -> bool {
     match block {
         ChatBlock::Message { kind, summary, .. } => {
-            matches!(kind, MessageKind::User | MessageKind::Assistant)
-                || (matches!(kind, MessageKind::System) && summary.is_some())
+            matches!(
+                kind,
+                MessageKind::User | MessageKind::Assistant | MessageKind::Status
+            ) || (matches!(kind, MessageKind::System) && summary.is_some())
         }
         ChatBlock::Thinking { .. } | ChatBlock::Tool { .. } => true,
     }
+}
+
+/// Blocks that separate the conversation: user, assistant, and system
+/// messages get a blank line before and after, while thinking and tool
+/// blocks stay packed line after line.
+fn is_decorated_message(block: &ChatBlock) -> bool {
+    matches!(
+        block,
+        ChatBlock::Message {
+            kind:
+                MessageKind::User
+                | MessageKind::Assistant
+                | MessageKind::Status
+                | MessageKind::System,
+            ..
+        }
+    )
 }
 
 fn image_cell_area(image: &ImageContent, area: Rect, font_size: (u16, u16)) -> (u16, u16) {
@@ -3513,14 +3543,15 @@ mod tests {
         let area = Rect::new(0, 3, 80, 12);
 
         let layout = chat_layout(&state, area, &mut renders.chat);
-        let header = layout.lines[0]
+        assert_eq!(layout.lines[0].to_string(), "");
+        let header = layout.lines[1]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(header, "▸ System: context compacted · 13 chars");
         assert_eq!(
-            chat_hit_test(&state, area, area.y, &mut renders.chat),
+            chat_hit_test(&state, area, area.y + 1, &mut renders.chat),
             Some(0)
         );
         assert!(
@@ -3533,13 +3564,13 @@ mod tests {
         state.select(0);
         state.toggle_selected();
         let layout = chat_layout(&state, area, &mut renders.chat);
-        let header = layout.lines[0]
+        let header = layout.lines[1]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(header, "▾ System: context compacted · 13 chars");
-        assert_eq!(layout.lines[1].to_string(), " dense summary");
+        assert_eq!(layout.lines[2].to_string(), " dense summary");
     }
 
     #[tokio::test]
@@ -3555,7 +3586,7 @@ mod tests {
         let mouse = |kind| MouseEvent {
             kind,
             column: area.x + 1,
-            row: area.y,
+            row: area.y + 1,
             modifiers: KeyModifiers::NONE,
         };
 
@@ -4546,8 +4577,43 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(text[0], "▾ You");
-        assert_eq!(text[1], " hello");
+        assert_eq!(text[0], "");
+        assert_eq!(text[1], "▾ You");
+        assert_eq!(text[2], " hello");
+    }
+
+    #[test]
+    fn status_header_is_labeled_and_colored_distinctly() {
+        let mut state = UiState::new();
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("checking first".into()));
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("read".into()),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+        });
+        state.apply(Event::ToolCallFinished {
+            index: 0,
+            call: crate::runtime::ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": "src/main.rs" }),
+            },
+        });
+
+        let mut renders = RenderState::new();
+        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10), &mut renders.chat);
+        let status_line = layout
+            .lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "▾ Status"))
+            .expect("status header");
+        let span = status_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "▾ Status")
+            .unwrap();
+        assert_eq!(span.style.fg, Some(Color::Gray));
     }
 
     #[test]

@@ -17,6 +17,9 @@ const IMAGE_SENTINEL: char = '\u{fffc}';
 pub enum MessageKind {
     User,
     Assistant,
+    /// An intermediate assistant message whose turn ended in tool calls
+    /// rather than a final answer.
+    Status,
     System,
     Error,
 }
@@ -376,6 +379,20 @@ impl UiState {
     fn bump_render(&mut self, index: usize) {
         if let Some(revision) = self.render_revisions.get_mut(index) {
             *revision += 1;
+        }
+    }
+
+    /// A model turn that requested tools is an intermediate status, not a
+    /// final answer: relabel the current assistant message once the first
+    /// tool call starts streaming.
+    fn mark_assistant_status(&mut self) {
+        if let Some(assistant) = self.assistant
+            && let ChatBlock::Message { kind, label, .. } = &mut self.blocks[assistant]
+            && matches!(*kind, MessageKind::Assistant)
+        {
+            *kind = MessageKind::Status;
+            *label = "Status".into();
+            self.bump_render(assistant);
         }
     }
 
@@ -986,7 +1003,7 @@ impl UiState {
     pub fn toggle(&mut self, index: usize) {
         if let Some(
             ChatBlock::Message {
-                kind: MessageKind::User | MessageKind::Assistant,
+                kind: MessageKind::User | MessageKind::Assistant | MessageKind::Status,
                 expanded,
                 ..
             }
@@ -1008,7 +1025,7 @@ impl UiState {
     pub fn collapse(&mut self, index: usize) {
         if let Some(
             ChatBlock::Message {
-                kind: MessageKind::User | MessageKind::Assistant,
+                kind: MessageKind::User | MessageKind::Assistant | MessageKind::Status,
                 expanded,
                 ..
             }
@@ -1209,6 +1226,7 @@ impl UiState {
                     block_arguments.push_str(&arguments);
                 }
                 self.bump_render(block);
+                self.mark_assistant_status();
             }
             Event::ToolCallFinished { index, call } => {
                 if let Some(block) = self.tool_drafts.remove(&index) {
@@ -1229,6 +1247,7 @@ impl UiState {
                     self.tool_calls.insert(call.id, block);
                     self.bump_render(block);
                 }
+                self.mark_assistant_status();
             }
             Event::ApprovalRequested(call) => {
                 for block in self.tool_calls.values().copied() {
@@ -1555,12 +1574,19 @@ impl UiState {
                         });
                     }
                     if !content.is_empty() {
+                        // A turn that requested tools is an intermediate
+                        // status, not a final answer.
+                        let intermediate = !tool_calls.is_empty();
                         self.push_block(ChatBlock::Message {
-                            label: "Assistant".into(),
+                            label: if intermediate { "Status" } else { "Assistant" }.into(),
                             content,
                             images: Vec::new(),
                             model,
-                            kind: MessageKind::Assistant,
+                            kind: if intermediate {
+                                MessageKind::Status
+                            } else {
+                                MessageKind::Assistant
+                            },
                             expanded: true,
                             summary: None,
                         });
@@ -1657,7 +1683,7 @@ fn collapsible(block: &ChatBlock) -> bool {
     matches!(
         block,
         ChatBlock::Message {
-            kind: MessageKind::User | MessageKind::Assistant,
+            kind: MessageKind::User | MessageKind::Assistant | MessageKind::Status,
             ..
         } | ChatBlock::Message {
             kind: MessageKind::System,
@@ -2112,6 +2138,106 @@ mod tests {
                 expanded: false,
                 ..
             } if output == "contents"
+        ));
+    }
+
+    #[test]
+    fn tool_calling_assistant_message_is_labeled_status() {
+        let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
+        state.apply(Event::ModelRequestStarted("test-model".into()));
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("Let me check the file first.".into()));
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("read".into()),
+            arguments: r#"{"path":"src/main.rs"}"#.into(),
+        });
+
+        // The moment the first tool call starts streaming, the turn is an
+        // intermediate status rather than a final answer.
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                label,
+                kind: MessageKind::Status,
+                ..
+            } if label == "Status"
+        ));
+
+        state.apply(Event::ToolCallFinished {
+            index: 0,
+            call: ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+        });
+
+        // An assistant turn that requests tools is an intermediate status.
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                label,
+                kind: MessageKind::Status,
+                content,
+                ..
+            } if label == "Status"
+                && content == "Let me check the file first."
+        ));
+
+        state.apply(Event::ModelRequestStarted("test-model".into()));
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::TextDelta("Here is the answer.".into()));
+        state.apply(Event::GenerationFinished);
+
+        // The final assistant turn keeps its label.
+        assert!(matches!(
+            state.blocks.last(),
+            Some(ChatBlock::Message {
+                label,
+                kind: MessageKind::Assistant,
+                ..
+            }) if label == "Assistant"
+        ));
+    }
+
+    #[test]
+    fn loaded_history_marks_tool_calling_turns_as_status() {
+        let mut state = UiState::new();
+        state.apply(Event::History(vec![
+            Message::user("do the thing".into()),
+            Message::assistant(
+                "Checking first.".into(),
+                "test-model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "src/main.rs" }),
+                }],
+            ),
+            Message::tool("call_1".into(), "contents".into(), None, None),
+            Message::assistant("All done.".into(), "test-model".into(), String::new(), vec![]),
+        ]));
+
+        // Blocks: you, status, tool, assistant.
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Message {
+                label,
+                kind: MessageKind::Status,
+                content,
+                ..
+            } if label == "Status" && content == "Checking first."
+        ));
+        assert!(matches!(
+            state.blocks.last(),
+            Some(ChatBlock::Message {
+                label,
+                kind: MessageKind::Assistant,
+                ..
+            }) if label == "Assistant"
         ));
     }
 

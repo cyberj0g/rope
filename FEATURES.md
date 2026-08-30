@@ -78,11 +78,13 @@ External tools receive their function arguments as JSON on stdin and must return
 - collapsible messages plus collapsed-by-default thinking and tool sections; right-clicking anywhere in an expanded section collapses it
 - live elapsed time on thinking and tool calls with compact duration units
 - one-space conversation content padding with flush section headers
+- blank lines around You, Assistant, and System messages only; thinking and tool blocks render line after line with no spacing between them
 - fixed-width, color-coded connecting, waiting-for-first-response, generating, tool-running, idle, and error status
 - failed turns preserve the visible transcript and append the error to the conversation
 - case-insensitive `Ctrl+F` chat search with highlighted, wrapping `F3` navigation
 - separately colored model and reasoning details on the padded input box; session tokens and cost on the status bar
 - generating model recorded beside each assistant response
+- intermediate assistant turns whose model request ends in tool calls relabel live from `Assistant` to a gray `Status` header as soon as the first tool call starts streaming, while the turn's final answer keeps the blue `Assistant` header; reloaded sessions apply the same rule from persisted tool calls
 - full-width conversation view with deliberate trailing whitespace
 - bounded bottom-follow chat scrolling that holds the viewport through streaming, collapses, and full-screen diff visits
 - distinctly colored session, token, context, price, and current-directory fields on the status bar, plus estimated live generation speed and the exact reported average while idle
