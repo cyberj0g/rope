@@ -32,9 +32,12 @@ const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
 /// Floor for the per-call tool output budget, in tokens (4 bytes each).
 /// Even near the context limit, a tool result always carries its control
 /// fields — e.g. a shell job's status and job_id — so the model can keep
-/// polling or cancelling instead of losing track of the command. The floor
-/// is clamped to the remaining context, so the result can never push the
-/// next model request past max_context_tokens.
+/// polling or cancelling instead of losing track of the command. The
+/// budget is measured after reserving the Tool message's own framing
+/// (role, call id) and per-message overhead, and when even the floor no
+/// longer fits the conversation is compacted mid-turn before the tool
+/// runs, so the result can never push the next model request past
+/// max_context_tokens.
 const MIN_TOOL_OUTPUT_TOKENS: u64 = 32; // 128 bytes
 /// Hard cap on the tool calls one assistant message may batch. The cap
 /// resets for every assistant message, so a turn may run as many model
@@ -740,7 +743,7 @@ async fn turn<P: Provider>(
     let max_tokens = config.active_model().max_context_tokens;
     if estimated as f64 >= max_tokens as f64 * config.compaction_threshold as f64 {
         let user = messages.pop().context("missing user message")?;
-        let summary = compact(provider.clone(), config, messages, events, internal).await?;
+        let summary = summarize(provider.clone(), config, &messages, events, internal).await?;
         messages = vec![
             Message::system(format!("Conversation summary for continuation:\n{summary}")),
             user,
@@ -751,18 +754,22 @@ async fn turn<P: Provider>(
         });
     }
     let persist_from = messages.len().saturating_sub(1);
-    let completed = agent(
+    let (completed, mid_turn_compaction) = agent(
         provider.clone(),
         tools,
         config,
         messages,
         persist_from,
+        visible_through,
         project_prompt,
         current_plan,
         events,
         internal,
     )
     .await?;
+    if let Some(mid_turn) = mid_turn_compaction {
+        compaction = Some(mid_turn);
+    }
     let title = if generate_title {
         Some(generate_session_title(provider, config, &completed, events, internal).await)
     } else {
@@ -775,10 +782,13 @@ async fn turn<P: Provider>(
     })
 }
 
-async fn compact<P: Provider>(
+/// Summarizes `messages` into a dense continuation summary in its own
+/// light-reasoning model request. Used for the turn-start compaction and
+/// for the mid-turn compaction that frees room for a tool result.
+async fn summarize<P: Provider>(
     provider: Arc<P>,
     config: &Config,
-    messages: Vec<Message>,
+    messages: &[Message],
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<String> {
@@ -791,7 +801,7 @@ async fn compact<P: Provider>(
         "Summarize this conversation for seamless continuation. Preserve requirements, decisions, files, commands, errors, results, and unresolved work. Be dense and factual. Return only the summary."
             .into(),
     )];
-    request_messages.extend(messages);
+    request_messages.extend(messages.iter().cloned());
     let request = CompletionRequest {
         provider: config.provider_name().to_owned(),
         model: config.model_id().to_owned(),
@@ -969,18 +979,32 @@ fn estimate_tokens(messages: &[Message]) -> u64 {
     (bytes.div_ceil(4) + messages.len() * 4) as u64
 }
 
+/// Tokens a Tool message costs before its content: the role, call id,
+/// image and diff slots, plus the per-message overhead of
+/// `estimate_tokens`. Reserved before the tool runs, so the content budget
+/// is what the next model request actually has left.
+fn tool_message_overhead(call: &ToolCall) -> u64 {
+    let message = Message::tool(call.id.clone(), String::new(), None, None);
+    estimate_tokens(std::slice::from_ref(&message))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn agent<P: Provider>(
     provider: Arc<P>,
     tools: &ToolRegistry,
     config: &Config,
     mut messages: Vec<Message>,
-    persist_from: usize,
+    mut persist_from: usize,
+    user_full_index: usize,
     project_prompt: Option<String>,
     mut current_plan: Option<ExecutionPlan>,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
-) -> Result<Vec<Message>> {
+) -> Result<(Vec<Message>, Option<Compaction>)> {
+    let mut compaction = None;
+    // One mid-turn compaction per turn: if it cannot free room, the turn
+    // fails instead of overflowing the context or looping.
+    let mut compacted_mid_turn = false;
     loop {
         events
             .send(Event::ModelRequestStarted(config.model_id().to_owned()))
@@ -1032,7 +1056,7 @@ async fn agent<P: Provider>(
             // The turn is done: no job outlives it, so a command the model
             // stopped polling is killed instead of running unattended.
             tools.cancel_active().await;
-            return Ok(messages[persist_from..].to_vec());
+            return Ok((messages[persist_from..].to_vec(), compaction));
         }
 
         for (index, call) in calls.iter().enumerate() {
@@ -1047,6 +1071,53 @@ async fn agent<P: Provider>(
 
         for call in calls {
             let entry = tools.get(&call.name)?;
+            // The result is one Tool message: reserve its framing (role,
+            // call id) and per-message overhead up front, so the budget
+            // bounds the next model request, not just the content.
+            let overhead = tool_message_overhead(&call);
+            let max_tokens = config.active_model().max_context_tokens;
+            let mut remaining = max_tokens.saturating_sub(used_context_tokens);
+            if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
+                // Not even the control envelope fits. Compact the
+                // conversation up to this turn's user message — the user,
+                // the assistant calls, and the results delivered so far
+                // all stay, so results still match their calls — and
+                // measure the freed context.
+                let boundary = persist_from;
+                if boundary == 0 || compacted_mid_turn {
+                    bail!("context exhausted: no room left for a tool result");
+                }
+                let summary = summarize(
+                    provider.clone(),
+                    config,
+                    &messages[..boundary],
+                    events,
+                    internal,
+                )
+                .await?;
+                messages.splice(
+                    0..boundary,
+                    [Message::system(format!(
+                        "Conversation summary for continuation:\n{summary}"
+                    ))],
+                );
+                persist_from = 1;
+                compacted_mid_turn = true;
+                compaction = Some(Compaction {
+                    summary,
+                    through: user_full_index,
+                });
+                used_context_tokens = max_tokens.saturating_sub(available_context_tokens(
+                    &messages,
+                    config,
+                    project_prompt.as_deref(),
+                    current_plan.as_ref(),
+                ));
+                remaining = max_tokens.saturating_sub(used_context_tokens);
+                if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
+                    bail!("context exhausted: compaction could not free room for a tool result");
+                }
+            }
             let approved = match entry.approval {
                 Approval::Allow => true,
                 Approval::Deny => false,
@@ -1063,13 +1134,11 @@ async fn agent<P: Provider>(
             };
             // The streaming cap mirrors the final truncation, so the chat
             // never shows output the model context will keep beyond it.
-            // The floor keeps the control envelope intact near the limit,
-            // clamped so the result never exceeds the remaining context.
-            let remaining = config
-                .active_model()
-                .max_context_tokens
-                .saturating_sub(used_context_tokens);
-            let output_tokens = (remaining / 5).max(MIN_TOOL_OUTPUT_TOKENS).min(remaining);
+            // The floor keeps the control envelope intact near the limit;
+            // after the framing reservation, the whole result — content,
+            // role, and call id — fits the remaining context.
+            let available = remaining.saturating_sub(overhead);
+            let output_tokens = (available / 5).max(MIN_TOOL_OUTPUT_TOKENS).min(available);
             let max_streamed_bytes =
                 output_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
             let result = if approved {
@@ -1444,11 +1513,12 @@ mod tests {
         ]]));
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &ToolRegistry::default(),
             &Config::default(),
             vec![Message::user("hi".into())],
+            0,
             0,
             None,
             None,
@@ -1503,6 +1573,7 @@ mod tests {
             &Config::default(),
             vec![Message::user("hi".into())],
             0,
+            0,
             None,
             None,
             &event_tx,
@@ -1554,11 +1625,12 @@ mod tests {
         tools.insert(Echo, Approval::Allow);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &tools,
             &Config::default(),
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1615,11 +1687,12 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
 
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &tools,
             &Config::default(),
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1680,7 +1753,7 @@ mod tests {
                 },
                 ResponseDelta::Usage(Usage {
                     prompt_tokens: 0,
-                    total_tokens: 80,
+                    total_tokens: 152,
                 }),
             ],
             vec![ResponseDelta::Text("finished".into())],
@@ -1688,7 +1761,7 @@ mod tests {
         let mut tools = ToolRegistry::default();
         tools.insert(SlowEcho(vec!["12345678".into(); 32]), Approval::Allow);
         let mut config = Config::default();
-        config.models[0].max_context_tokens = 100;
+        config.models[0].max_context_tokens = 200;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
         // Drain events while the agent runs: with enough tool output deltas
@@ -1706,6 +1779,7 @@ mod tests {
             &tools,
             &config,
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1730,10 +1804,12 @@ mod tests {
                 .any(|event| matches!(event, Event::ToolResult { .. })),
             "expected a tool result event"
         );
-        // The budget is (100 - 80) / 5 = 4 tokens, floored to 32 and
-        // clamped to the 20 remaining tokens: 80 bytes, so exactly ten
-        // eight-byte chunks are forwarded.
-        assert_eq!(streamed, "12345678".repeat(10));
+        // The budget is the 48 remaining tokens minus the 16-token Tool
+        // message framing: the 32-token control minimum — 128 bytes, so
+        // exactly sixteen eight-byte chunks are forwarded, and
+        // 152 + 16 + 32 hits the 200-token limit exactly without
+        // exceeding it.
+        assert_eq!(streamed, "12345678".repeat(16));
     }
 
     #[tokio::test]
@@ -1748,16 +1824,16 @@ mod tests {
                 },
                 ResponseDelta::Usage(Usage {
                     prompt_tokens: 0,
-                    total_tokens: 80,
+                    total_tokens: 152,
                 }),
             ],
             vec![ResponseDelta::Text("finished".into())],
         ]));
         let mut tools = ToolRegistry::default();
-        // One 1000-byte delta, far larger than the 80-byte budget.
+        // One 1000-byte delta, far larger than the 128-byte budget.
         tools.insert(SlowEcho(vec!["a".repeat(1_000)]), Approval::Allow);
         let mut config = Config::default();
-        config.models[0].max_context_tokens = 100;
+        config.models[0].max_context_tokens = 200;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
         let collector = tokio::spawn(async move {
@@ -1773,6 +1849,7 @@ mod tests {
             &tools,
             &config,
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1791,9 +1868,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The final delta is sliced to the remaining allowance, so the
-        // cap holds exactly.
-        assert_eq!(streamed, "a".repeat(80));
+        // The budget is the 48 remaining tokens minus the Tool message
+        // framing: 128 bytes. The final delta is sliced to the remaining
+        // allowance, so the cap holds exactly.
+        assert_eq!(streamed, "a".repeat(128));
     }
 
     #[tokio::test]
@@ -1814,11 +1892,12 @@ mod tests {
         tools.insert(Echo, Approval::Allow);
         let (event_tx, _) = mpsc::channel(512);
         let (internal_tx, _) = mpsc::channel(2);
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &tools,
             &Config::default(),
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1858,11 +1937,12 @@ mod tests {
         tools.insert(Echo, Approval::Allow);
         let (event_tx, _) = mpsc::channel(4096);
         let (internal_tx, _) = mpsc::channel(2);
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &tools,
             &Config::default(),
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1909,11 +1989,12 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(32);
         let (internal_tx, mut internal_rx) = mpsc::channel(4);
 
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &tools,
             &config,
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1926,9 +2007,11 @@ mod tests {
 
         assert!(matches!(
             &completed[2],
-            // (100 - 50) / 5 = 10 tokens, floored to the 32-token control
-            // envelope minimum, which still fits the 50 remaining tokens:
-            // 128 bytes.
+            // 100 - 50 = 50 remaining tokens, minus the 16-token Tool
+            // message framing: 34, which floors to the 32-token control
+            // minimum: 128 bytes. 50 + 16 + 32 = 98 stays under the
+            // 100-token limit, where the framing-less old budget (50 +
+            // 128) would have overflowed it.
             Message::Tool { content, .. }
                 if content.ends_with("[tool output truncated]") && content.len() <= 128
         ));
@@ -1946,7 +2029,7 @@ mod tests {
                 },
                 ResponseDelta::Usage(Usage {
                     prompt_tokens: 0,
-                    total_tokens: 64,
+                    total_tokens: 150,
                 }),
             ],
             vec![ResponseDelta::Text("finished".into())],
@@ -1956,16 +2039,17 @@ mod tests {
         tools.insert(ShellTool(jobs.clone()), Approval::Allow);
         tools.insert(ShellPollTool(jobs), Approval::Allow);
         let mut config = Config::default();
-        config.models[0].max_context_tokens = 100;
+        config.models[0].max_context_tokens = 200;
         let (event_tx, event_rx) = mpsc::channel(16);
         drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(4);
 
-        let completed = agent(
-            provider,
+        let (completed, _) = agent(
+            provider.clone(),
             &tools,
             &config,
             vec![Message::user("run it".into())],
+            0,
             0,
             None,
             None,
@@ -1975,10 +2059,12 @@ mod tests {
         .await
         .unwrap();
 
-        // (100 - 64) / 5 = 7 tokens: without the floor the 128-byte
-        // envelope would be truncated and lose the job_id, and the command
-        // could never be polled or cancelled. The floor keeps the control
-        // fields while still fitting the remaining context.
+        // 200 - 150 = 50 remaining tokens, minus the 16-token Tool message
+        // framing: 34, floored to the 32-token control minimum. Without
+        // the floor the 40-byte envelope would be truncated and lose the
+        // job_id, and the command could never be polled or cancelled. The
+        // floor keeps the control fields, and 150 + 16 + 32 = 198 stays
+        // under the limit.
         assert!(matches!(
             &completed[2],
             Message::Tool { content, .. }
@@ -1986,10 +2072,16 @@ mod tests {
                     && content.contains("job_id: shell-1\n")
                     && !content.ends_with("[tool output truncated]")
         ));
+        // The next model request — with the result's framing — fits.
+        let requests = provider.requests();
+        assert!(
+            estimate_tokens(&requests.last().unwrap().messages)
+                <= config.active_model().max_context_tokens
+        );
     }
 
     #[tokio::test]
-    async fn tool_output_budget_never_exceeds_the_remaining_context() {
+    async fn tool_output_budget_compacts_mid_turn_and_never_exceeds_the_context() {
         let provider = Arc::new(MockProvider::new(vec![
             vec![
                 ResponseDelta::ToolCall {
@@ -2000,9 +2092,12 @@ mod tests {
                 },
                 ResponseDelta::Usage(Usage {
                     prompt_tokens: 0,
-                    total_tokens: 96,
+                    total_tokens: 190,
                 }),
             ],
+            // The mid-turn compaction request: summarize the earlier
+            // conversation.
+            vec![ResponseDelta::Text("Old work done.".into())],
             vec![ResponseDelta::Text("finished".into())],
         ]));
         let mut tools = ToolRegistry::default();
@@ -2010,17 +2105,30 @@ mod tests {
         tools.insert(ShellTool(jobs.clone()), Approval::Allow);
         tools.insert(ShellPollTool(jobs), Approval::Allow);
         let mut config = Config::default();
-        config.models[0].max_context_tokens = 100;
+        config.models[0].max_context_tokens = 200;
         let (event_tx, event_rx) = mpsc::channel(16);
         drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(4);
 
-        let completed = agent(
-            provider,
+        // Only 10 tokens remain — not even the 32-token control envelope
+        // plus the Tool message framing fits — with an earlier
+        // conversation to compact.
+        let (completed, compaction) = agent(
+            provider.clone(),
             &tools,
             &config,
-            vec![Message::user("run it".into())],
-            0,
+            vec![
+                Message::user("old request".into()),
+                Message::assistant(
+                    "old reply".into(),
+                    "model".into(),
+                    String::new(),
+                    Vec::new(),
+                ),
+                Message::user("run it".into()),
+            ],
+            2,
+            7,
             None,
             None,
             &event_tx,
@@ -2029,14 +2137,28 @@ mod tests {
         .await
         .unwrap();
 
-        // Only 4 tokens (16 bytes) remain: the floor clamps to them, so the
-        // result keeps the head of the envelope and can never push the next
-        // model request past max_context_tokens.
+        // The mid-turn compaction lands its marker at the turn's user
+        // message and keeps the user, the call, and the result.
+        let compaction = compaction.expect("expected a mid-turn compaction");
+        assert_eq!(compaction.through, 7);
+        assert_eq!(completed[0], Message::user("run it".into()));
         assert!(matches!(
             &completed[2],
             Message::Tool { content, .. }
-                if content.starts_with("status: running\n") && content.len() <= 16
+                if content.starts_with("status: running\n")
+                    && content.contains("job_id: shell-1\n")
+                    && !content.ends_with("[tool output truncated]")
         ));
+        // The next model request fits the context: before the fix, 128
+        // bytes of content were delivered at 10 remaining tokens and the
+        // full message (content + role + call id) pushed the request past
+        // max_context_tokens while truncating away the job_id.
+        let requests = provider.requests();
+        assert!(
+            estimate_tokens(&requests.last().unwrap().messages)
+                <= config.active_model().max_context_tokens,
+            "next model request must fit the context"
+        );
     }
 
     #[tokio::test]
@@ -2065,11 +2187,12 @@ mod tests {
         // of blocking once the buffer fills.
         drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &tools,
             &Config::default(),
             vec![Message::user("go".into())],
+            0,
             0,
             None,
             None,
@@ -2155,6 +2278,7 @@ mod tests {
                     &config,
                     vec![Message::user("go".into())],
                     0,
+                    0,
                     None,
                     None,
                     &events,
@@ -2189,7 +2313,7 @@ mod tests {
             }
         };
         assert_eq!(approvals, 1, "only the shell start may ask for approval");
-        let completed = agent_result.unwrap().unwrap();
+        let (completed, _) = agent_result.unwrap().unwrap();
 
         // user, three assistant/tool pairs, final assistant
         assert_eq!(completed.len(), 8);
@@ -2266,11 +2390,12 @@ mod tests {
         // Never read: drop the receiver so event sends fail fast.
         drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
-        let completed = agent(
+        let (completed, _) = agent(
             provider,
             &tools,
             &Config::default(),
             vec![Message::user("go".into())],
+            0,
             0,
             None,
             None,

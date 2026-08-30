@@ -274,6 +274,36 @@ struct ShellJob {
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl ShellJob {
+    /// Appends output, keeping the buffer the tail of the stream:
+    /// `total` always covers the buffer, and the oldest bytes are dropped
+    /// once the retention cap is exceeded. Every byte that can be delivered
+    /// later — including terminal error text — must come through here, or
+    /// the absolute offsets no longer line up with the buffer.
+    fn append(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.total += text.len() as u64;
+        self.buffer.push_str(text);
+        // Bound retained memory: the buffer is always the tail of the
+        // stream, so once it grows past the cap drop the oldest bytes —
+        // already-delivered ones first, then the oldest undelivered
+        // ones, which are counted as discarded and reported later.
+        if self.buffer.len() > MAX_SHELL_RETAINED {
+            let cut = floor_char_boundary(&self.buffer, self.buffer.len() - MAX_SHELL_RETAINED);
+            if cut > 0 {
+                let start_after = (self.total - self.buffer.len() as u64) + cut as u64;
+                if start_after > self.delivered {
+                    self.discarded += start_after - self.delivered;
+                    self.delivered = start_after;
+                }
+                self.buffer.drain(..cut);
+            }
+        }
+    }
+}
+
 /// Shared state behind the `shell`, `shell_poll`, and `shell_cancel` tools.
 pub struct ShellJobManager {
     working_dir: PathBuf,
@@ -433,10 +463,15 @@ impl ShellJobManager {
                     job.streamed = job.total;
                 }
                 let terminal = job.state.is_terminal();
-                // No point waiting longer: the envelope cannot carry more
-                // than the budget, and a verbose command would only fill
-                // the retained buffer.
-                let full = job.total - job.delivered >= budget as u64;
+                // The budget covers the whole envelope, so stop waiting
+                // once the undelivered output fills the payload left
+                // after the current header — not once it reaches the raw
+                // budget, which the header alone would overshoot.
+                let discarded = job.discarded.saturating_sub(job.discarded_reported);
+                let allowance = budget
+                    .saturating_sub(envelope_header(job_id, job.state, false, discarded).len());
+                let full =
+                    allowance != 0 && job.total.saturating_sub(job.delivered) >= allowance as u64;
                 (terminal, full)
             };
             if terminal || full {
@@ -606,23 +641,7 @@ impl ShellJobManager {
             let Some(job) = inner.jobs.get_mut(job_id) else {
                 return;
             };
-            job.total += text.len() as u64;
-            job.buffer.push_str(text);
-            // Bound retained memory: the buffer is always the tail of the
-            // stream, so once it grows past the cap drop the oldest bytes —
-            // already-delivered ones first, then the oldest undelivered
-            // ones, which are counted as discarded and reported later.
-            if job.buffer.len() > MAX_SHELL_RETAINED {
-                let cut = floor_char_boundary(&job.buffer, job.buffer.len() - MAX_SHELL_RETAINED);
-                if cut > 0 {
-                    let start_after = (job.total - job.buffer.len() as u64) + cut as u64;
-                    if start_after > job.delivered {
-                        job.discarded += start_after - job.delivered;
-                        job.delivered = start_after;
-                    }
-                    job.buffer.drain(..cut);
-                }
-            }
+            job.append(text);
         }
         self.signal(job_id);
     }
@@ -632,8 +651,11 @@ impl ShellJobManager {
         let Some(job) = inner.jobs.get_mut(job_id) else {
             return;
         };
+        // The trailing error text is output: it must be counted in `total`
+        // and pass through retention before the state flips, or the buffer
+        // stops being the tail of the stream and poll's offsets underflow.
         if let Some(text) = trailing {
-            job.buffer.push_str(&text);
+            job.append(&text);
         }
         job.state = state;
         job.notify.notify_waiters();
@@ -649,6 +671,7 @@ impl ShellJobManager {
 
 /// A not-yet-delivered slice of a job plus the envelope header it is
 /// returned under.
+#[derive(Debug)]
 struct ShellJobSnapshot {
     header: String,
     output: String,
@@ -800,8 +823,17 @@ impl GroupLease {
                 CloseHandle(job);
                 bail!("assign shell to job object");
             }
-            ResumeThread(thread);
+            // ResumeThread returns the previous suspend count, or MAXDWORD
+            // on failure. A failed resume would leave the shell suspended
+            // forever, so fail the lease: closing the job handle (with
+            // kill-on-close) takes the suspended tree down, and the caller
+            // fails the call before the job can register.
+            let resumed = ResumeThread(thread) != u32::MAX;
             CloseHandle(thread);
+            if !resumed {
+                CloseHandle(job);
+                bail!("resume the suspended shell");
+            }
             Ok(GroupLease(job))
         }
     }
@@ -1785,6 +1817,11 @@ mod tests {
             )
             .await
             .unwrap();
+        // Settle the job to terminal state before draining: running chunks
+        // do not mark has_more, so every chunk below is a terminal one.
+        tool.0
+            .wait_terminal("shell-1", Duration::from_secs(5))
+            .await;
         let mut delivered = String::new();
         let mut saw_has_more = false;
         let mut polls = 0;
@@ -1856,6 +1893,95 @@ mod tests {
         // The command is still running; stop it for the test.
         let cancelled = cancel.run(json!({ "job_id": "shell-1" })).await.unwrap();
         assert!(cancelled.output.starts_with("status: cancelled\n"));
+    }
+
+    #[tokio::test]
+    async fn shell_poll_returns_when_the_payload_fills_the_envelope() {
+        let tool = ShellTool(ShellJobManager::new(std::env::temp_dir()));
+        let cancel = ShellCancelTool(tool.0.clone());
+        // 60 bytes fill the payload left after the running header of a
+        // 100-byte envelope: the call must return on the 60th byte, not
+        // wait for 100 bytes of output or the whole yield.
+        let started = Instant::now();
+        let first = tool
+            .run_streamed(
+                json!({
+                    "command": "head -c 60 /dev/zero | tr '\\0' x; sleep 1",
+                    "yield_time_ms": 1000
+                }),
+                None,
+                100,
+            )
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "poll must return once the payload is full, not wait out the yield: {elapsed:?}"
+        );
+        assert!(first.output.starts_with("status: running\n"));
+        assert!(
+            first.output.len() <= 100,
+            "envelope must fit its budget: {:?}",
+            first.output
+        );
+        assert_eq!(
+            envelope_output(&first.output),
+            "x".repeat(60),
+            "the chunk must fill the payload: {:?}",
+            first.output
+        );
+        // The command is still running; stop it for the test.
+        let cancelled = cancel.run(json!({ "job_id": "shell-1" })).await.unwrap();
+        assert!(cancelled.output.starts_with("status: cancelled\n"));
+    }
+
+    #[tokio::test]
+    async fn poll_after_terminal_error_text_keeps_offsets_consistent() {
+        let manager = ShellJobManager::new(std::env::temp_dir());
+        // Fabricate a job mid-stream: 10 bytes produced, 4 delivered.
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let job = ShellJob {
+            buffer: "0123456789".to_string(),
+            total: 10,
+            delivered: 4,
+            streamed: 0,
+            discarded: 0,
+            discarded_reported: 0,
+            state: ShellJobState::Running,
+            notify: Arc::new(Notify::new()),
+            cancel,
+            group: None,
+            handle: None,
+        };
+        manager
+            .inner
+            .lock()
+            .unwrap()
+            .jobs
+            .insert("shell-1".into(), job);
+
+        manager.finish_job(
+            "shell-1",
+            ShellJobState::Finished(None),
+            Some("\n[shell: read command stdout: broken pipe]\n".into()),
+        );
+        let snapshot = manager
+            .poll("shell-1", Duration::from_millis(1), usize::MAX, &None)
+            .await
+            .unwrap();
+        let envelope = snapshot.envelope();
+        assert!(envelope.starts_with("status: finished\n"));
+        assert_eq!(
+            envelope_output(&envelope),
+            "456789\n[shell: read command stdout: broken pipe]\n"
+        );
+        // Fully delivered terminal job is removed.
+        let gone = manager
+            .poll("shell-1", Duration::from_millis(1), usize::MAX, &None)
+            .await
+            .unwrap_err();
+        assert!(gone.to_string().contains("unknown shell job"));
     }
 
     #[tokio::test]
@@ -1941,7 +2067,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // The control header (39 bytes) is kept whole; only the output is
+        // The control header (40 bytes) is kept whole; only the output is
         // squeezed to fit the budget.
         assert!(first.output.starts_with("status: running\n"));
         assert!(
@@ -2093,6 +2219,40 @@ mod tests {
         }
         assert_eq!(streamed, "live");
         assert_eq!(envelope_output(&result.output), "live");
+    }
+
+    #[test]
+    fn terminal_error_text_is_accounted_like_output() {
+        // Worker read/wait failures append trailing text to the job; it is
+        // output, so it must go through the same accounting as normal
+        // output, or the buffer stops being the tail of the stream and
+        // poll's absolute offsets underflow.
+        let (cancel, _cancel_rx) = watch::channel(false);
+        let mut job = ShellJob {
+            buffer: String::new(),
+            total: 0,
+            delivered: 0,
+            streamed: 0,
+            discarded: 0,
+            discarded_reported: 0,
+            state: ShellJobState::Running,
+            notify: Arc::new(Notify::new()),
+            cancel,
+            group: None,
+            handle: None,
+        };
+        job.append("hello");
+        job.append("\n[shell: read command stdout: broken pipe]\n");
+
+        assert_eq!(job.total, job.buffer.len() as u64);
+        assert_eq!(
+            job.buffer,
+            "hello\n[shell: read command stdout: broken pipe]\n"
+        );
+        // What poll computes to locate the buffer in the stream.
+        let buffer_start = job.total - job.buffer.len() as u64;
+        assert_eq!(buffer_start, 0);
+        assert_eq!(job.delivered, 0);
     }
 
     #[test]
