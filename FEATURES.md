@@ -38,7 +38,7 @@
 - iterative model → tool → model execution, with the 64 tool call cap applied per assistant message so long turns keep running instead of failing after a fixed number of model turns
 - immediate Escape cancellation with force-killed command process trees, preserved partial model and command output, failed in-flight tools, and a persisted cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
-- configurable context fill tracking and automatic continuation compaction that replays the persisted summary into model context
+- configurable context fill tracking and automatic continuation compaction that allows light reasoning, accepts reasoning-only summaries, and replays the persisted summary into model context
 - preserved visible transcripts with persisted `Context compacted` markers whose summary stays in history as a collapsed chat section
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - tool approval controls in the composer with paused execution timing across batched calls, session-persisted approvals, and decision markers retained in conversation history

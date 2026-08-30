@@ -819,6 +819,7 @@ async fn summarize<P: Provider>(
     };
     let mut stream = stream_with_retry(&provider, request, events).await?;
     let mut summary = String::new();
+    let mut reasoning = String::new();
     let mut started = false;
     while let Some(delta) = stream.next().await {
         let delta = delta?;
@@ -828,18 +829,22 @@ async fn summarize<P: Provider>(
         }
         match delta {
             ResponseDelta::Text(text) => summary.push_str(&text),
+            ResponseDelta::Reasoning(text) => reasoning.push_str(&text),
             ResponseDelta::Usage(usage) => {
-                internal.send(InternalEvent::Usage(usage)).await?;
+                internal.send(InternalEvent::AuxiliaryUsage(usage)).await?;
             }
-            ResponseDelta::Reasoning(_)
-            | ResponseDelta::ToolCall { .. }
-            | ResponseDelta::OutputItem(_) => {}
+            ResponseDelta::ToolCall { .. } | ResponseDelta::OutputItem(_) => {}
         }
     }
-    if summary.trim().is_empty() {
+    let summary = if summary.trim().is_empty() {
+        reasoning.trim()
+    } else {
+        summary.trim()
+    };
+    if summary.is_empty() {
         bail!("compaction returned an empty summary");
     }
-    let summary = summary.trim().to_owned();
+    let summary = summary.to_owned();
     events
         .send(Event::ContextCompacted {
             summary: summary.clone(),
@@ -2763,7 +2768,49 @@ mod tests {
         }
         assert!(matches!(
             internal_rx.recv().await,
-            Some(InternalEvent::Usage(Usage {
+            Some(InternalEvent::AuxiliaryUsage(Usage {
+                total_tokens: 100,
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_accepts_a_reasoning_only_summary() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::Reasoning("Dense continuation summary".into()),
+            ResponseDelta::Usage(Usage {
+                prompt_tokens: 90,
+                total_tokens: 100,
+            }),
+        ]]));
+        let mut config = Config::default();
+        config.models[0].reasoning_efforts = vec![
+            ReasoningEffort::None,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+        ];
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (internal_tx, mut internal_rx) = mpsc::channel(2);
+
+        let summary = summarize(
+            provider.clone(),
+            &config,
+            &[Message::user("old turn".into())],
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary, "Dense continuation summary");
+        assert_eq!(
+            provider.requests()[0].reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
+        assert!(matches!(
+            internal_rx.recv().await,
+            Some(InternalEvent::AuxiliaryUsage(Usage {
                 total_tokens: 100,
                 ..
             }))

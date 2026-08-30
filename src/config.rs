@@ -273,7 +273,12 @@ impl Config {
     }
 
     pub fn light_reasoning_effort(&self) -> Option<ReasoningEffort> {
-        self.active_model().reasoning_efforts.first().copied()
+        self.active_model()
+            .reasoning_efforts
+            .iter()
+            .copied()
+            .find(|effort| *effort != ReasoningEffort::None)
+            .or_else(|| self.active_model().reasoning_efforts.first().copied())
     }
 
     pub fn set_model(&mut self, value: &str) -> Result<()> {
