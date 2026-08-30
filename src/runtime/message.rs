@@ -115,6 +115,17 @@ impl Message {
         }
     }
 
+    /// The images attached to this message: user-attached or a tool result.
+    pub fn images(&self) -> &[ImageContent] {
+        match self {
+            Self::User { images, .. } => images,
+            Self::Tool {
+                image: Some(image), ..
+            } => std::slice::from_ref(image),
+            _ => &[],
+        }
+    }
+
     #[cfg(test)]
     pub fn content(&self) -> &str {
         match self {

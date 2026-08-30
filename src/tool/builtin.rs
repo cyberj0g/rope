@@ -1399,14 +1399,20 @@ impl Tool for ViewImageTool {
         let data = tokio::fs::read(&target)
             .await
             .with_context(|| format!("read image {}", target.display()))?;
+        // Header-only dimension read: the context budget reserves the
+        // provider's per-image maximum when dimensions are unknown.
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(&data))
+            .into_dimensions()
+            .ok()
+            .unwrap_or((0, 0));
         Ok(ToolResult {
             output: format!("viewed {}", target.display()),
             image: Some(crate::runtime::ImageContent {
                 mime_type: mime_type.into(),
                 data: STANDARD.encode(data),
                 path: None,
-                width: 0,
-                height: 0,
+                width,
+                height,
             }),
             diff: None,
         })

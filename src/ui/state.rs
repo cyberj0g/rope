@@ -1241,20 +1241,24 @@ impl UiState {
                     expanded: false,
                     summary: Some(summary),
                 };
-                let before_user = self.blocks.iter().rposition(|block| {
-                    matches!(
-                        block,
-                        ChatBlock::Message {
-                            kind: MessageKind::User,
-                            ..
-                        }
-                    )
-                });
-                if let Some(index) = before_user {
-                    self.blocks.insert(index, block);
-                } else {
-                    self.blocks.push(block);
-                }
+                let index = self
+                    .blocks
+                    .iter()
+                    .rposition(|block| {
+                        matches!(
+                            block,
+                            ChatBlock::Message {
+                                kind: MessageKind::User,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| self.blocks.len());
+                self.blocks.insert(index, block);
+                // Inserting before the current user shifts every later
+                // block: re-index the stored positions so the active
+                // tool's deltas and result still land on its block.
+                self.shift_block_indices(index, 1);
                 if self.notice.as_deref() == Some("compacting context") {
                     self.notice = None;
                 }
@@ -1353,6 +1357,36 @@ impl UiState {
 
     pub fn average_generation_speed(&self) -> Option<f64> {
         self.average_generation_speed
+    }
+
+    /// Shifts every stored block index at or after `from` by `delta`,
+    /// after an insertion moves the later blocks.
+    fn shift_block_indices(&mut self, from: usize, delta: usize) {
+        for index in self.tool_drafts.values_mut() {
+            if *index >= from {
+                *index += delta;
+            }
+        }
+        for index in self.tool_calls.values_mut() {
+            if *index >= from {
+                *index += delta;
+            }
+        }
+        if let Some(index) = self.assistant
+            && index >= from
+        {
+            self.assistant = Some(index + delta);
+        }
+        if let Some(index) = self.reasoning
+            && index >= from
+        {
+            self.reasoning = Some(index + delta);
+        }
+        if let Some(index) = self.selected
+            && index >= from
+        {
+            self.selected = Some(index + delta);
+        }
     }
 
     fn set_tool_status(&mut self, call_id: &str, value: ToolStatus) {
@@ -1751,6 +1785,84 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn mid_turn_compaction_reindexes_active_tool_blocks() {
+        let mut state = UiState::new();
+        state.push_user("old request".into());
+        state.apply(Event::TextDelta("old answer".into()));
+        state.push_user("run it".into());
+        state.apply(Event::GenerationStarted);
+        state.apply(Event::ModelRequestStarted("model".into()));
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("shell".into()),
+            arguments: "{}".into(),
+        });
+        state.apply(Event::ToolCallFinished {
+            index: 0,
+            call: ToolCall {
+                id: "call_1".into(),
+                name: "shell".into(),
+                arguments: json!({}),
+            },
+        });
+
+        // The mid-turn marker lands before the current user while the
+        // tool block is still pending: the active block must keep
+        // receiving its status and output.
+        state.apply(Event::CompactionStarted);
+        state.apply(Event::ContextCompacted {
+            summary: "mid-turn summary".into(),
+        });
+        state.apply(Event::ToolStarted {
+            call_id: "call_1".into(),
+        });
+        state.apply(Event::ToolOutputDelta {
+            call_id: "call_1".into(),
+            delta: "output".into(),
+        });
+        state.apply(Event::ToolResult {
+            call_id: "call_1".into(),
+            output: "output".into(),
+            success: true,
+            diff: None,
+        });
+
+        assert_eq!(state.blocks.len(), 5);
+        assert!(matches!(
+            &state.blocks[2],
+            ChatBlock::Message {
+                kind: MessageKind::System,
+                summary: Some(summary),
+                ..
+            } if summary == "mid-turn summary"
+        ));
+        assert!(matches!(
+            &state.blocks[3],
+            ChatBlock::Message {
+                kind: MessageKind::User,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &state.blocks[4],
+            ChatBlock::Tool {
+                call_id: Some(call_id),
+                output: Some(output),
+                status: ToolStatus::Done,
+                ..
+            } if call_id == "call_1" && output == "output"
+        ));
+        assert!(!state.blocks.iter().any(|block| matches!(
+            block,
+            ChatBlock::Tool {
+                status: ToolStatus::Pending,
+                ..
+            }
+        )));
     }
 
     #[test]

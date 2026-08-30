@@ -39,6 +39,10 @@ const TOOL_OUTPUT_TRUNCATED: &str = "\n[tool output truncated]";
 /// runs, so the result can never push the next model request past
 /// max_context_tokens.
 const MIN_TOOL_OUTPUT_TOKENS: u64 = 32; // 128 bytes
+/// Floor for the compaction request's own output: below it the summary
+/// would be too short to continue the conversation from, and the request
+/// is trimmed or refused instead of risking a one-line summary.
+const SUMMARY_MIN_OUTPUT_TOKENS: u64 = 128;
 /// Hard cap on the tool calls one assistant message may batch. The cap
 /// resets for every assistant message, so a turn may run as many model
 /// turns as needed; only a single message is bounded.
@@ -797,23 +801,34 @@ async fn summarize<P: Provider>(
         .send(Event::ModelRequestStarted(config.model_id().to_owned()))
         .await
         .ok();
+    let max_context = config.active_model().max_context_tokens;
+    let preferred_output = (max_context / 8).clamp(512, 4096);
     let mut request_messages = vec![Message::system(
         "Summarize this conversation for seamless continuation. Preserve requirements, decisions, files, commands, errors, results, and unresolved work. Be dense and factual. Return only the summary."
             .into(),
     )];
     request_messages.extend(messages.iter().cloned());
+    // A long conversation can crowd the summary's own input past the
+    // context. Drop the oldest messages — a tool result leaves only with
+    // the assistant message that called it — until the input leaves room
+    // for at least the minimum summary.
+    while estimate_tokens(&request_messages) + SUMMARY_MIN_OUTPUT_TOKENS > max_context
+        && drop_oldest_message(&mut request_messages)
+    {}
+    let input_tokens = estimate_tokens(&request_messages);
+    let max_tokens = max_context
+        .saturating_sub(input_tokens)
+        .min(preferred_output);
+    if max_tokens < SUMMARY_MIN_OUTPUT_TOKENS {
+        bail!("context exhausted: the compaction request itself does not fit the context");
+    }
     let request = CompletionRequest {
         provider: config.provider_name().to_owned(),
         model: config.model_id().to_owned(),
         messages: request_messages,
         temperature: config.effective_temperature(),
         reasoning_effort: config.light_reasoning_effort(),
-        max_tokens: Some(
-            (config.active_model().max_context_tokens / 8)
-                .clamp(512, 4096)
-                .try_into()
-                .unwrap(),
-        ),
+        max_tokens: Some(max_tokens.min(u32::MAX as u64) as u32),
         stream: true,
         tools: Vec::new(),
     };
@@ -852,6 +867,34 @@ async fn summarize<P: Provider>(
         .await
         .ok();
     Ok(summary)
+}
+
+/// Drops the oldest summarized message from a compaction request, along
+/// with the tool results it introduced, so the request never starts on
+/// an orphaned tool result. Returns false when only the system prompt
+/// remains.
+fn drop_oldest_message(request: &mut Vec<Message>) -> bool {
+    if request.len() <= 1 {
+        return false;
+    }
+    let mut extra = 0;
+    if let Message::Assistant { tool_calls, .. } = &request[1] {
+        let ids = tool_calls
+            .iter()
+            .map(|call| &call.id)
+            .collect::<HashSet<_>>();
+        for message in request.iter().skip(2) {
+            if let Message::Tool { call_id, .. } = message
+                && ids.contains(call_id)
+            {
+                extra += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    request.drain(1..2 + extra);
+    true
 }
 
 async fn generate_session_title<P: Provider>(
@@ -977,11 +1020,68 @@ fn fallback_session_title(messages: &[Message]) -> String {
 }
 
 fn estimate_tokens(messages: &[Message]) -> u64 {
-    let bytes = messages
+    let mut tokens = messages
         .iter()
         .map(|message| serde_json::to_string(message).map_or(0, |value| value.len()))
-        .sum::<usize>();
-    (bytes.div_ceil(4) + messages.len() * 4) as u64
+        .sum::<usize>()
+        .div_ceil(4) as u64
+        + messages.len() as u64 * 4;
+    // `ImageContent.data` is skipped during serialization, so the JSON pass
+    // above never sees an image; reserve the tokens the provider charges
+    // for sending it.
+    for message in messages {
+        tokens += message.images().iter().map(image_tokens).sum::<u64>();
+    }
+    tokens
+}
+
+/// Tokens one attached image costs the OpenAI provider. Rope sends images
+/// with the default `auto` detail; for the tile-based models (gpt-4o and
+/// gpt-4.1) that fits the image into a 2048px square, caps the shortest
+/// side at 768px, and bills 85 base tokens plus 170 per 512px tile.
+/// Images without recorded dimensions reserve the rule's per-image
+/// maximum, so an image can never cost more than the budget reserved.
+fn image_tokens(image: &ImageContent) -> u64 {
+    const BASE: u64 = 85;
+    const TILE: u64 = 170;
+    const MAX_SIDE: u32 = 2048;
+    const SHORT_SIDE: u32 = 768;
+    const TILE_SIZE: u32 = 512;
+    if image.width == 0 || image.height == 0 {
+        return BASE + 8 * TILE;
+    }
+    let (mut width, mut height) = (image.width, image.height);
+    // Fit into a 2048px square, preserving aspect ratio, never enlarging.
+    let longest = width.max(height);
+    if longest > MAX_SIDE {
+        if width >= height {
+            height = fit_side(height, longest);
+            width = MAX_SIDE;
+        } else {
+            width = fit_side(width, longest);
+            height = MAX_SIDE;
+        }
+    }
+    // Cap the shortest side at 768px, flooring the other dimension.
+    let (shortest, longest) = (width.min(height), width.max(height));
+    if shortest > SHORT_SIDE {
+        // `other` is strictly below `longest`, so it fits a u32.
+        let other = (longest as u64 * SHORT_SIDE as u64 / shortest as u64) as u32;
+        if width <= height {
+            width = SHORT_SIDE;
+            height = other;
+        } else {
+            height = SHORT_SIDE;
+            width = other;
+        }
+    }
+    BASE + (width.div_ceil(TILE_SIZE) * height.div_ceil(TILE_SIZE)).min(8) as u64 * TILE
+}
+
+/// `side * MAX_SIDE / longest`, rounded up so the estimate never undershoots.
+fn fit_side(side: u32, longest: u32) -> u32 {
+    let scaled = (side as u64 * 2048 + longest as u64 - 1) / longest as u64;
+    scaled.clamp(1, u32::MAX as u64) as u32
 }
 
 /// Tokens a Tool message costs before its content: the role, call id,
@@ -1137,13 +1237,18 @@ async fn agent<P: Provider>(
                     decision.await.unwrap_or(ApprovalDecision::Deny) != ApprovalDecision::Deny
                 }
             };
-            // The streaming cap mirrors the final truncation, so the chat
-            // never shows output the model context will keep beyond it.
-            // The floor keeps the control envelope intact near the limit;
-            // after the framing reservation, the whole result — content,
-            // role, and call id — fits the remaining context.
+            // The streaming cap bounds the final truncation in raw bytes,
+            // so the chat never shows more output than the model keeps
+            // (the final truncation may keep less once JSON escaping of
+            // the content is counted). The floor keeps the control
+            // envelope intact near the limit; after the framing
+            // reservation, the whole result — content, role, and call id
+            // — fits the remaining context.
             let available = remaining.saturating_sub(overhead);
             let output_tokens = (available / 5).max(MIN_TOOL_OUTPUT_TOKENS).min(available);
+            // The whole Tool message — framing, image, and content — is
+            // what the next model request must absorb.
+            let message_budget = overhead.saturating_add(output_tokens);
             let max_streamed_bytes =
                 output_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
             let result = if approved {
@@ -1170,11 +1275,35 @@ async fn agent<P: Provider>(
             } else {
                 bail_tool_denied(&call.name)
             };
-            let (output, image, diff, success) = match result {
+            let (mut output, mut image, diff, success) = match result {
                 Ok(result) => (result.output, result.image, result.diff, true),
                 Err(error) => (format!("Error: {error:#}"), None, None, false),
             };
-            let output = truncate_tool_output(output, output_tokens);
+            // The pre-run reservation covered the text, not the image. An
+            // image that would crowd the result past its budget is
+            // replaced by a note in the content, so the next model
+            // request still fits.
+            if let Some(reserved) = image.as_ref() {
+                let with_image = Message::tool(
+                    call.id.clone(),
+                    String::new(),
+                    Some(reserved.clone()),
+                    diff.clone(),
+                );
+                if estimate_tokens(std::slice::from_ref(&with_image)) + MIN_TOOL_OUTPUT_TOKENS
+                    > message_budget
+                {
+                    output.push_str("\n[image omitted: no room left in the context]");
+                    image = None;
+                }
+            }
+            let output = truncate_tool_output(
+                &call.id,
+                image.clone(),
+                diff.clone(),
+                output,
+                message_budget,
+            );
             events
                 .send(Event::ToolResult {
                     call_id: call.id.clone(),
@@ -1270,22 +1399,71 @@ fn floor_char_boundary(s: &str, index: usize) -> usize {
     end
 }
 
-fn truncate_tool_output(mut output: String, max_tokens: u64) -> String {
-    let max_bytes = max_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
-    if output.len() <= max_bytes {
+/// The serialized length of one character inside a JSON string: quotes,
+/// backslashes, and the common escapes double, other control characters
+/// sextuple, and everything else keeps its UTF-8 length.
+fn escaped_char_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        character if (character as u32) < 0x20 => 6,
+        character => character.len_utf8(),
+    }
+}
+
+/// Truncates tool output so the completed Tool message — role, call id,
+/// image, diff, and the JSON-escaped content — stays within
+/// `max_tokens` under `estimate_tokens`. The budget bounds the message,
+/// not the raw bytes: quotes, backslashes, and newlines expand when the
+/// content is serialized, so a bytes-per-token cap on the raw output
+/// could still leave the next model request over the limit.
+fn truncate_tool_output(
+    call_id: &str,
+    image: Option<ImageContent>,
+    diff: Option<String>,
+    mut output: String,
+    max_tokens: u64,
+) -> String {
+    // `estimate_tokens` charges four bytes per token, four per message,
+    // and the image its own reservation; the serialized message is the
+    // empty-content framing plus the escaped content.
+    let image_reserve = image.as_ref().map_or(0, image_tokens);
+    let framed = serde_json::to_string(&Message::tool(
+        call_id.to_owned(),
+        String::new(),
+        image,
+        diff,
+    ))
+    .map_or(0, |message| message.len() as u64);
+    let content_limit = max_tokens
+        .saturating_sub(4)
+        .saturating_sub(image_reserve)
+        .saturating_mul(4)
+        .saturating_sub(framed)
+        .saturating_sub(2);
+    let escaped = |text: &str| -> u64 {
+        serde_json::to_string(text).map_or(text.len() as u64, |value| value.len() as u64)
+    };
+    if escaped(&output) <= content_limit {
         return output;
     }
-    // The cap is a hard budget: when even the marker no longer fits, keep
-    // the head up to the cap instead of overshooting it.
-    if max_bytes <= TOOL_OUTPUT_TRUNCATED.len() {
-        output.truncate(floor_char_boundary(&output, max_bytes));
-        return output;
+    // Drop the smallest suffix so the escaped content — marker included
+    // when the marker itself still fits — meets the limit, ending on a
+    // character boundary.
+    let keep_marker = escaped(TOOL_OUTPUT_TRUNCATED) <= content_limit;
+    let target = content_limit.saturating_sub(escaped(TOOL_OUTPUT_TRUNCATED));
+    let total = escaped(&output);
+    let (mut raw_removed, mut escaped_removed) = (0u64, 0u64);
+    for character in output.chars().rev() {
+        raw_removed += character.len_utf8() as u64;
+        escaped_removed += escaped_char_len(character) as u64;
+        if total.saturating_sub(escaped_removed) <= target {
+            break;
+        }
     }
-    output.truncate(floor_char_boundary(
-        &output,
-        max_bytes - TOOL_OUTPUT_TRUNCATED.len(),
-    ));
-    output.push_str(TOOL_OUTPUT_TRUNCATED);
+    output.truncate(output.len() - raw_removed as usize);
+    if keep_marker {
+        output.push_str(TOOL_OUTPUT_TRUNCATED);
+    }
     output
 }
 
@@ -1964,10 +2142,24 @@ mod tests {
 
     #[test]
     fn tool_output_is_truncated_on_a_character_boundary() {
-        let output = truncate_tool_output("é".repeat(100), 10);
+        let output = truncate_tool_output("call_1", None, None, "é".repeat(100), 30);
 
         assert!(output.ends_with("[tool output truncated]"));
-        assert!(output.len() <= 40);
+        // The completed message — framing, escaped content, and marker —
+        // meets the budget on a character boundary.
+        let message = Message::tool("call_1".into(), output, None, None);
+        assert!(estimate_tokens(std::slice::from_ref(&message)) <= 30);
+    }
+
+    #[test]
+    fn tool_output_truncation_counts_json_escaping() {
+        // A thousand newlines: the escaped form doubles, so a raw-bytes
+        // budget would let the completed message exceed the limit.
+        // Measuring the populated message does not.
+        let output = truncate_tool_output("call_1", None, None, "\n".repeat(1_000), 32);
+
+        let message = Message::tool("call_1".into(), output, None, None);
+        assert!(estimate_tokens(std::slice::from_ref(&message)) <= 32);
     }
 
     #[tokio::test]
@@ -2014,11 +2206,13 @@ mod tests {
             &completed[2],
             // 100 - 50 = 50 remaining tokens, minus the 16-token Tool
             // message framing: 34, which floors to the 32-token control
-            // minimum: 128 bytes. 50 + 16 + 32 = 98 stays under the
-            // 100-token limit, where the framing-less old budget (50 +
-            // 128) would have overflowed it.
+            // minimum. The 48-token message budget holds the serialized
+            // message — framing plus the escaped content and marker — to
+            // 130 escaped bytes: 105 content characters and the marker,
+            // where the framing-less old budget (50 + 128) would have
+            // overflowed the 100-token limit.
             Message::Tool { content, .. }
-                if content.ends_with("[tool output truncated]") && content.len() <= 128
+                if content.ends_with("[tool output truncated]") && content.len() <= 129
         ));
     }
 
@@ -2723,7 +2917,7 @@ mod tests {
             ],
         ]));
         let mut config = Config::default();
-        config.models[0].max_context_tokens = 100;
+        config.models[0].max_context_tokens = 2048;
         config.compaction_threshold = 0.75;
         let (event_tx, mut event_rx) = mpsc::channel(32);
         let (internal_tx, mut internal_rx) = mpsc::channel(4);
@@ -2737,7 +2931,7 @@ mod tests {
                 Message::user("continue".into()),
             ],
             1,
-            80,
+            1800,
             None,
             false,
             None,
@@ -2815,6 +3009,255 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[tokio::test]
+    async fn compaction_output_is_capped_to_the_remaining_context() {
+        let provider = Arc::new(MockProvider::new(vec![vec![ResponseDelta::Text(
+            "dense summary".into(),
+        )]]));
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 4_096;
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        // ~1,800 tokens per message: the input leaves less than the
+        // preferred 512-token summary room.
+        let messages = vec![
+            Message::user("a".repeat(7_200)),
+            Message::assistant("a".repeat(7_200), "model".into(), String::new(), Vec::new()),
+        ];
+        summarize(
+            provider.clone(),
+            &config,
+            &messages,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        let request = &provider.requests()[0];
+        let input_tokens = estimate_tokens(&request.messages);
+        assert_eq!(request.messages.len(), 3, "no message may be dropped");
+        assert!(
+            request.max_tokens.unwrap() < 512,
+            "output must shrink below the preferred 512"
+        );
+        assert!(
+            input_tokens + request.max_tokens.unwrap() as u64 <= 4_096,
+            "input + output must fit the context"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_input_is_trimmed_when_it_does_not_fit() {
+        let provider = Arc::new(MockProvider::new(vec![vec![ResponseDelta::Text(
+            "dense summary".into(),
+        )]]));
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 2_048;
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        // ~1,800 tokens per message: even the minimum 128-token summary
+        // does not fit the full input.
+        let messages = vec![
+            Message::user("a".repeat(7_200)),
+            Message::assistant("a".repeat(7_200), "model".into(), String::new(), Vec::new()),
+        ];
+        summarize(
+            provider.clone(),
+            &config,
+            &messages,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        let request = &provider.requests()[0];
+        let input_tokens = estimate_tokens(&request.messages);
+        assert_eq!(
+            request.messages.len(),
+            2,
+            "the oldest message must be dropped"
+        );
+        assert!(
+            request.max_tokens.unwrap() as u64 >= 128,
+            "the summary must stay usable"
+        );
+        assert!(
+            input_tokens + request.max_tokens.unwrap() as u64 <= 2_048,
+            "input + output must fit the context"
+        );
+    }
+
+    #[test]
+    fn drop_oldest_message_removes_tool_results_with_their_call() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: json!({}),
+        };
+        let mut request = vec![
+            Message::system("prompt".into()),
+            Message::user("old".into()),
+            Message::assistant_response(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![call],
+                Vec::new(),
+            ),
+            Message::tool("call_1".into(), "result".into(), None, None),
+            Message::user("new".into()),
+        ];
+
+        assert!(drop_oldest_message(&mut request));
+        assert_eq!(request.len(), 4);
+        // The assistant call and its result leave together, so the
+        // request never starts on an orphaned tool result.
+        assert!(drop_oldest_message(&mut request));
+        assert_eq!(request.len(), 2);
+        assert!(matches!(&request[1], Message::User { .. }));
+    }
+
+    #[test]
+    fn image_tokens_follow_the_openai_auto_detail_rule() {
+        fn image(width: u32, height: u32) -> ImageContent {
+            ImageContent {
+                mime_type: "image/png".into(),
+                data: String::new(),
+                path: None,
+                width,
+                height,
+            }
+        }
+        // 1x1 is a single 512px tile.
+        assert_eq!(image_tokens(&image(1, 1)), 85 + 170);
+        // 1024x1024 is capped to 768x768: four tiles.
+        assert_eq!(image_tokens(&image(1024, 1024)), 85 + 4 * 170);
+        // 1920x1080 is capped to 1365x768: six tiles.
+        assert_eq!(image_tokens(&image(1920, 1080)), 85 + 6 * 170);
+        // 3072x1024 fits 2048x683: eight tiles, the auto maximum.
+        assert_eq!(image_tokens(&image(3072, 1024)), 85 + 8 * 170);
+        // Unknown dimensions reserve the per-image maximum.
+        assert_eq!(image_tokens(&image(0, 0)), 85 + 8 * 170);
+    }
+
+    #[test]
+    fn image_results_are_counted_in_the_context_budget() {
+        let image = ImageContent {
+            mime_type: "image/png".into(),
+            data: "aW1hZ2U=".into(),
+            path: None,
+            width: 1024,
+            height: 1024,
+        };
+        let without = Message::tool("call_1".into(), "viewed image.png".into(), None, None);
+        let with = Message::tool(
+            "call_1".into(),
+            "viewed image.png".into(),
+            Some(image.clone()),
+            None,
+        );
+
+        // At least the provider's image reservation, plus the serialized
+        // image metadata field.
+        assert!(
+            estimate_tokens(std::slice::from_ref(&with))
+                - estimate_tokens(std::slice::from_ref(&without))
+                >= image_tokens(&image)
+        );
+    }
+
+    #[tokio::test]
+    async fn image_result_is_dropped_when_it_does_not_fit_the_budget() {
+        struct BigImage;
+
+        #[async_trait]
+        impl Tool for BigImage {
+            fn name(&self) -> &str {
+                "view"
+            }
+            fn description(&self) -> &str {
+                "show an image"
+            }
+            fn schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(&self, _args: Value) -> Result<ToolResult> {
+                Ok(ToolResult {
+                    output: "viewed big.png".into(),
+                    image: Some(ImageContent {
+                        mime_type: "image/png".into(),
+                        data: "aW1hZ2U=".into(),
+                        path: None,
+                        width: 3072,
+                        height: 1024, // 1445 tokens
+                    }),
+                    diff: None,
+                })
+            }
+        }
+
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("view".into()),
+                    arguments: "{}".into(),
+                },
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 0,
+                    total_tokens: 152,
+                }),
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(BigImage, Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 200;
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast instead
+        // of blocking once the buffer fills.
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(4);
+
+        let (completed, _) = agent(
+            provider.clone(),
+            &tools,
+            &config,
+            vec![Message::user("run it".into())],
+            0,
+            0,
+            None,
+            None,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        // The 1445-token image cannot fit the 48-token message budget; a
+        // note stays in the content, and the next model request fits the
+        // context.
+        assert!(matches!(
+            &completed[2],
+            Message::Tool {
+                content,
+                image: None,
+                ..
+            } if content.contains("[image omitted: no room left in the context]")
+        ));
+        let requests = provider.requests();
+        assert!(
+            estimate_tokens(&requests.last().unwrap().messages)
+                <= config.active_model().max_context_tokens
+        );
     }
 
     #[test]
