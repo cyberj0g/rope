@@ -4613,7 +4613,7 @@ mod tests {
             .iter()
             .find(|span| span.content.as_ref() == "▾ Status")
             .unwrap();
-        assert_eq!(span.style.fg, Some(Color::Gray));
+        assert_eq!(span.style.fg, Some(Color::from((100, 70, 255))));
     }
 
     #[test]
