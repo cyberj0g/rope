@@ -2436,7 +2436,7 @@ fn block_header(
             let color = match kind {
                 MessageKind::User => Color::Cyan,
                 MessageKind::Assistant => Color::Blue,
-                MessageKind::Status => Color::Yellow,
+                MessageKind::Status => Color::from((100, 70, 255)),
                 MessageKind::System => Color::Magenta,
                 MessageKind::Error => Color::Red,
             };
