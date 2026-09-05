@@ -16,6 +16,8 @@ const IMAGE_SENTINEL: char = '\u{fffc}';
 #[derive(Clone, Copy)]
 pub enum MessageKind {
     User,
+    /// A message sent while the model's turn is in progress.
+    Steer,
     Assistant,
     /// An intermediate assistant message whose turn ended in tool calls
     /// rather than a final answer.
@@ -408,10 +410,7 @@ impl UiState {
 
     pub fn take_input(&mut self) -> Option<UserPrompt> {
         let content = self.input.replace(IMAGE_SENTINEL, "").trim().to_owned();
-        if (content.is_empty() && self.input_images.is_empty())
-            || self.generating
-            || self.image_loading()
-        {
+        if (content.is_empty() && self.input_images.is_empty()) || self.image_loading() {
             return None;
         }
         let images = std::mem::take(&mut self.input_images)
@@ -828,6 +827,18 @@ impl UiState {
         });
     }
 
+    pub fn push_steer_with_images(&mut self, content: String, images: Vec<ImageContent>) {
+        self.push_block(ChatBlock::Message {
+            label: "Steer".into(),
+            content,
+            images,
+            model: String::new(),
+            kind: MessageKind::Steer,
+            expanded: true,
+            summary: None,
+        });
+    }
+
     pub fn set_error(&mut self, error: impl Into<String>) {
         let error = error.into();
         self.error = Some(error.clone());
@@ -1013,7 +1024,11 @@ impl UiState {
     pub fn toggle(&mut self, index: usize) {
         if let Some(
             ChatBlock::Message {
-                kind: MessageKind::User | MessageKind::Assistant | MessageKind::Status,
+                kind:
+                    MessageKind::User
+                    | MessageKind::Steer
+                    | MessageKind::Assistant
+                    | MessageKind::Status,
                 expanded,
                 ..
             }
@@ -1359,7 +1374,7 @@ impl UiState {
                         matches!(
                             block,
                             ChatBlock::Message {
-                                kind: MessageKind::User,
+                                kind: MessageKind::User | MessageKind::Steer,
                                 ..
                             }
                         )
@@ -1568,6 +1583,15 @@ impl UiState {
                     expanded: true,
                     summary: None,
                 }),
+                Message::Steer { content, images } => self.push_block(ChatBlock::Message {
+                    label: "Steer".into(),
+                    content,
+                    images,
+                    model: String::new(),
+                    kind: MessageKind::Steer,
+                    expanded: true,
+                    summary: None,
+                }),
                 Message::Assistant {
                     content,
                     model,
@@ -1692,7 +1716,11 @@ fn collapsible(block: &ChatBlock) -> bool {
     matches!(
         block,
         ChatBlock::Message {
-            kind: MessageKind::User | MessageKind::Assistant | MessageKind::Status,
+            kind:
+                MessageKind::User
+                | MessageKind::Steer
+                | MessageKind::Assistant
+                | MessageKind::Status,
             ..
         } | ChatBlock::Message {
             kind: MessageKind::System,

@@ -1034,7 +1034,7 @@ async fn dispatch(
     input_loads: &mpsc::UnboundedSender<InputLoad>,
 ) -> Result<()> {
     if !images.is_empty() {
-        submit(input, images, state, history, commands).await?;
+        send_prompt(input, images, state, history, commands).await?;
         return Ok(());
     }
     let is_command = input.starts_with('/');
@@ -1117,7 +1117,7 @@ async fn dispatch(
             false
         }
         _ => {
-            submit(input, Vec::new(), state, history, commands).await?;
+            send_prompt(input, Vec::new(), state, history, commands).await?;
             false
         }
     };
@@ -1131,6 +1131,22 @@ async fn dispatch(
         history.reset_navigation();
     }
     Ok(())
+}
+
+/// A prompt sent while a turn is in progress steers that turn; otherwise it
+/// starts a new one.
+async fn send_prompt(
+    content: String,
+    images: Vec<ImageContent>,
+    state: &mut UiState,
+    history: &mut PromptHistory,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    if state.generating {
+        steer(content, images, state, history, commands).await
+    } else {
+        submit(content, images, state, history, commands).await
+    }
 }
 
 async fn submit(
@@ -1148,6 +1164,27 @@ async fn submit(
     state.push_user_with_images(content.clone(), images.clone());
     commands
         .send(Command::Submit(UserPrompt { content, images }))
+        .await?;
+    Ok(())
+}
+
+/// Queues a steering message for the in-progress turn: it reaches the model
+/// at the turn's next model request and renders as a Steer message.
+async fn steer(
+    content: String,
+    images: Vec<ImageContent>,
+    state: &mut UiState,
+    history: &mut PromptHistory,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    if !content.is_empty()
+        && let Err(error) = history.record(&content).await
+    {
+        state.notice = Some(format!("history was not saved: {error:#}"));
+    }
+    state.push_steer_with_images(content.clone(), images.clone());
+    commands
+        .send(Command::Steer(UserPrompt { content, images }))
         .await?;
     Ok(())
 }
@@ -1677,7 +1714,7 @@ fn draw(
     }
     if state.generating {
         title.push(Span::styled(
-            " · Esc to cancel",
+            " · Enter to steer · Esc to cancel",
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -2552,9 +2589,10 @@ fn block_body_lines(
             summary,
             ..
         } => match kind {
-            MessageKind::User | MessageKind::Assistant | MessageKind::Status => {
+            MessageKind::User | MessageKind::Steer | MessageKind::Assistant
+            | MessageKind::Status => {
                 if *expanded {
-                    let rendered = if matches!(kind, MessageKind::User) {
+                    let rendered = if matches!(kind, MessageKind::User | MessageKind::Steer) {
                         markdown_preserving_breaks(content)
                     } else {
                         markdown(content)
@@ -2658,13 +2696,15 @@ fn block_header(
         } => {
             let color = match kind {
                 MessageKind::User => Color::Cyan,
+                MessageKind::Steer => Color::Yellow,
                 MessageKind::Assistant => Color::Blue,
                 MessageKind::Status => Color::from((100, 70, 255)),
                 MessageKind::System => Color::Magenta,
                 MessageKind::Error => Color::Red,
             };
             let line = match kind {
-                MessageKind::User | MessageKind::Assistant | MessageKind::Status => {
+                MessageKind::User | MessageKind::Steer | MessageKind::Assistant
+                | MessageKind::Status => {
                     let header = format!("{} {label}", if *expanded { "▾" } else { "▸" });
                     if matches!(kind, MessageKind::Assistant) && !model.is_empty() {
                         assistant_header(header, model, color, selected)
@@ -2759,22 +2799,26 @@ fn has_block_header(block: &ChatBlock) -> bool {
         ChatBlock::Message { kind, summary, .. } => {
             matches!(
                 kind,
-                MessageKind::User | MessageKind::Assistant | MessageKind::Status
+                MessageKind::User
+                    | MessageKind::Steer
+                    | MessageKind::Assistant
+                    | MessageKind::Status
             ) || (matches!(kind, MessageKind::System) && summary.is_some())
         }
         ChatBlock::Thinking { .. } | ChatBlock::Tool { .. } => true,
     }
 }
 
-/// Blocks that separate the conversation: user, assistant, and system
-/// messages get a blank line before and after, while thinking and tool
-/// blocks stay packed line after line.
+/// Blocks that separate the conversation: user, steer, assistant, and
+/// system messages get a blank line before and after, while thinking and
+/// tool blocks stay packed line after line.
 fn is_decorated_message(block: &ChatBlock) -> bool {
     matches!(
         block,
         ChatBlock::Message {
             kind:
                 MessageKind::User
+                | MessageKind::Steer
                 | MessageKind::Assistant
                 | MessageKind::Status
                 | MessageKind::System,
@@ -4837,6 +4881,112 @@ mod tests {
             .find(|span| span.content.as_ref() == "▾ Status")
             .unwrap();
         assert_eq!(span.style.fg, Some(Color::from((100, 70, 255))));
+    }
+
+    #[test]
+    fn steer_messages_render_with_their_own_header() {
+        let mut state = UiState::new();
+        state.push_user("original request".into());
+        state.push_steer_with_images("stay focused on the tests".into(), Vec::new());
+
+        let mut renders = RenderState::new();
+        let layout = chat_layout(&state, Rect::new(0, 0, 80, 10), &mut renders.chat);
+        let steer_line = layout
+            .lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "▾ Steer"))
+            .expect("steer header");
+        let span = steer_line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "▾ Steer")
+            .unwrap();
+        assert_eq!(span.style.fg, Some(Color::Yellow));
+        // The steer body follows its header, soft breaks preserved like
+        // user messages.
+        let body = layout
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("stay focused on the tests"));
+        assert!(body);
+    }
+
+    #[test]
+    fn loaded_history_renders_steer_messages() {
+        let mut state = UiState::new();
+        state.apply(Event::History(vec![
+            crate::runtime::Message::user("go".into()),
+            crate::runtime::Message::steer("focus on the build".into(), Vec::new()),
+        ]));
+
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Message {
+                label,
+                kind: MessageKind::Steer,
+                content,
+                ..
+            } if label == "Steer" && content == "focus on the build"
+        ));
+        // Steering messages stay part of the navigable sections.
+        state.select(1);
+        assert_eq!(state.selected(), Some(1));
+        state.toggle_selected();
+        assert!(matches!(
+            state.blocks[1],
+            ChatBlock::Message {
+                expanded: false, ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn prompts_sent_while_generating_steer_the_active_turn() {
+        let mut state = UiState::new();
+        state.generating = true;
+        let mut history = PromptHistory::empty();
+        let (commands, mut rx) = mpsc::channel(1);
+
+        send_prompt("keep going".into(), Vec::new(), &mut state, &mut history, &commands)
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            Command::Steer(prompt) => assert_eq!(prompt.content, "keep going"),
+            _ => panic!("expected a steer command"),
+        }
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                label,
+                kind: MessageKind::Steer,
+                ..
+            } if label == "Steer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn prompts_sent_while_idle_start_a_new_turn() {
+        let mut state = UiState::new();
+        let mut history = PromptHistory::empty();
+        let (commands, mut rx) = mpsc::channel(1);
+
+        send_prompt("fresh request".into(), Vec::new(), &mut state, &mut history, &commands)
+            .await
+            .unwrap();
+
+        match rx.recv().await.unwrap() {
+            Command::Submit(prompt) => assert_eq!(prompt.content, "fresh request"),
+            _ => panic!("expected a submit command"),
+        }
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                label,
+                kind: MessageKind::User,
+                ..
+            } if label == "You"
+        ));
     }
 
     #[test]

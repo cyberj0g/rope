@@ -256,6 +256,13 @@ impl From<Message> for WireMessage {
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             },
+            Message::Steer { content, images } if images.is_empty() => Self::plain("user", content),
+            Message::Steer { content, images } => Self {
+                role: "user",
+                content: Some(multimodal_content(content, images)),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
             Message::Assistant {
                 content,
                 model: _,

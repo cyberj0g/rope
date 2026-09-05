@@ -29,6 +29,13 @@ pub enum Message {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageContent>,
     },
+    /// A steering message sent while a turn is already in progress. Sent to
+    /// the model with the user role at the next model request.
+    Steer {
+        content: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageContent>,
+    },
     Assistant {
         content: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -70,6 +77,9 @@ impl Message {
     }
     pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
         Self::User { content, images }
+    }
+    pub fn steer(content: String, images: Vec<ImageContent>) -> Self {
+        Self::Steer { content, images }
     }
     #[cfg(test)]
     pub fn assistant(
@@ -115,10 +125,11 @@ impl Message {
         }
     }
 
-    /// The images attached to this message: user-attached or a tool result.
+    /// The images attached to this message: user- or steer-attached or a
+    /// tool result.
     pub fn images(&self) -> &[ImageContent] {
         match self {
-            Self::User { images, .. } => images,
+            Self::User { images, .. } | Self::Steer { images, .. } => images,
             Self::Tool {
                 image: Some(image), ..
             } => std::slice::from_ref(image),
@@ -131,6 +142,7 @@ impl Message {
         match self {
             Self::System { content }
             | Self::User { content, .. }
+            | Self::Steer { content, .. }
             | Self::Assistant { content, .. }
             | Self::Tool { content, .. } => content,
         }
@@ -152,5 +164,14 @@ mod tests {
             message,
             Message::Assistant { response_items, .. } if response_items.is_empty()
         ));
+    }
+
+    #[test]
+    fn steer_messages_round_trip_through_their_own_role() {
+        let steer = Message::steer("stay focused".into(), Vec::new());
+        let encoded = serde_json::to_string(&steer).unwrap();
+
+        assert!(encoded.starts_with(r#"{"role":"steer""#));
+        assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), steer);
     }
 }

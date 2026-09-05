@@ -42,6 +42,20 @@ impl PromptHistory {
         })
     }
 
+    /// An in-memory history backed by a scratch file; test-only.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "rope-test-prompt-history-{}",
+                std::process::id()
+            )),
+            entries: Vec::new(),
+            index: None,
+            draft: String::new(),
+        }
+    }
+
     pub async fn record(&mut self, prompt: &str) -> Result<()> {
         if self.entries.last().is_some_and(|entry| entry == prompt) {
             self.reset_navigation();

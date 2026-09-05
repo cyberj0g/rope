@@ -132,6 +132,13 @@ fn message_items(message: Message, model: &str) -> Vec<Value> {
             "role": "user",
             "content": response_content(content, images),
         })],
+        Message::Steer { content, images } if images.is_empty() => {
+            vec![json!({ "role": "user", "content": content })]
+        }
+        Message::Steer { content, images } => vec![json!({
+            "role": "user",
+            "content": response_content(content, images),
+        })],
         Message::Assistant {
             content,
             model: source_model,

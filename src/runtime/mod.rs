@@ -3,7 +3,7 @@ mod message;
 use std::{
     collections::HashSet,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -107,6 +107,13 @@ pub struct UserPrompt {
     pub images: Vec<ImageContent>,
 }
 
+impl UserPrompt {
+    /// The Steer message this prompt persists as in conversation history.
+    pub fn steer_message(self) -> Message {
+        Message::steer(self.content, self.images)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalDecision {
     AllowOnce,
@@ -116,6 +123,10 @@ pub enum ApprovalDecision {
 
 pub enum Command {
     Submit(UserPrompt),
+    /// A prompt sent while a turn is in progress. Queued for injection at
+    /// the turn's next model request; if the turn already finished it
+    /// starts a fresh turn instead.
+    Steer(UserPrompt),
     Cancel,
     Approve(ApprovalDecision),
     NewSession(Option<String>),
@@ -298,6 +309,10 @@ async fn run<P: Provider>(
     let mut generation: Option<JoinHandle<()>> = None;
     let mut pending_approval: Option<PendingApproval> = None;
     let mut project_requests = ProjectRequests::default();
+    // Steering prompts queued for the active turn. The turn's agent drains
+    // them into the conversation at each model request; whatever is left
+    // when the turn ends never reached the model and is resubmitted.
+    let mut pending_prompts: SteerQueue = Arc::new(Mutex::new(Vec::new()));
 
     events.send(Event::History(messages.clone())).await.ok();
     events
@@ -319,33 +334,44 @@ async fn run<P: Provider>(
     loop {
         tokio::select! {
             Some(command) = commands.recv() => match command {
-                Command::Submit(prompt) if generation.is_none() => {
-                    let persist_from = messages.len();
-                    messages.push(Message::user_with_images(prompt.content, prompt.images));
-                    let request_messages = request_context(&messages, &session.meta);
-                    let context_tokens = session.meta.context_tokens;
-                    let generate_title = session.needs_title();
-                    let current_plan = session.meta.plan.clone();
-                    let provider = provider.clone();
-                    let tools = tools.clone();
-                    let config = config.clone();
-                    let project_prompt = project.prompt().await;
-                    let events = events.clone();
-                    let internal = internal_tx.clone();
-                    events.send(Event::GenerationStarted).await.ok();
-                    generation = Some(tokio::spawn(async move {
-                        let result = match project_prompt {
-                            Ok(prompt) => turn(provider, &tools, &config, request_messages, persist_from, context_tokens, prompt, generate_title, current_plan, &events, &internal).await,
-                            Err(error) => Err(error),
-                        };
-                        let event = match result {
-                            Ok(result) => InternalEvent::Finished(result),
-                            Err(error) => InternalEvent::Failed(format!("{error:#}")),
-                        };
-                        internal.send(event).await.ok();
-                    }));
-                }
+                Command::Submit(prompt) if generation.is_none()
+                    => spawn_turn(
+                        &mut generation,
+                        &mut pending_prompts,
+                        &mut messages,
+                        &mut session,
+                        &project,
+                        &provider,
+                        &tools,
+                        &config,
+                        Message::user_with_images(prompt.content, prompt.images),
+                        &events,
+                        &internal_tx,
+                    )
+                    .await,
                 Command::Submit(_) => {}
+                // A steer arriving with no active turn is just a prompt:
+                // it starts a fresh turn, and keeps its Steer identity in
+                // history, as the UI rendered it.
+                Command::Steer(prompt) if generation.is_none() => {
+                    spawn_turn(
+                        &mut generation,
+                        &mut pending_prompts,
+                        &mut messages,
+                        &mut session,
+                        &project,
+                        &provider,
+                        &tools,
+                        &config,
+                        prompt.steer_message(),
+                        &events,
+                        &internal_tx,
+                    )
+                    .await;
+                }
+                Command::Steer(prompt) => {
+                    pending_prompts.lock().unwrap().push(prompt);
+                }
                 Command::Cancel => {
                     if let Some(task) = generation.take() {
                         task.abort();
@@ -355,6 +381,16 @@ async fn run<P: Provider>(
                         task.await.ok();
                         tools.cancel_active().await;
                         pending_approval = None;
+                        // Steers queued for the cancelled turn never
+                        // reached the model; persist them with the turn so
+                        // history keeps what the user said.
+                        messages.extend(
+                            pending_prompts
+                                .lock()
+                                .unwrap()
+                                .drain(..)
+                                .map(UserPrompt::steer_message),
+                        );
                         let pending_from = messages.len().saturating_sub(1);
                         messages.push(Message::system(CANCELLED_BY_USER.into()));
                         let saved = async {
@@ -488,6 +524,28 @@ async fn run<P: Provider>(
                         events.send(Event::GenerationFinished).await.ok();
                     }
                     request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
+                    // Steering prompts queued after the turn's final model
+                    // request never reached the model: resubmit the first as
+                    // a fresh turn, keeping any stragglers queued for it.
+                    let mut steered = pending_prompts.lock().unwrap().drain(..).collect::<Vec<_>>();
+                    if !steered.is_empty() {
+                        let first = steered.remove(0);
+                        spawn_turn(
+                            &mut generation,
+                            &mut pending_prompts,
+                            &mut messages,
+                            &mut session,
+                            &project,
+                            &provider,
+                            &tools,
+                            &config,
+                            first.steer_message(),
+                            &events,
+                            &internal_tx,
+                        )
+                        .await;
+                        pending_prompts.lock().unwrap().extend(steered);
+                    }
                 }
                 InternalEvent::Failed(error) if generation.is_some() => {
                     generation = None; pending_approval = None; messages.pop();
@@ -542,6 +600,67 @@ async fn run<P: Provider>(
         }
     }
     tools.shutdown().await;
+}
+
+/// Steering prompts queued for the active turn. Drained by the turn's agent
+/// at each model request and, if the turn ends first, by the runtime, which
+/// resubmits the leftovers as a fresh turn.
+type SteerQueue = Arc<Mutex<Vec<UserPrompt>>>;
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_turn<P: Provider>(
+    generation: &mut Option<JoinHandle<()>>,
+    pending_prompts: &mut SteerQueue,
+    messages: &mut Vec<Message>,
+    session: &mut Session,
+    project: &ProjectState,
+    provider: &Arc<P>,
+    tools: &ToolRegistry,
+    config: &Config,
+    first: Message,
+    events: &mpsc::Sender<Event>,
+    internal: &mpsc::Sender<InternalEvent>,
+) {
+    let persist_from = messages.len();
+    messages.push(first);
+    let request_messages = request_context(messages, &session.meta);
+    let context_tokens = session.meta.context_tokens;
+    let generate_title = session.needs_title();
+    let current_plan = session.meta.plan.clone();
+    let project_prompt = project.prompt().await;
+    *pending_prompts = Arc::new(Mutex::new(Vec::new()));
+    let steers = pending_prompts.clone();
+    let provider = provider.clone();
+    let tools = tools.clone();
+    let config = config.clone();
+    let events = events.clone();
+    let internal = internal.clone();
+    events.send(Event::GenerationStarted).await.ok();
+    *generation = Some(tokio::spawn(async move {
+        let result = match project_prompt {
+            Ok(prompt) => turn(
+                provider,
+                &tools,
+                &config,
+                request_messages,
+                persist_from,
+                context_tokens,
+                prompt,
+                generate_title,
+                current_plan,
+                steers,
+                &events,
+                &internal,
+            )
+            .await,
+            Err(error) => Err(error),
+        };
+        let event = match result {
+            Ok(result) => InternalEvent::Finished(result),
+            Err(error) => InternalEvent::Failed(format!("{error:#}")),
+        };
+        internal.send(event).await.ok();
+    }));
 }
 
 fn spawn_project_task(
@@ -750,6 +869,7 @@ async fn turn<P: Provider>(
     project_prompt: Option<String>,
     generate_title: bool,
     current_plan: Option<ExecutionPlan>,
+    steers: SteerQueue,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<TurnResult> {
@@ -778,6 +898,7 @@ async fn turn<P: Provider>(
         visible_through,
         project_prompt,
         current_plan,
+        &steers,
         events,
         internal,
     )
@@ -1114,6 +1235,7 @@ async fn agent<P: Provider>(
     user_full_index: usize,
     project_prompt: Option<String>,
     mut current_plan: Option<ExecutionPlan>,
+    steers: &SteerQueue,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<(Vec<Message>, Option<Compaction>)> {
@@ -1122,6 +1244,16 @@ async fn agent<P: Provider>(
     // fails instead of overflowing the context or looping.
     let mut compacted_mid_turn = false;
     loop {
+        // Steering prompts sent during this turn are injected here, so the
+        // next model request carries them after everything delivered so
+        // far — including in-flight tool results.
+        messages.extend(
+            steers
+                .lock()
+                .unwrap()
+                .drain(..)
+                .map(UserPrompt::steer_message),
+        );
         events
             .send(Event::ModelRequestStarted(config.model_id().to_owned()))
             .await
@@ -1625,12 +1757,16 @@ async fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ResponseDelta, mock::MockProvider};
+    use crate::provider::{Provider, ResponseDelta, ResponseStream, mock::MockProvider};
     use crate::tool::{
         Approval, ShellCancelTool, ShellJobManager, ShellPollTool, ShellTool, Tool, ToolResult,
     };
     use async_trait::async_trait;
     use serde_json::{Value, json};
+
+    fn no_steers() -> SteerQueue {
+        Arc::new(Mutex::new(Vec::new()))
+    }
 
     struct Echo;
 
@@ -1716,6 +1852,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -1770,6 +1907,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -1828,6 +1966,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -1890,6 +2029,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -1977,6 +2117,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2047,6 +2188,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2095,6 +2237,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2140,6 +2283,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2206,6 +2350,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2263,6 +2408,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2341,6 +2487,7 @@ mod tests {
             7,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2406,6 +2553,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2491,6 +2639,7 @@ mod tests {
                     0,
                     None,
                     None,
+                    &no_steers(),
                     &events,
                     &internal,
                 )
@@ -2609,6 +2758,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -2946,6 +3096,7 @@ mod tests {
             None,
             false,
             None,
+            no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -3247,6 +3398,7 @@ mod tests {
             0,
             None,
             None,
+            &no_steers(),
             &event_tx,
             &internal_tx,
         )
@@ -3304,5 +3456,244 @@ mod tests {
         ));
         assert_eq!(context[1], Message::user("continue".into()));
         assert!(context.iter().all(|message| !is_compaction_marker(message)));
+    }
+
+    #[tokio::test]
+    async fn steer_prompts_are_injected_into_the_next_model_request() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("echo".into()),
+                arguments: r#"{"value":"done"}"#.into(),
+            }],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let steers = no_steers();
+        steers
+            .lock()
+            .unwrap()
+            .push(UserPrompt {
+                content: "focus on the tests".into(),
+                images: Vec::new(),
+            });
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast instead
+        // of blocking once the buffer fills.
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        let (completed, _) = agent(
+            provider.clone(),
+            &tools,
+            &Config::default(),
+            vec![Message::user("run it".into())],
+            0,
+            0,
+            None,
+            None,
+            &steers,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        // The steer is appended after everything already delivered and
+        // reaches the very next model request.
+        let first_request = &provider.requests()[0];
+        assert!(matches!(
+            first_request.messages.last().unwrap(),
+            Message::Steer { content, .. } if content == "focus on the tests"
+        ));
+        assert!(completed
+            .iter()
+            .any(|message| matches!(message, Message::Steer { .. })));
+    }
+
+    #[tokio::test]
+    async fn steer_during_a_tool_run_reaches_the_following_request() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("slow_echo".into()),
+                arguments: "{}".into(),
+            }],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        // 25 chunks at 2ms each: the tool runs long enough to steer it.
+        tools.insert(SlowEcho(vec!["x".repeat(64); 25]), Approval::Allow);
+        let steers = no_steers();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+        let agent_task = {
+            let provider = provider.clone();
+            let tools = tools.clone();
+            let events = event_tx.clone();
+            let internal = internal_tx.clone();
+            let steers = steers.clone();
+            tokio::spawn(async move {
+                agent(
+                    provider,
+                    &tools,
+                    &Config::default(),
+                    vec![Message::user("run it".into())],
+                    0,
+                    0,
+                    None,
+                    None,
+                    &steers,
+                    &events,
+                    &internal,
+                )
+                .await
+            })
+        };
+
+        // Well past the first request, mid-tool-run: the steer must not
+        // re-request what already went out, only the next delivery.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        steers.lock().unwrap().push(UserPrompt {
+            content: "also fix the docs".into(),
+            images: Vec::new(),
+        });
+        agent_task.await.unwrap().unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0]
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Steer { .. })));
+        assert!(requests[1].messages.iter().any(|message| {
+            matches!(message, Message::Steer { content, .. } if content == "also fix the docs")
+        }));
+    }
+
+    /// The mock with one twist: the request that carries a tool result —
+    /// a turn's final model request — is delayed, so a steer can land
+    /// after the turn's last injection point.
+    struct DelayedFinalProvider {
+        mock: MockProvider,
+    }
+
+    #[async_trait]
+    impl Provider for DelayedFinalProvider {
+        async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream> {
+            if request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool { .. }))
+            {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            self.mock.stream(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn steers_queued_after_the_final_request_start_a_fresh_turn() {
+        let provider = Arc::new(DelayedFinalProvider {
+            mock: MockProvider::new(vec![
+                vec![ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("echo".into()),
+                    arguments: r#"{"value":"done"}"#.into(),
+                }],
+                vec![ResponseDelta::Text("final answer".into())],
+                vec![ResponseDelta::Text("steered answer".into())],
+            ]),
+        });
+        let root = std::env::temp_dir().join(format!(
+            "rope-steer-resubmit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create_in(root.clone(), "steer".into()).await.unwrap();
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let run_task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                run(
+                    Config::default(),
+                    provider,
+                    tools,
+                    session,
+                    Vec::new(),
+                    ProjectState::new().await.unwrap(),
+                    command_rx,
+                    event_tx,
+                )
+                .await
+            }
+        });
+        command_tx
+            .send(Command::Submit(UserPrompt {
+                content: "go".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        // By the time the tool result lands, the turn's final model
+        // request is already built — and its response is delayed.
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::ToolResult { .. }) {
+                break;
+            }
+        }
+        // Let the agent drain the (empty) steer queue for the final
+        // request, then steer while the response streams: the prompt
+        // misses every injection point of this turn.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        command_tx
+            .send(Command::Steer(UserPrompt {
+                content: "steered".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let mut finished = 0;
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::GenerationFinished) {
+                finished += 1;
+                if finished == 2 {
+                    break;
+                }
+            }
+        }
+        let (reply, summary) = tokio::sync::oneshot::channel();
+        command_tx.send(Command::Shutdown(reply)).await.unwrap();
+        summary.await.unwrap();
+        run_task.await.unwrap();
+        let _ = tokio::fs::remove_dir_all(&root).await;
+
+        let requests = provider.mock.requests();
+        assert_eq!(requests.len(), 3);
+        // The steer missed the turn's final request...
+        assert!(!requests[1]
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::Steer { .. })));
+        // ...so it was resubmitted: the fresh turn carries it as its
+        // prompt, on top of the finished conversation, keeping its Steer
+        // identity as the UI rendered it.
+        let resubmitted = &requests[2].messages;
+        assert!(resubmitted.last().is_some_and(|message| {
+            matches!(message, Message::Steer { content, .. } if content == "steered")
+        }));
     }
 }

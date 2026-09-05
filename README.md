@@ -82,6 +82,8 @@ rope "what is this repo up to?"
   `rope --session NAME`, `/new`, or the `/session` picker.
 - Iterative model → tool → model execution with immediate cancellation
   and automatic retry with backoff on transient failures.
+- Steering: send a message while a turn is in progress and it is injected
+  into the conversation at the next model request, shown as a `Steer` message.
 - Per-tool `allow` / `ask` / `deny` approval policies in `config.toml`,
   with session-persisted decisions.
 - Built-in tools: `read`, `write`, `edit` (with per-call diffs),

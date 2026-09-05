@@ -39,6 +39,7 @@
 - UTF-8 file reads with optional 1-based line offsets and line limits
 - iterative model → tool → model execution, with the 64 tool call cap applied per assistant message so long turns keep running instead of failing after a fixed number of model turns
 - immediate Escape cancellation with force-killed command process trees, preserved partial model and command output, failed in-flight tools, and a persisted cancellation marker
+- steering messages: prompts sent while a turn is in progress are queued and injected as `Steer` messages into the conversation at the turn's next model request — even while tools run — and persist with the turn; a steer that misses the turn's final model request is resubmitted as a fresh turn, and steers queued on a cancelled turn are persisted with the cancellation marker
 - automatic 2/5/10/30-second retry backoff for transient model failures
 - configurable context fill tracking and automatic continuation compaction that allows light reasoning, accepts reasoning-only summaries, and replays the persisted summary into model context, with the summary request itself budgeted to the model context: output capped to the remaining tokens, the oldest conversation trimmed when the input alone does not fit, and a clear refusal instead of a rejected request when even the minimum summary no longer fits
 - preserved visible transcripts with persisted `Context compacted` markers whose summary stays in history as a collapsed chat section, inserted before the current user with every stored tool-block index shifted so mid-turn results still land on the active tool block
@@ -79,13 +80,14 @@ External tools receive their function arguments as JSON on stdin and must return
 - collapsible messages plus collapsed-by-default thinking and tool sections; right-clicking anywhere in an expanded section collapses it
 - live elapsed time on thinking and tool calls with compact duration units
 - one-space conversation content padding with flush section headers
-- blank lines around You, Assistant, and System messages only; thinking and tool blocks render line after line with no spacing between them
+- blank lines around You, Steer, Assistant, and System messages only; thinking and tool blocks render line after line with no spacing between them
 - fixed-width, color-coded connecting, waiting-for-first-response, generating, tool-running, idle, and error status
 - failed turns preserve the visible transcript and append the error to the conversation
 - case-insensitive `Ctrl+F` chat search with highlighted, wrapping `F3` navigation
 - separately colored model and reasoning details on the padded input box; session tokens and cost on the status bar
 - generating model recorded beside each assistant response
 - intermediate assistant turns whose model request ends in tool calls relabel live from `Assistant` to a gray `Status` header as soon as the first tool call starts streaming, while the turn's final answer keeps the blue `Assistant` header; reloaded sessions apply the same rule from persisted tool calls
+- steering: the composer accepts a prompt while a turn is in progress and renders it as a distinct yellow `Steer` message; the input title switches from `Esc to cancel` to `Enter to steer · Esc to cancel` while generating
 - full-width conversation view with deliberate trailing whitespace
 - bounded bottom-follow chat scrolling that holds the viewport through streaming, collapses, and full-screen diff visits
 - distinctly colored session, token, context, price, and current-directory fields on the status bar, plus estimated live generation speed and the exact reported average while idle

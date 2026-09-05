@@ -81,6 +81,12 @@ impl Session {
         Self::create(root, name).await
     }
 
+    /// Creates a session under an explicit root; test-only.
+    #[cfg(test)]
+    pub async fn create_in(root: PathBuf, name: String) -> Result<Self> {
+        Self::create(root, name).await
+    }
+
     /// Every persisted session, most recent first.
     pub async fn list() -> Result<Vec<SessionInfo>> {
         Self::list_in(sessions_root()?).await
@@ -307,7 +313,9 @@ async fn hydrate_images(directory: &Path, message: &mut Message) -> Result<()> {
 
 fn message_images_mut(message: &mut Message) -> Vec<&mut crate::runtime::ImageContent> {
     match message {
-        Message::User { images, .. } => images.iter_mut().collect(),
+        Message::User { images, .. } | Message::Steer { images, .. } => {
+            images.iter_mut().collect()
+        }
         Message::Tool {
             image: Some(image), ..
         } => vec![image],
