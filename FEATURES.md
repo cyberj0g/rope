@@ -29,7 +29,8 @@
 - persisted 2-3 word model-generated titles for automatically named sessions, created after the first completed response
 - JSONL conversation persistence after completed turns
 - persisted session token totals and per-model cost estimates, hidden when any model used in the session has no configured token price
-- `--session NAME` to create or resume a session, plus `/new [NAME]` and `/save`
+- `--session NAME` to create or resume a session, plus `/new [NAME]`
+- `/session` popup listing every past session — name, creation date, and summary (the generated title, else the first user message) — with a live filter and keyboard navigation, resuming the selected session in place
 - optional positional startup request submitted as soon as the terminal UI opens
 - exit summary with tokens used, estimated cost when available, and the exact session resume command
 

@@ -849,15 +849,15 @@ max_context_tokens = 32768
             ..Config::default()
         };
 
-        config.remember_command("/save").unwrap();
+        config.remember_command("/new").unwrap();
         config.remember_command("/tools").unwrap();
-        config.remember_command("/save").unwrap();
+        config.remember_command("/new").unwrap();
 
-        assert_eq!(config.recent_commands, ["/save", "/tools"]);
+        assert_eq!(config.recent_commands, ["/new", "/tools"]);
         let settings: PersistedSettings =
             toml::from_str(&std::fs::read_to_string(directory.path().join("state.toml")).unwrap())
                 .unwrap();
-        assert_eq!(settings.recent_commands, ["/save", "/tools"]);
+        assert_eq!(settings.recent_commands, ["/new", "/tools"]);
     }
 
     #[test]

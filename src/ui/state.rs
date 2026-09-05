@@ -189,6 +189,7 @@ pub struct UiState {
     pub plan_scroll: u16,
     pub search: Option<ChatSearch>,
     pub model_picker: Option<ModelPicker>,
+    pub session_picker: Option<SessionPicker>,
     pub recent_models: Vec<String>,
     pub recent_commands: Vec<String>,
     pub image_cell_size: Option<(u16, u16)>,
@@ -224,6 +225,14 @@ pub struct ModelPicker {
     pub query: String,
     pub cursor: usize,
     pub selected: usize,
+}
+
+#[derive(Default)]
+pub struct SessionPicker {
+    pub query: String,
+    pub cursor: usize,
+    pub selected: usize,
+    pub sessions: Vec<crate::session::SessionInfo>,
 }
 
 impl ChatSearch {
@@ -342,6 +351,7 @@ impl UiState {
             plan_scroll: 0,
             search: None,
             model_picker: None,
+            session_picker: None,
             recent_models: Vec::new(),
             recent_commands: Vec::new(),
             image_cell_size: None,
@@ -1439,7 +1449,6 @@ impl UiState {
                 self.reported_generation_duration = Duration::ZERO;
                 self.reported_output_tokens = 0;
             }
-            Event::Saved => self.notice = Some("session saved".into()),
             Event::Error(error) => {
                 self.finish_reasoning();
                 self.generating = false;

@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 use crate::{
     config::{Config, ModelConfig},
     runtime::{ApprovalDecision, Command, Event, ImageContent, SessionSummary, UserPrompt},
+    session::{Session, SessionInfo},
     tool::PlanStatus,
 };
 use history::PromptHistory;
@@ -263,9 +264,9 @@ const COMMANDS: &[SlashCommand] = &[
         argument: false,
     },
     SlashCommand {
-        name: "/save",
-        title: "Save session",
-        hotkey: "Ctrl+S",
+        name: "/session",
+        title: "Resume session",
+        hotkey: "—",
         argument: false,
     },
     SlashCommand {
@@ -441,6 +442,11 @@ pub async fn run(
                                 picker.query.insert_str(picker.cursor, &text);
                                 picker.cursor += text.len();
                                 picker.selected = 0;
+                            } else if let Some(picker) = &mut state.session_picker {
+                                let text = text.replace('\n', " ");
+                                picker.query.insert_str(picker.cursor, &text);
+                                picker.cursor += text.len();
+                                picker.selected = 0;
                             } else if let Some(search) = &mut state.search {
                                 let text = text.replace('\n', " ");
                                 search.query.insert_str(search.cursor, &text);
@@ -495,7 +501,6 @@ fn apply_runtime_event(
                 | Event::ContextCompacted { .. }
                 | Event::GenerationFinished
                 | Event::GenerationCancelled
-                | Event::Saved
                 | Event::Error(_)
         );
     state.apply(event);
@@ -562,6 +567,10 @@ async fn handle_key(
     }
     if state.model_picker.is_some() {
         handle_model_picker_key(key, config, state, commands).await?;
+        return Ok(false);
+    }
+    if state.session_picker.is_some() {
+        handle_session_picker_key(key, state, commands).await?;
         return Ok(false);
     }
     if key.code == KeyCode::Esc && state.generating {
@@ -900,6 +909,96 @@ fn filtered_model_indices(config: &Config, state: &UiState) -> Vec<usize> {
     indices
 }
 
+async fn handle_session_picker_key(
+    key: KeyEvent,
+    state: &mut UiState,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    let indices = filtered_session_indices(state);
+    let picker = state.session_picker.as_mut().unwrap();
+    match key.code {
+        KeyCode::Esc => state.session_picker = None,
+        KeyCode::Enter => {
+            let Some(index) = indices.get(picker.selected).copied() else {
+                return Ok(());
+            };
+            let name = picker.sessions[index].name.clone();
+            state.session_picker = None;
+            commands.send(Command::ResumeSession(name)).await?;
+        }
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down => {
+            picker.selected = (picker.selected + 1).min(indices.len().saturating_sub(1))
+        }
+        KeyCode::PageUp => picker.selected = picker.selected.saturating_sub(10),
+        KeyCode::PageDown => {
+            picker.selected = (picker.selected + 10).min(indices.len().saturating_sub(1))
+        }
+        KeyCode::Home => picker.selected = 0,
+        KeyCode::End => picker.selected = indices.len().saturating_sub(1),
+        KeyCode::Backspace => {
+            if let Some((start, _)) = picker.query[..picker.cursor].char_indices().next_back() {
+                picker.query.replace_range(start..picker.cursor, "");
+                picker.cursor = start;
+                picker.selected = 0;
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(character) = picker.query[picker.cursor..].chars().next() {
+                picker
+                    .query
+                    .replace_range(picker.cursor..picker.cursor + character.len_utf8(), "");
+                picker.selected = 0;
+            }
+        }
+        KeyCode::Left => {
+            if let Some((start, _)) = picker.query[..picker.cursor].char_indices().next_back() {
+                picker.cursor = start;
+            }
+        }
+        KeyCode::Right => {
+            if let Some(character) = picker.query[picker.cursor..].chars().next() {
+                picker.cursor += character.len_utf8();
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.query.clear();
+            picker.cursor = 0;
+            picker.selected = 0;
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.query.insert(picker.cursor, character);
+            picker.cursor += character.len_utf8();
+            picker.selected = 0;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Indices into the picker's session list that match its query, keeping the
+/// recency order the sessions were listed in.
+fn filtered_session_indices(state: &UiState) -> Vec<usize> {
+    let Some(picker) = state.session_picker.as_ref() else {
+        return Vec::new();
+    };
+    let query = picker.query.to_ascii_lowercase();
+    picker
+        .sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, info)| {
+            query.is_empty()
+                || info.name.to_ascii_lowercase().contains(&query)
+                || info
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| title.to_ascii_lowercase().contains(&query))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn handle_fullscreen_diff_key(
     key: KeyEvent,
     state: &mut UiState,
@@ -952,8 +1051,24 @@ async fn dispatch(
                 .await?;
             true
         }
-        "/save" if argument.is_empty() => {
-            commands.send(Command::Save).await?;
+        "/session" => {
+            if state.generating {
+                state.notice =
+                    Some("finish or cancel the current response before switching sessions".into());
+            } else {
+                match Session::list().await {
+                    Ok(sessions) => {
+                        let query = argument.trim().to_owned();
+                        state.session_picker = Some(state::SessionPicker {
+                            query: query.clone(),
+                            cursor: query.len(),
+                            selected: 0,
+                            sessions,
+                        });
+                    }
+                    Err(error) => state.set_error(format!("list sessions: {error:#}")),
+                }
+            }
             true
         }
         "/image" if !argument.is_empty() => {
@@ -1137,7 +1252,7 @@ async fn handle_mouse(
     commands: &mpsc::Sender<Command>,
     renders: &mut RenderState,
 ) -> Result<()> {
-    if state.model_picker.is_some() {
+    if state.model_picker.is_some() || state.session_picker.is_some() {
         return Ok(());
     }
     let MouseAreas {
@@ -1610,6 +1725,7 @@ fn draw(
         }
     }
     draw_model_picker(frame, config, state);
+    draw_session_picker(frame, state);
     draw_toast(frame, state);
     chat_height
 }
@@ -1697,6 +1813,108 @@ fn model_picker_item(model: &ModelConfig, state: &UiState) -> ListItem<'static> 
         ),
         Span::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
     ]))
+}
+
+fn draw_session_picker(frame: &mut ratatui::Frame, state: &UiState) {
+    let Some(picker) = &state.session_picker else {
+        return;
+    };
+    let area = modal_area(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select session · ↑↓ navigate · Enter select · Esc close ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [search, list] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .areas(inner);
+    frame.render_widget(
+        Paragraph::new(picker.query.clone()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Filter sessions "),
+        ),
+        search,
+    );
+
+    let indices = filtered_session_indices(state);
+    let items = indices
+        .iter()
+        .map(|index| session_picker_item(&picker.sessions[*index], state))
+        .collect::<Vec<_>>();
+    let mut list_state = ListState::default();
+    if !items.is_empty() {
+        list_state.select(Some(picker.selected.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("› ").highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        list,
+        &mut list_state,
+    );
+    let cursor_column = picker.query[..picker.cursor].chars().count() as u16;
+    frame.set_cursor_position((
+        search.x + 1 + cursor_column.min(search.width.saturating_sub(3)),
+        search.y + 1,
+    ));
+}
+
+fn session_picker_item(info: &SessionInfo, state: &UiState) -> ListItem<'static> {
+    let marker = if info.display_name() == state.session {
+        "●"
+    } else {
+        " "
+    };
+    let date = format_session_date(info.created_at);
+    let summary = session_summary(info);
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{marker} {}", truncate_chars(&info.name, 24)),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(format!("  {date}"), Style::default().fg(Color::Yellow)),
+        Span::styled(format!("  {summary}"), Style::default().fg(Color::DarkGray)),
+    ]))
+}
+
+/// The one-line session summary: the model-generated title, else the first
+/// user message, else an empty-session marker.
+fn session_summary(info: &SessionInfo) -> String {
+    let summary = info
+        .title
+        .clone()
+        .or(info.first_message.clone())
+        .unwrap_or_else(|| "(empty)".into());
+    truncate_chars(&summary.replace(['\n', '\r'], " "), 48)
+}
+
+fn format_session_date(millis: u64) -> String {
+    let Ok(millis) = i64::try_from(millis) else {
+        return String::new();
+    };
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|datetime| {
+            datetime
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut truncated = text.chars().take(max).collect::<String>();
+    if text.chars().count() > max {
+        truncated.push('…');
+    }
+    truncated
 }
 
 fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState, diff: &mut DiffMemo) {
@@ -1790,11 +2008,17 @@ fn palette_commands(input: &str, recent: &[String]) -> Option<Vec<SlashCommand>>
                 || command.title.to_ascii_lowercase().contains(&query)
         })
         .collect::<Vec<_>>();
+    // A command whose name matches the query beats one that only matches by
+    // title, so `/session` selects itself instead of a recent `/new`.
     commands.sort_by_key(|command| {
-        recent
-            .iter()
-            .position(|name| name == command.name)
-            .unwrap_or(usize::MAX)
+        let name_match = command.name[1..].to_ascii_lowercase().starts_with(&query);
+        (
+            usize::from(!name_match),
+            recent
+                .iter()
+                .position(|name| name == command.name)
+                .unwrap_or(usize::MAX),
+        )
     });
     Some(commands)
 }
@@ -1802,7 +2026,6 @@ fn palette_commands(input: &str, recent: &[String]) -> Option<Vec<SlashCommand>>
 fn hotkey_command(key: KeyEvent) -> Option<&'static str> {
     match (key.modifiers, key.code) {
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => Some("/new"),
-        (KeyModifiers::CONTROL, KeyCode::Char('s')) => Some("/save"),
         (KeyModifiers::CONTROL, KeyCode::Char('d')) => Some("/diff"),
         (KeyModifiers::ALT, KeyCode::Char('m')) => Some("/model"),
         (KeyModifiers::ALT, KeyCode::Char('r')) => Some("/reason"),
@@ -4760,12 +4983,23 @@ mod tests {
 
     #[test]
     fn command_palette_keeps_recent_commands_first() {
-        let recent = vec!["/tools".into(), "/save".into()];
+        let recent = vec!["/tools".into(), "/new".into()];
         let commands = palette_commands("/", &recent).unwrap();
 
         assert_eq!(commands[0].name, "/tools");
-        assert_eq!(commands[1].name, "/save");
-        assert_eq!(commands[2].name, "/new");
+        assert_eq!(commands[1].name, "/new");
+        assert_eq!(commands[2].name, "/session");
+    }
+
+    #[test]
+    fn command_palette_ranks_name_matches_above_title_matches() {
+        let recent = vec!["/new".into(), "/diff".into()];
+        let commands = palette_commands("/session", &recent).unwrap();
+
+        // /new only matches by title ("New session"), so the name match
+        // comes first despite the recency.
+        assert_eq!(commands[0].name, "/session");
+        assert_eq!(commands[1].name, "/new");
     }
 
     #[test]
@@ -4823,6 +5057,180 @@ mod tests {
         assert!(screen.contains("Filter models"));
         assert!(screen.contains("gpt-5.6-sol"));
         assert!(screen.contains("Qwen/Qwen3.8-27B"));
+    }
+
+    #[test]
+    fn session_picker_filters_by_name_or_title() {
+        let mut state = UiState::new();
+        state.session_picker = Some(state::SessionPicker {
+            query: String::new(),
+            cursor: 0,
+            selected: 0,
+            sessions: vec![
+                SessionInfo {
+                    name: "session-1".into(),
+                    title: Some("Git Pane Scrolling".into()),
+                    created_at: 3,
+                    first_message: None,
+                },
+                SessionInfo {
+                    name: "work".into(),
+                    title: None,
+                    created_at: 2,
+                    first_message: Some("fix the build".into()),
+                },
+                SessionInfo {
+                    name: "session-3".into(),
+                    title: Some("Session Palette".into()),
+                    created_at: 1,
+                    first_message: None,
+                },
+            ],
+        });
+
+        assert_eq!(filtered_session_indices(&state), [0usize, 1, 2]);
+
+        let set_query = |state: &mut UiState, query: &str| {
+            let picker = state.session_picker.as_mut().unwrap();
+            picker.query = query.into();
+            picker.cursor = query.len();
+        };
+        set_query(&mut state, "pane");
+        assert_eq!(filtered_session_indices(&state), [0usize]);
+
+        set_query(&mut state, "work");
+        assert_eq!(filtered_session_indices(&state), [1usize]);
+
+        set_query(&mut state, "missing");
+        assert_eq!(filtered_session_indices(&state), Vec::<usize>::new());
+    }
+
+    #[tokio::test]
+    async fn session_picker_enter_resumes_the_selected_session() {
+        let mut state = UiState::new();
+        state.session_picker = Some(state::SessionPicker {
+            query: String::new(),
+            cursor: 0,
+            selected: 1,
+            sessions: vec![
+                SessionInfo {
+                    name: "one".into(),
+                    title: None,
+                    created_at: 2,
+                    first_message: None,
+                },
+                SessionInfo {
+                    name: "two".into(),
+                    title: Some("Second Session".into()),
+                    created_at: 1,
+                    first_message: None,
+                },
+            ],
+        });
+        let (commands, mut events) = mpsc::channel(1);
+
+        handle_session_picker_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &commands,
+        )
+        .await
+        .unwrap();
+
+        assert!(state.session_picker.is_none());
+        match events.recv().await.unwrap() {
+            Command::ResumeSession(name) => assert_eq!(name, "two"),
+            _ => panic!("expected a resume command"),
+        }
+    }
+
+    #[test]
+    fn session_picker_renders_id_date_and_summary_in_a_modal() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = UiState::new();
+        state.session = "Git Pane Scrolling".into();
+        let created_at = 1_700_000_000_000;
+        state.session_picker = Some(state::SessionPicker {
+            query: String::new(),
+            cursor: 0,
+            selected: 1,
+            sessions: vec![
+                SessionInfo {
+                    name: "session-1".into(),
+                    title: Some("Git Pane Scrolling".into()),
+                    created_at: created_at + 1_000,
+                    first_message: None,
+                },
+                SessionInfo {
+                    name: "work".into(),
+                    title: None,
+                    created_at,
+                    first_message: Some("fix the build".into()),
+                },
+            ],
+        });
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut renders = RenderState::new();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, &Config::default(), &state, 0, &mut renders);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..30)
+            .map(|row| {
+                (0..100)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Select session"));
+        assert!(screen.contains("Filter sessions"));
+        assert!(screen.contains("session-1"));
+        assert!(screen.contains("Git Pane Scrolling"));
+        assert!(screen.contains("fix the build"));
+        assert!(screen.contains(&format_session_date(created_at)));
+    }
+
+    #[test]
+    fn session_dates_render_as_local_date_and_time() {
+        let date = format_session_date(1_700_000_000_000);
+        let parts = date.split(' ').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 10);
+        assert_eq!(parts[1].len(), 5);
+        assert!(format_session_date(u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn session_summary_prefers_the_title_and_falls_back_to_the_first_message() {
+        let titled = SessionInfo {
+            name: "session-1".into(),
+            title: Some("Git Pane Scrolling".into()),
+            created_at: 0,
+            first_message: Some("make the git pane scroll".into()),
+        };
+        assert_eq!(session_summary(&titled), "Git Pane Scrolling");
+
+        let untitled = SessionInfo {
+            name: "work".into(),
+            title: None,
+            created_at: 0,
+            first_message: Some("fix the build".into()),
+        };
+        assert_eq!(session_summary(&untitled), "fix the build");
+
+        let empty = SessionInfo {
+            name: "new".into(),
+            title: None,
+            created_at: 0,
+            first_message: None,
+        };
+        assert_eq!(session_summary(&empty), "(empty)");
     }
 
     #[test]

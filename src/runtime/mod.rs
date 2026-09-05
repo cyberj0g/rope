@@ -119,7 +119,7 @@ pub enum Command {
     Cancel,
     Approve(ApprovalDecision),
     NewSession(Option<String>),
-    Save,
+    ResumeSession(String),
     SelectModel(String),
     NextReasoningEffort,
     RememberCommand(String),
@@ -193,7 +193,6 @@ pub enum Event {
     },
     GenerationFinished,
     GenerationCancelled,
-    Saved,
     Error(String),
 }
 
@@ -393,9 +392,20 @@ async fn run<P: Provider>(
                     }
                     Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
                 }
-                Command::Save => match session.save().await {
-                    Ok(()) => { events.send(Event::Saved).await.ok(); }
-                    Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
+                Command::ResumeSession(name)
+                    if generation.is_none() && name != session.meta.name =>
+                {
+                    match Session::resume(&name).await {
+                        Ok((loaded_session, loaded_messages)) => {
+                            session = loaded_session; messages = loaded_messages;
+                            events.send(Event::History(messages.clone())).await.ok();
+                            events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
+                            send_usage(&events, &session).await;
+                            events.send(Event::PlanChanged(session.meta.plan.clone())).await.ok();
+                            send_context(&events, &session, &config).await;
+                        }
+                        Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
+                    }
                 }
                 Command::SelectModel(model) if generation.is_none() => match config.set_model(&model) {
                     Ok(()) => {
@@ -436,6 +446,7 @@ async fn run<P: Provider>(
                     break;
                 }
                 Command::NewSession(_)
+                | Command::ResumeSession(_)
                 | Command::SelectModel(_)
                 | Command::NextReasoningEffort => {}
             },

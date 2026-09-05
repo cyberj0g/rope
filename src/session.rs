@@ -39,6 +39,22 @@ pub struct Session {
     pub meta: SessionMeta,
 }
 
+/// One row of the session picker: the persisted identity of a session plus
+/// the first user message, which summarizes sessions without a title.
+#[derive(Clone, Debug)]
+pub struct SessionInfo {
+    pub name: String,
+    pub title: Option<String>,
+    pub created_at: u64,
+    pub first_message: Option<String>,
+}
+
+impl SessionInfo {
+    pub fn display_name(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.name)
+    }
+}
+
 impl Session {
     pub async fn open(startup: Startup) -> Result<(Self, Vec<Message>)> {
         let root = sessions_root()?;
@@ -63,6 +79,58 @@ impl Session {
             .transpose()?
             .unwrap_or_else(auto_name);
         Self::create(root, name).await
+    }
+
+    /// Every persisted session, most recent first.
+    pub async fn list() -> Result<Vec<SessionInfo>> {
+        Self::list_in(sessions_root()?).await
+    }
+
+    pub async fn list_in(root: PathBuf) -> Result<Vec<SessionInfo>> {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return Ok(Vec::new());
+        };
+        let mut sessions = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Ok(data) = tokio::fs::read(path.join("session.json")).await else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<SessionMeta>(&data) else {
+                continue;
+            };
+            sessions.push(SessionInfo {
+                name: meta.name,
+                title: meta.title,
+                created_at: meta.created_at,
+                first_message: first_user_message(&path.join("messages.jsonl")).await,
+            });
+        }
+        sessions.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(sessions)
+    }
+
+    /// Loads a persisted session by name for resumption.
+    pub async fn resume(name: &str) -> Result<(Self, Vec<Message>)> {
+        Self::resume_in(sessions_root()?, name).await
+    }
+
+    pub async fn resume_in(root: PathBuf, name: &str) -> Result<(Self, Vec<Message>)> {
+        let name = clean_name(name)?;
+        if !root.join(&name).is_dir() {
+            bail!("unknown session: {name}");
+        }
+        Self::load(root, name).await
     }
 
     async fn create(root: PathBuf, name: String) -> Result<Self> {
@@ -247,6 +315,17 @@ fn message_images_mut(message: &mut Message) -> Vec<&mut crate::runtime::ImageCo
     }
 }
 
+async fn first_user_message(path: &Path) -> Option<String> {
+    let data = tokio::fs::read_to_string(path).await.ok()?;
+    data.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| match serde_json::from_str::<Message>(line) {
+            Ok(Message::User { content, .. }) if !content.trim().is_empty() => Some(content),
+            _ => None,
+        })
+        .next()
+}
+
 fn sessions_root() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("home directory not found")?;
     Ok(base.data_dir().join("harness/sessions"))
@@ -420,6 +499,108 @@ mod tests {
             loaded.meta.approved_tools,
             ["shell", "search_files", "list_files"]
         );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_orders_by_recency_and_extracts_summaries() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-session-list-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+
+        let mut old = Session::create(root.clone(), "older".into()).await.unwrap();
+        old.meta.created_at = 1_000;
+        old.save().await.unwrap();
+        tokio::fs::write(
+            root.join("older").join("messages.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&Message::user_with_images(
+                    "summarize the crash log".into(),
+                    Vec::new()
+                ))
+                .unwrap()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mut new = Session::create(root.clone(), "newer".into()).await.unwrap();
+        new.meta.created_at = 2_000;
+        new.set_title("Git Pane Scrolling".into());
+        new.save().await.unwrap();
+
+        // A stray file and a directory without valid metadata are skipped.
+        tokio::fs::write(root.join("stray.txt"), "not a session")
+            .await
+            .unwrap();
+        let broken = root.join("broken");
+        tokio::fs::create_dir(&broken).await.unwrap();
+        tokio::fs::write(broken.join("session.json"), "{not json")
+            .await
+            .unwrap();
+
+        let sessions = Session::list_in(root.clone()).await.unwrap();
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|info| info.name.as_str())
+                .collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        assert_eq!(sessions[0].title.as_deref(), Some("Git Pane Scrolling"));
+        assert_eq!(sessions[0].first_message, None);
+        assert_eq!(
+            sessions[1].first_message.as_deref(),
+            Some("summarize the crash log")
+        );
+        assert_eq!(sessions[1].display_name(), "older");
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_is_empty_before_any_session_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-session-empty-list-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+
+        assert!(Session::list_in(root.clone()).await.unwrap().is_empty());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_loads_a_persisted_session_by_name() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-session-resume-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create(root.clone(), "work".into()).await.unwrap();
+        session
+            .append(&[Message::user_with_images("keep going".into(), Vec::new())])
+            .await
+            .unwrap();
+
+        let (loaded, messages) = Session::resume_in(root.clone(), "work").await.unwrap();
+        assert_eq!(loaded.meta.name, "work");
+        assert_eq!(
+            messages,
+            vec![Message::user_with_images("keep going".into(), Vec::new())]
+        );
+
+        assert!(Session::resume_in(root.clone(), "missing").await.is_err());
+        assert!(Session::resume_in(root.clone(), "../work").await.is_err());
+
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

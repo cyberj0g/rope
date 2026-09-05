@@ -79,7 +79,7 @@ rope "what is this repo up to?"
   others), with a text placeholder otherwise
 - Persistent sessions as JSONL under `~/.local/share/harness/sessions`,
   with auto-generated titles, token totals, and resume via
-  `rope --session NAME`, `/new`, or `/save`.
+  `rope --session NAME`, `/new`, or the `/session` picker.
 - Iterative model → tool → model execution with immediate cancellation
   and automatic retry with backoff on transient failures.
 - Per-tool `allow` / `ask` / `deny` approval policies in `config.toml`,
