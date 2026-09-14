@@ -870,7 +870,16 @@ async fn turn<P: Provider>(
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<TurnResult> {
     let mut compaction = None;
-    let estimated = estimate_tokens(&messages).max(context_tokens);
+    // The provider's last reported usage is ground truth for everything
+    // already in the context, so predict the next request as that usage
+    // plus the new user message. Fall back to the whole-context estimate
+    // on a cold start, before any request has reported usage.
+    let (known, unknown) = if context_tokens == 0 {
+        (0u64, &messages[..])
+    } else {
+        (context_tokens, &messages[messages.len().saturating_sub(1)..])
+    };
+    let estimated = known.saturating_add(estimate_tokens(unknown));
     let max_tokens = config.active_model().max_context_tokens;
     if estimated as f64 >= max_tokens as f64 * config.compaction_threshold as f64 {
         let user = messages.pop().context("missing user message")?;
@@ -3125,6 +3134,62 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[tokio::test]
+    async fn turn_start_compaction_anchors_on_real_usage_not_the_whole_context_estimate() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::Text("ok".into()),
+            ResponseDelta::Usage(Usage {
+                prompt_tokens: 90,
+                total_tokens: 100,
+            }),
+        ]]));
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 2048;
+        config.compaction_threshold = 0.75;
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (internal_tx, _internal_rx) = mpsc::channel(4);
+
+        // The whole-context estimate is pushed past the threshold by an
+        // assistant message whose bulk (a long reasoning transcript) the
+        // provider never charges for, but the last reported usage is well
+        // below it: the next request is that usage plus one short word.
+        let bulky = Message::assistant(
+            "done".into(),
+            "model".into(),
+            "x".repeat(8000),
+            Vec::new(),
+        );
+        assert!(estimate_tokens(&[bulky.clone()]) as f64 >= 2048.0 * 0.75);
+
+        let result = turn(
+            provider,
+            &ToolRegistry::default(),
+            &config,
+            vec![
+                Message::user("old turn".into()),
+                bulky,
+                Message::user("commit".into()),
+            ],
+            2,
+            1000,
+            None,
+            false,
+            None,
+            no_steers(),
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.compaction.is_none());
+        assert_eq!(result.completed[0], Message::user("commit".into()));
+        assert_eq!(result.completed[1].content(), "ok");
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(!matches!(event, Event::CompactionStarted));
+        }
     }
 
     #[tokio::test]
