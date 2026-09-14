@@ -25,6 +25,10 @@ use crate::{
 pub use message::{ImageContent, Message, ToolCall};
 
 pub const CANCELLED_BY_USER: &str = "cancelled by user";
+/// Tool result recorded for a call still in flight when the user stopped
+/// the turn, so the interrupted history stays a valid message sequence
+/// and the model knows the call never completed.
+const CANCELLED_TOOL_OUTPUT: &str = "Cancelled by user before the tool completed.";
 /// Prefix of the persisted System marker for a compacted context. The
 /// remainder of the marker content is the summary the context was reduced to.
 pub const COMPACTION_MARKER: &str = "Context compacted";
@@ -260,6 +264,29 @@ struct TurnResult {
     title: Option<String>,
 }
 
+/// The in-flight state of an active turn, shared with the runtime so an
+/// interrupted turn's completed work can be persisted instead of lost:
+/// without it, the aborted agent task would take its partial conversation
+/// with it and the next turn would start as if nothing had happened.
+#[derive(Clone, Default)]
+struct TurnProgress {
+    /// The turn's tail — its user prompt and everything delivered since,
+    /// exactly as the agent's working context holds it; the same tail the
+    /// turn would return on a clean finish.
+    messages: Vec<Message>,
+    /// Compaction the turn applied (turn-start or mid-turn), if any.
+    compaction: Option<Compaction>,
+}
+
+type TurnProgressHandle = Arc<Mutex<TurnProgress>>;
+
+/// One active generation: the agent task and the progress it publishes.
+struct ActiveTurn {
+    task: JoinHandle<()>,
+    progress: TurnProgressHandle,
+}
+
+#[derive(Clone)]
 struct Compaction {
     summary: String,
     through: usize,
@@ -305,7 +332,7 @@ async fn run<P: Provider>(
     events: mpsc::Sender<Event>,
 ) {
     let (internal_tx, mut internal_rx) = mpsc::channel(8);
-    let mut generation: Option<JoinHandle<()>> = None;
+    let mut generation: Option<ActiveTurn> = None;
     let mut pending_approval: Option<PendingApproval> = None;
     let mut project_requests = ProjectRequests::default();
     // Steering prompts queued for the active turn. The turn's agent drains
@@ -372,30 +399,25 @@ async fn run<P: Provider>(
                     pending_prompts.lock().unwrap().push(prompt);
                 }
                 Command::Cancel => {
-                    if let Some(task) = generation.take() {
-                        task.abort();
+                    if let Some(active) = generation.take() {
+                        active.task.abort();
                         // Let the aborted generation fully unwind before
                         // cancelling tools, so a shell job cannot be
                         // registered after cancellation began.
-                        task.await.ok();
+                        active.task.await.ok();
                         tools.cancel_active().await;
                         pending_approval = None;
-                        // Steers queued for the cancelled turn never
-                        // reached the model; persist them with the turn so
-                        // history keeps what the user said.
-                        messages.extend(
-                            pending_prompts
-                                .lock()
-                                .unwrap()
-                                .drain(..)
-                                .map(UserPrompt::steer_message),
-                        );
-                        let pending_from = messages.len().saturating_sub(1);
-                        messages.push(Message::system(CANCELLED_BY_USER.into()));
-                        let saved = async {
-                            session.append(&messages[pending_from..]).await?;
-                            session.save().await
-                        }.await;
+                        // Persist the work the interrupted turn already
+                        // completed, with the cancellation marker, so
+                        // the next turn continues from the real state of
+                        // the conversation instead of from before it.
+                        let saved = persist_interrupted_turn(
+                            &mut messages,
+                            &mut session,
+                            active.progress,
+                            &pending_prompts,
+                        )
+                        .await;
                         events.send(Event::GenerationCancelled).await.ok();
                         if let Err(error) = saved {
                             events.send(Event::Error(format!("save cancelled turn: {error:#}"))).await.ok();
@@ -462,11 +484,21 @@ async fn run<P: Provider>(
                     request_project(&mut project_requests, &project, ProjectRequest::Diff(path), &internal_tx);
                 }
                 Command::Shutdown(reply) => {
-                    if let Some(task) = generation.take() {
-                        task.abort();
+                    if let Some(active) = generation.take() {
+                        active.task.abort();
                         // Same ordering as Cancel: let the generation unwind
                         // before shell-job cleanup starts.
-                        task.await.ok();
+                        active.task.await.ok();
+                        // An interrupted turn keeps its completed work, as
+                        // Cancel does, so a resumed session continues from
+                        // the real state of the conversation.
+                        let _ = persist_interrupted_turn(
+                            &mut messages,
+                            &mut session,
+                            active.progress,
+                            &pending_prompts,
+                        )
+                        .await;
                     }
                     tools.shutdown().await;
                     session.save().await.ok();
@@ -603,9 +635,85 @@ async fn run<P: Provider>(
 /// resubmits the leftovers as a fresh turn.
 type SteerQueue = Arc<Mutex<Vec<UserPrompt>>>;
 
+/// Persists the work an interrupted turn already completed, so the
+/// conversation continues from the real state instead of from before the
+/// interruption: the turn's user prompt, every assistant message and
+/// tool result the model saw, any compaction the turn applied, the
+/// steers queued but never delivered, and a marker that the user stopped
+/// the turn.
+async fn persist_interrupted_turn(
+    messages: &mut Vec<Message>,
+    session: &mut Session,
+    progress: TurnProgressHandle,
+    pending_prompts: &SteerQueue,
+) -> Result<()> {
+    // The turn's user prompt: spawn_turn pushed it when the turn began,
+    // and the runtime appends nothing else while a turn is active.
+    let turn_from = messages.len().saturating_sub(1);
+    let TurnProgress {
+        messages: mut tail,
+        compaction,
+    } = progress.lock().unwrap().clone();
+    close_open_tool_calls(&mut tail);
+    messages.truncate(turn_from);
+    if let Some(compaction) = compaction {
+        let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
+        session.meta.compaction_summary = Some(compaction.summary);
+        session.meta.compacted_through = compaction.through;
+        messages.push(marker);
+    }
+    messages.extend(tail);
+    // Steers queued for the turn never reached the model; persist them
+    // with the turn so history keeps what the user said.
+    messages.extend(
+        pending_prompts
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(UserPrompt::steer_message),
+    );
+    messages.push(Message::system(CANCELLED_BY_USER.into()));
+    session.append(&messages[turn_from..]).await?;
+    session.save().await
+}
+
+/// Closes the tool calls an interrupted turn left hanging: the agent may
+/// have been stopped between an assistant message and the results of its
+/// calls, and providers refuse a tool call without its result. Each
+/// unanswered call receives a cancellation result, in call order.
+fn close_open_tool_calls(tail: &mut Vec<Message>) {
+    let Some(start) = tail
+        .iter()
+        .rposition(|message| matches!(message, Message::Assistant { .. }))
+    else {
+        return;
+    };
+    let Message::Assistant { tool_calls, .. } = &tail[start] else {
+        return;
+    };
+    let answered = tail[start + 1..]
+        .iter()
+        .take_while(|message| matches!(message, Message::Tool { .. }))
+        .count();
+    // The results arrive in call order, so the open calls are the suffix
+    // after the answered prefix.
+    let open = tool_calls[answered..]
+        .iter()
+        .map(|call| call.id.clone())
+        .collect::<Vec<_>>();
+    for call_id in open {
+        tail.push(Message::tool(
+            call_id,
+            CANCELLED_TOOL_OUTPUT.into(),
+            None,
+            None,
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_turn<P: Provider>(
-    generation: &mut Option<JoinHandle<()>>,
+    generation: &mut Option<ActiveTurn>,
     pending_prompts: &mut SteerQueue,
     messages: &mut Vec<Message>,
     session: &mut Session,
@@ -618,6 +726,10 @@ async fn spawn_turn<P: Provider>(
     internal: &mpsc::Sender<InternalEvent>,
 ) {
     let persist_from = messages.len();
+    let progress: TurnProgressHandle = Arc::new(Mutex::new(TurnProgress {
+        messages: vec![first.clone()],
+        compaction: None,
+    }));
     messages.push(first);
     let request_messages = request_context(messages, &session.meta);
     let context_tokens = session.meta.context_tokens;
@@ -632,31 +744,35 @@ async fn spawn_turn<P: Provider>(
     let events = events.clone();
     let internal = internal.clone();
     events.send(Event::GenerationStarted).await.ok();
-    *generation = Some(tokio::spawn(async move {
-        let result = match project_prompt {
-            Ok(prompt) => turn(
-                provider,
-                &tools,
-                &config,
-                request_messages,
-                persist_from,
-                context_tokens,
-                prompt,
-                generate_title,
-                current_plan,
-                steers,
-                &events,
-                &internal,
-            )
-            .await,
-            Err(error) => Err(error),
-        };
-        let event = match result {
-            Ok(result) => InternalEvent::Finished(result),
-            Err(error) => InternalEvent::Failed(format!("{error:#}")),
-        };
-        internal.send(event).await.ok();
-    }));
+    *generation = Some(ActiveTurn {
+        progress: progress.clone(),
+        task: tokio::spawn(async move {
+            let result = match project_prompt {
+                Ok(prompt) => turn(
+                    provider,
+                    &tools,
+                    &config,
+                    request_messages,
+                    persist_from,
+                    context_tokens,
+                    prompt,
+                    generate_title,
+                    current_plan,
+                    steers,
+                    &progress,
+                    &events,
+                    &internal,
+                )
+                .await,
+                Err(error) => Err(error),
+            };
+            let event = match result {
+                Ok(result) => InternalEvent::Finished(result),
+                Err(error) => InternalEvent::Failed(format!("{error:#}")),
+            };
+            internal.send(event).await.ok();
+        }),
+    });
 }
 
 fn spawn_project_task(
@@ -866,6 +982,7 @@ async fn turn<P: Provider>(
     generate_title: bool,
     current_plan: Option<ExecutionPlan>,
     steers: SteerQueue,
+    progress: &TurnProgressHandle,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<TurnResult> {
@@ -894,6 +1011,10 @@ async fn turn<P: Provider>(
         });
     }
     let persist_from = messages.len().saturating_sub(1);
+    // A turn-start compaction replaces the whole context with its summary,
+    // so record it for interruption salvage: the summary subsumes the
+    // history that stays in the session file but leaves the model context.
+    progress.lock().unwrap().compaction = compaction.clone();
     let (completed, mid_turn_compaction) = agent(
         provider.clone(),
         tools,
@@ -904,6 +1025,7 @@ async fn turn<P: Provider>(
         project_prompt,
         current_plan,
         &steers,
+        progress,
         events,
         internal,
     )
@@ -1241,6 +1363,7 @@ async fn agent<P: Provider>(
     project_prompt: Option<String>,
     mut current_plan: Option<ExecutionPlan>,
     steers: &SteerQueue,
+    progress: &TurnProgressHandle,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<(Vec<Message>, Option<Compaction>)> {
@@ -1252,13 +1375,16 @@ async fn agent<P: Provider>(
         // Steering prompts sent during this turn are injected here, so the
         // next model request carries them after everything delivered so
         // far — including in-flight tool results.
-        messages.extend(
-            steers
-                .lock()
-                .unwrap()
-                .drain(..)
-                .map(UserPrompt::steer_message),
-        );
+        let steered = steers
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(UserPrompt::steer_message)
+            .collect::<Vec<_>>();
+        if !steered.is_empty() {
+            messages.extend(steered.iter().cloned());
+            progress.lock().unwrap().messages.extend(steered);
+        }
         events
             .send(Event::ModelRequestStarted(config.model_id().to_owned()))
             .await
@@ -1284,13 +1410,15 @@ async fn agent<P: Provider>(
             collect(stream, events, internal).await?;
         // The tool call cap applies between assistant messages, not per turn.
         calls.truncate(MAX_TOOL_CALLS_PER_MESSAGE);
-        messages.push(Message::assistant_response(
+        let response = Message::assistant_response(
             text,
             config.model_id().to_owned(),
             reasoning,
             calls.clone(),
             response_items,
-        ));
+        );
+        messages.push(response.clone());
+        progress.lock().unwrap().messages.push(response);
         let mut used_context_tokens = usage.map_or_else(
             || {
                 config
@@ -1360,6 +1488,7 @@ async fn agent<P: Provider>(
                     summary,
                     through: user_full_index,
                 });
+                progress.lock().unwrap().compaction = compaction.clone();
                 used_context_tokens = max_tokens.saturating_sub(available_context_tokens(
                     &messages,
                     config,
@@ -1474,7 +1603,8 @@ async fn agent<P: Provider>(
             let message = Message::tool(call.id, output, image, diff);
             used_context_tokens =
                 used_context_tokens.saturating_add(estimate_tokens(std::slice::from_ref(&message)));
-            messages.push(message);
+            messages.push(message.clone());
+            progress.lock().unwrap().messages.push(message);
         }
     }
 }
@@ -1773,6 +1903,10 @@ mod tests {
         Arc::new(Mutex::new(Vec::new()))
     }
 
+    fn fresh_progress() -> TurnProgressHandle {
+        Arc::new(Mutex::new(TurnProgress::default()))
+    }
+
     struct Echo;
 
     #[async_trait]
@@ -1858,6 +1992,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -1913,6 +2048,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -1972,6 +2108,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2035,6 +2172,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2123,6 +2261,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2194,6 +2333,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2243,6 +2383,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2289,6 +2430,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2356,6 +2498,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2414,6 +2557,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2493,6 +2637,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2559,6 +2704,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -2645,6 +2791,7 @@ mod tests {
                     None,
                     None,
                     &no_steers(),
+                    &fresh_progress(),
                     &events,
                     &internal,
                 )
@@ -2764,6 +2911,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -3102,6 +3250,7 @@ mod tests {
             false,
             None,
             no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -3178,6 +3327,7 @@ mod tests {
             false,
             None,
             no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -3460,6 +3610,7 @@ mod tests {
             None,
             None,
             &no_steers(),
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -3556,6 +3707,7 @@ mod tests {
             None,
             None,
             &steers,
+            &fresh_progress(),
             &event_tx,
             &internal_tx,
         )
@@ -3609,6 +3761,7 @@ mod tests {
                     None,
                     None,
                     &steers,
+                    &fresh_progress(),
                     &events,
                     &internal,
                 )
@@ -3756,5 +3909,325 @@ mod tests {
         assert!(resubmitted.last().is_some_and(|message| {
             matches!(message, Message::Steer { content, .. } if content == "steered")
         }));
+    }
+
+    #[test]
+    fn close_open_tool_calls_appends_a_cancellation_result_per_open_call() {
+        // Two calls, no results yet: both close, in call order.
+        let mut tail = vec![
+            Message::user("go".into()),
+            Message::assistant(
+                "working".into(),
+                "model".into(),
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                ],
+            ),
+        ];
+        close_open_tool_calls(&mut tail);
+        assert_eq!(tail.len(), 4);
+        assert!(matches!(
+            &tail[2],
+            Message::Tool { call_id, content, .. }
+                if call_id == "a" && content == CANCELLED_TOOL_OUTPUT
+        ));
+        assert!(matches!(&tail[3], Message::Tool { call_id, .. } if call_id == "b"));
+
+        // One call answered: only the rest closes.
+        let mut tail = vec![
+            Message::user("go".into()),
+            Message::assistant(
+                "working".into(),
+                "model".into(),
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                ],
+            ),
+            Message::tool("a".into(), "first".into(), None, None),
+        ];
+        close_open_tool_calls(&mut tail);
+        assert_eq!(tail.len(), 4);
+        assert!(matches!(&tail[3], Message::Tool { call_id, .. } if call_id == "b"));
+
+        // A completed tail is unchanged.
+        let mut tail = vec![
+            Message::user("go".into()),
+            Message::assistant(
+                "working".into(),
+                "model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "a".into(),
+                    name: "echo".into(),
+                    arguments: json!({}),
+                }],
+            ),
+            Message::tool("a".into(), "first".into(), None, None),
+            Message::assistant("done".into(), "model".into(), String::new(), Vec::new()),
+        ];
+        close_open_tool_calls(&mut tail);
+        assert_eq!(tail.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_persists_its_completed_work() {
+        // The second response is held behind an 80ms delay that is
+        // interrupted before it is consumed, so the follow-up turn gets
+        // the "continued answer".
+        let provider = Arc::new(DelayedFinalProvider {
+            mock: MockProvider::new(vec![
+                vec![ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("echo".into()),
+                    arguments: r#"{"value":"done"}"#.into(),
+                }],
+                vec![ResponseDelta::Text("continued answer".into())],
+                vec![ResponseDelta::Text("never used".into())],
+            ]),
+        });
+        let root = std::env::temp_dir().join(format!(
+            "rope-cancel-salvage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create_in(root.clone(), "cancel".into())
+            .await
+            .unwrap();
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let run_task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                run(
+                    Config::default(),
+                    provider,
+                    tools,
+                    session,
+                    Vec::new(),
+                    ProjectState::new().await.unwrap(),
+                    command_rx,
+                    event_tx,
+                )
+                .await
+            }
+        });
+        command_tx
+            .send(Command::Submit(UserPrompt {
+                content: "go".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        // Once the tool result lands, the turn's final model request is
+        // built and its response delayed: a cancel lands mid-turn.
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::ToolResult { .. }) {
+                break;
+            }
+        }
+        // Let the agent drain the (empty) steer queue for the final
+        // request, then steer while the response is delayed: the prompt
+        // misses the turn's last injection point.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        command_tx
+            .send(Command::Steer(UserPrompt {
+                content: "keep going".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        command_tx.send(Command::Cancel).await.unwrap();
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::GenerationCancelled) {
+                break;
+            }
+        }
+        // The next turn must see the cancelled turn's work and the marker.
+        command_tx
+            .send(Command::Submit(UserPrompt {
+                content: "continue".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::GenerationFinished) {
+                break;
+            }
+        }
+        let (reply, _summary) = tokio::sync::oneshot::channel();
+        command_tx.send(Command::Shutdown(reply)).await.unwrap();
+        run_task.await.unwrap();
+
+        // The persisted session keeps the interrupted turn's work, the
+        // undelivered steer, and the cancellation marker — in order —
+        // followed by the fresh turn's own user + assistant messages.
+        let (_, messages) = Session::resume_in(root.clone(), "cancel").await.unwrap();
+        assert_eq!(messages.len(), 7);
+        assert!(matches!(&messages[0], Message::User { content, .. } if content == "go"));
+        assert!(matches!(&messages[1], Message::Assistant { tool_calls, .. }
+            if tool_calls.len() == 1 && tool_calls[0].id == "call_1"));
+        assert!(
+            matches!(&messages[2], Message::Tool { call_id, content, .. }
+            if call_id == "call_1" && content == "done")
+        );
+        assert!(matches!(&messages[3], Message::Steer { content, .. } if content == "keep going"));
+        assert!(
+            matches!(&messages[4], Message::System { content } if content == CANCELLED_BY_USER)
+        );
+        assert!(matches!(&messages[5], Message::User { content, .. } if content == "continue"));
+        assert!(
+            matches!(&messages[6], Message::Assistant { content, .. } if content == "continued answer")
+        );
+
+        // The next turn's model request carries the salvaged work and the
+        // marker before its own prompt, so the agent continues from where
+        // the user stopped it instead of from before the cancelled turn.
+        let requests = provider.mock.requests();
+        assert_eq!(requests.len(), 2);
+        let next = &requests[1].messages;
+        let seen_tool = next
+            .iter()
+            .position(|m| matches!(m, Message::Tool { call_id, .. } if call_id == "call_1"))
+            .expect("the cancelled turn's tool result left the next context");
+        let seen_marker = next
+            .iter()
+            .position(|m| matches!(m, Message::System { content } if content == CANCELLED_BY_USER))
+            .expect("the cancellation marker left the next context");
+        let seen_continue = next
+            .iter()
+            .position(|m| matches!(m, Message::User { content, .. } if content == "continue"))
+            .expect("the fresh prompt is in the context");
+        assert!(seen_tool < seen_marker);
+        assert!(seen_marker < seen_continue);
+
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_closes_the_tool_calls_it_left_open() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("slow_echo".into()),
+                    arguments: r#"{"value":"x"}"#.into(),
+                },
+                ResponseDelta::ToolCall {
+                    index: 1,
+                    id: Some("call_2".into()),
+                    name: Some("slow_echo".into()),
+                    arguments: r#"{"value":"y"}"#.into(),
+                },
+            ],
+            vec![ResponseDelta::Text("never reached".into())],
+        ]));
+        let root = std::env::temp_dir().join(format!(
+            "rope-cancel-open-calls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create_in(root.clone(), "open".into())
+            .await
+            .unwrap();
+        // 40 chunks x 2ms keeps the first tool running long enough to
+        // cancel while it is in flight.
+        let mut tools = ToolRegistry::default();
+        tools.insert(SlowEcho(vec!["x".into(); 40]), Approval::Allow);
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let run_task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                run(
+                    Config::default(),
+                    provider,
+                    tools,
+                    session,
+                    Vec::new(),
+                    ProjectState::new().await.unwrap(),
+                    command_rx,
+                    event_tx,
+                )
+                .await
+            }
+        });
+        command_tx
+            .send(Command::Submit(UserPrompt {
+                content: "go".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::ToolStarted { .. }) {
+                break;
+            }
+        }
+        // The first tool is still running; the second never starts.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        command_tx.send(Command::Cancel).await.unwrap();
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::GenerationCancelled) {
+                break;
+            }
+        }
+        let (reply, _summary) = tokio::sync::oneshot::channel();
+        command_tx.send(Command::Shutdown(reply)).await.unwrap();
+        run_task.await.unwrap();
+
+        // Both open calls received a cancellation result, so the
+        // interrupted history is a valid message sequence.
+        let (_, messages) = Session::resume_in(root.clone(), "open").await.unwrap();
+        assert_eq!(messages.len(), 5);
+        assert!(matches!(&messages[1], Message::Assistant { tool_calls, .. }
+            if tool_calls.len() == 2 && tool_calls[0].id == "call_1" && tool_calls[1].id == "call_2"));
+        assert!(
+            matches!(&messages[2], Message::Tool { call_id, content, .. }
+            if call_id == "call_1" && content == CANCELLED_TOOL_OUTPUT)
+        );
+        assert!(
+            matches!(&messages[3], Message::Tool { call_id, content, .. }
+            if call_id == "call_2" && content == CANCELLED_TOOL_OUTPUT)
+        );
+        assert!(
+            matches!(&messages[4], Message::System { content } if content == CANCELLED_BY_USER)
+        );
+
+        tokio::fs::remove_dir_all(&root).await.unwrap();
     }
 }
