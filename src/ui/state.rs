@@ -178,11 +178,9 @@ pub struct UiState {
     pub git_panel: bool,
     pub git_panel_width: Option<u16>,
     pub git_split_dragging: bool,
-    pub git_diff_mode: bool,
     pub git_fullscreen_diff: bool,
     pub fullscreen_tool_diff: Option<String>,
     pub git_status_scroll: u16,
-    pub git_panel_diff_scroll: u16,
     pub git_diff_scroll: u16,
     pub plan: Option<ExecutionPlan>,
     pub plan_panel: bool,
@@ -212,6 +210,8 @@ pub struct UiState {
     next_input_image_id: u64,
     pub text_selection: Option<TextSelection>,
     pub selection_anchor: Option<TextPoint>,
+    pub input_selection: Option<TextSelection>,
+    pub input_selection_anchor: Option<TextPoint>,
     toast: Option<Toast>,
 }
 
@@ -284,7 +284,7 @@ pub struct TextPoint {
     pub column: u16,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextSelection {
     pub start: TextPoint,
     pub end: TextPoint,
@@ -340,11 +340,9 @@ impl UiState {
             git_panel: true,
             git_panel_width: None,
             git_split_dragging: false,
-            git_diff_mode: false,
             git_fullscreen_diff: false,
             fullscreen_tool_diff: None,
             git_status_scroll: 0,
-            git_panel_diff_scroll: 0,
             git_diff_scroll: 0,
             plan: None,
             plan_panel: false,
@@ -374,6 +372,8 @@ impl UiState {
             next_input_image_id: 0,
             text_selection: None,
             selection_anchor: None,
+            input_selection: None,
+            input_selection_anchor: None,
             toast: None,
             render_revisions: Vec::new(),
             diff_generation: 0,
@@ -423,6 +423,7 @@ impl UiState {
         self.error = None;
         self.notice = None;
         self.scroll = 0;
+        self.clear_input_selection();
         Some(UserPrompt { content, images })
     }
 
@@ -432,16 +433,25 @@ impl UiState {
         self.pasted.clear();
         self.input_images.clear();
         self.palette_selected = 0;
+        self.clear_input_selection();
     }
 
     pub fn clear_input(&mut self) {
         self.set_input(String::new());
     }
 
+    /// Drops any in-progress composer selection. Called whenever the input
+    /// text changes, since a stale highlight would no longer line up.
+    fn clear_input_selection(&mut self) {
+        self.input_selection = None;
+        self.input_selection_anchor = None;
+    }
+
     pub fn insert_char(&mut self, character: char) {
         self.shift_input_items(self.input_cursor, character.len_utf8() as isize);
         self.input.insert(self.input_cursor, character);
         self.input_cursor += character.len_utf8();
+        self.clear_input_selection();
     }
 
     pub fn insert_paste(&mut self, text: &str, collapse_at: usize) {
@@ -458,6 +468,7 @@ impl UiState {
             });
             self.pasted.sort_by_key(|range| range.start);
         }
+        self.clear_input_selection();
     }
 
     #[cfg(test)]
@@ -483,6 +494,7 @@ impl UiState {
             image: None,
         });
         self.input_images.sort_by_key(|item| item.start);
+        self.clear_input_selection();
         id
     }
 
@@ -564,6 +576,7 @@ impl UiState {
             self.input.replace_range(range.start..range.end, "");
             self.input_cursor = range.start;
             self.shift_input_items(range.end, -((range.end - range.start) as isize));
+            self.clear_input_selection();
             return;
         }
         let Some((start, _)) = self.input[..self.input_cursor].char_indices().next_back() else {
@@ -573,6 +586,7 @@ impl UiState {
         let removed = self.input_cursor - start;
         self.input_cursor = start;
         self.shift_input_items(start + removed, -(removed as isize));
+        self.clear_input_selection();
     }
 
     pub fn delete(&mut self) {
@@ -592,6 +606,7 @@ impl UiState {
             let range = self.pasted.remove(index);
             self.input.replace_range(range.start..range.end, "");
             self.shift_input_items(range.end, -((range.end - range.start) as isize));
+            self.clear_input_selection();
             return;
         }
         let Some(character) = self.input[self.input_cursor..].chars().next() else {
@@ -600,6 +615,7 @@ impl UiState {
         let end = self.input_cursor + character.len_utf8();
         self.input.replace_range(self.input_cursor..end, "");
         self.shift_input_items(end, -(character.len_utf8() as isize));
+        self.clear_input_selection();
     }
 
     pub fn move_input_left(&mut self) {
@@ -678,6 +694,7 @@ impl UiState {
             .retain(|item| item.start < start || item.end > end);
         self.input.replace_range(start..end, "");
         self.shift_input_items(end, -((end - start) as isize));
+        self.clear_input_selection();
     }
 
     pub fn move_input_home(&mut self) {
@@ -735,7 +752,7 @@ impl UiState {
         (row, column)
     }
 
-    fn input_plates(&self) -> Vec<(usize, usize, String, ratatui::style::Color, bool)> {
+    pub fn input_plates(&self) -> Vec<(usize, usize, String, ratatui::style::Color, bool)> {
         use ratatui::style::Color;
 
         let mut plates = self
@@ -792,6 +809,7 @@ impl UiState {
             self.input_cursor = item.start;
         }
         self.shift_input_items(item.end, -((item.end - item.start) as isize));
+        self.clear_input_selection();
         item.start
     }
 
@@ -892,11 +910,11 @@ impl UiState {
         self.plan_split_dragging = false;
     }
 
-    pub fn open_fullscreen_git_diff(&mut self) {
+    pub fn open_fullscreen_git_diff(&mut self, path: Option<std::path::PathBuf>) {
         self.git_fullscreen_diff = true;
         self.git_diff_scroll = 0;
         self.fullscreen_tool_diff = None;
-        self.project.git_diff_path = None;
+        self.project.git_diff_path = path;
         self.project.git_diff.clear();
         self.diff_generation = self.diff_generation.wrapping_add(1);
     }
@@ -912,6 +930,7 @@ impl UiState {
         self.git_fullscreen_diff = false;
         self.git_diff_scroll = 0;
         self.fullscreen_tool_diff = None;
+        self.project.git_diff_path = None;
         self.diff_generation = self.diff_generation.wrapping_add(1);
     }
 
@@ -2544,14 +2563,18 @@ mod tests {
         state.project.git_diff_path = Some("old.rs".into());
         state.git_diff_scroll = 10;
 
-        state.open_fullscreen_git_diff();
+        state.open_fullscreen_git_diff(Some("src/new.rs".into()));
         assert!(state.git_fullscreen_diff);
         assert_eq!(state.git_diff_scroll, 0);
         assert!(state.project.git_diff.is_empty());
-        assert!(state.project.git_diff_path.is_none());
+        assert_eq!(
+            state.project.git_diff_path.as_deref(),
+            Some(std::path::Path::new("src/new.rs"))
+        );
 
         state.close_fullscreen_git_diff();
         assert!(!state.git_fullscreen_diff);
+        assert!(state.project.git_diff_path.is_none());
     }
 
     #[test]

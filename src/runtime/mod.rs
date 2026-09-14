@@ -134,7 +134,6 @@ pub enum Command {
     SelectModel(String),
     NextReasoningEffort,
     RememberCommand(String),
-    RefreshProject,
     GitDiff(Option<std::path::PathBuf>),
     Shutdown(oneshot::Sender<SessionSummary>),
 }
@@ -458,9 +457,6 @@ async fn run<P: Provider>(
                     if let Err(error) = config.remember_command(&command) {
                         events.send(Event::Error(format!("save command history: {error:#}"))).await.ok();
                     }
-                }
-                Command::RefreshProject => {
-                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
                 }
                 Command::GitDiff(path) => {
                     request_project(&mut project_requests, &project, ProjectRequest::Diff(path), &internal_tx);

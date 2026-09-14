@@ -194,11 +194,10 @@ struct RenderedBlock {
     argument_summary: String,
 }
 
-/// Memoized diff line rendering for the git pane and fullscreen diff, which
-/// would otherwise re-color every line of the diff on each frame.
+/// Memoized diff line rendering for the full-screen diff, which would
+/// otherwise re-color every line of the diff on each frame.
 struct DiffMemo {
     generation: u64,
-    fullscreen: bool,
     lines: Vec<Line<'static>>,
 }
 
@@ -207,29 +206,23 @@ impl Default for DiffMemo {
         // A generation no state can match until the first `get`.
         Self {
             generation: u64::MAX,
-            fullscreen: false,
             lines: Vec::new(),
         }
     }
 }
 
 impl DiffMemo {
-    fn get(&mut self, state: &UiState, fullscreen: bool) -> &Vec<Line<'static>> {
-        if self.generation != state.diff_generation || self.fullscreen != fullscreen {
-            self.lines = if fullscreen {
-                if state.fullscreen_tool_diff.is_some() || state.project.git_available {
-                    diff_lines(state.fullscreen_diff())
-                } else {
-                    vec![Line::styled(
-                        " not a Git repository",
-                        Style::default().fg(Color::DarkGray),
-                    )]
-                }
+    fn get(&mut self, state: &UiState) -> &Vec<Line<'static>> {
+        if self.generation != state.diff_generation {
+            self.lines = if state.fullscreen_tool_diff.is_some() || state.project.git_available {
+                diff_lines(state.fullscreen_diff())
             } else {
-                diff_lines(&state.project.git_diff)
+                vec![Line::styled(
+                    " not a Git repository",
+                    Style::default().fg(Color::DarkGray),
+                )]
             };
             self.generation = state.diff_generation;
-            self.fullscreen = fullscreen;
         }
         &self.lines
     }
@@ -361,9 +354,6 @@ pub async fn run(
                 state.git_status_scroll = state
                     .git_status_scroll
                     .min(git_status_max_scroll(&state, area.height));
-                state.git_panel_diff_scroll = state.git_panel_diff_scroll.min(
-                    git_panel_diff_max_scroll(&state, area.height, &mut renders.diff),
-                );
             }
             if let Some(area) = plan {
                 state.plan_scroll = state.plan_scroll.min(plan_max_scroll(&state, area.height));
@@ -1107,7 +1097,7 @@ async fn dispatch(
             true
         }
         "/diff" if argument.is_empty() => {
-            state.open_fullscreen_git_diff();
+            state.open_fullscreen_git_diff(None);
             commands.send(Command::GitDiff(None)).await?;
             true
         }
@@ -1392,46 +1382,22 @@ async fn handle_mouse(
         && area.contains((mouse.column, mouse.row).into())
     {
         match mouse.kind {
-            MouseEventKind::ScrollUp if !state.git_diff_mode => {
+            MouseEventKind::ScrollUp => {
                 state.git_status_scroll = state.git_status_scroll.saturating_sub(3);
             }
-            MouseEventKind::ScrollDown if !state.git_diff_mode => {
+            MouseEventKind::ScrollDown => {
                 state.git_status_scroll = state
                     .git_status_scroll
                     .saturating_add(3)
                     .min(git_status_max_scroll(state, area.height));
             }
-            MouseEventKind::ScrollUp if state.git_diff_mode => {
-                state.git_panel_diff_scroll = state.git_panel_diff_scroll.saturating_sub(3);
-            }
-            MouseEventKind::ScrollDown if state.git_diff_mode => {
-                state.git_panel_diff_scroll =
-                    state
-                        .git_panel_diff_scroll
-                        .saturating_add(3)
-                        .min(git_panel_diff_max_scroll(
-                            state,
-                            area.height,
-                            &mut renders.diff,
-                        ));
-            }
             MouseEventKind::Down(MouseButton::Left) => {
-                let row = mouse.row.saturating_sub(area.y + 1) as usize;
-                if state.git_diff_mode {
-                    if row == 0 {
-                        state.git_diff_mode = false;
-                        state.git_panel_diff_scroll = 0;
-                        commands.send(Command::RefreshProject).await?;
-                    }
-                } else {
-                    let row = row + state.git_status_scroll as usize;
-                    if let Some(file) = state.project.git_files.get(row) {
-                        state.git_diff_mode = true;
-                        state.git_panel_diff_scroll = 0;
-                        commands
-                            .send(Command::GitDiff(Some(file.path.clone())))
-                            .await?;
-                    }
+                let row = mouse.row.saturating_sub(area.y + 1) as usize
+                    + state.git_status_scroll as usize;
+                if let Some(file) = state.project.git_files.get(row) {
+                    let path = file.path.clone();
+                    state.open_fullscreen_git_diff(Some(path.clone()));
+                    commands.send(Command::GitDiff(Some(path))).await?;
                 }
             }
             _ => {}
@@ -1450,6 +1416,56 @@ async fn handle_mouse(
                     .plan_scroll
                     .saturating_add(3)
                     .min(plan_max_scroll(state, area.height));
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if input.contains((mouse.column, mouse.row).into())
+        && mouse.row != input.y
+        && state.search.is_none()
+    {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                state.focus_input();
+                state.text_selection = None;
+                state.selection_anchor = None;
+                let point = input_point(state, input, mouse.column, mouse.row);
+                state.input_selection_anchor = Some(point);
+                state.input_selection = Some(TextSelection {
+                    start: point,
+                    end: point,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(start) = state.input_selection_anchor {
+                    state.input_selection = Some(TextSelection {
+                        start,
+                        end: input_point(state, input, mouse.column, mouse.row),
+                    });
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(start) = state.input_selection_anchor.take() {
+                    let end = input_point(state, input, mouse.column, mouse.row);
+                    if start == end {
+                        state.input_selection = None;
+                    } else {
+                        let selection = TextSelection { start, end };
+                        state.input_selection = Some(selection);
+                        let width = input.width.saturating_sub(2).max(1);
+                        if let Some((from, to)) = input_selection_range(state, width, selection) {
+                            let selected: String = state.input[from..to]
+                                .chars()
+                                .filter(|character| *character != '\u{fffc}')
+                                .collect();
+                            if !selected.is_empty() {
+                                copy_to_clipboard(&selected)?;
+                                state.show_toast("copied to clipboard");
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -1487,6 +1503,8 @@ async fn handle_mouse(
                 mouse.row,
                 &mut renders.chat,
             );
+            state.input_selection = None;
+            state.input_selection_anchor = None;
             state.selection_anchor = Some(point);
             state.text_selection = Some(TextSelection {
                 start: point,
@@ -1694,7 +1712,7 @@ fn draw(
     let chat_height = draw_chat(frame, state, chat, renders);
     if let Some(side) = side {
         let (git, plan) = side_split(side, state);
-        draw_git(frame, state, git, &mut renders.diff);
+        draw_git(frame, state, git);
         if let Some(plan) = plan {
             draw_plan(frame, state, plan);
         }
@@ -1746,8 +1764,14 @@ fn draw(
             input.y + 1,
         ));
     } else {
+        let mut lines = wrapped_input_lines(state, input_width);
+        if let Some(selection) = state.input_selection
+            && let Some(range) = input_selection_range(state, input_width, selection)
+        {
+            highlight_input_selection(&mut lines, &input_cells(state, input_width), range);
+        }
         frame.render_widget(
-            Paragraph::new(wrapped_input_lines(state, input_width)).block(
+            Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(Line::from(title)),
@@ -1955,22 +1979,24 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 fn draw_fullscreen_git(frame: &mut ratatui::Frame, state: &UiState, diff: &mut DiffMemo) {
-    let tool_diff = state.fullscreen_tool_diff.is_some();
+    let title = if state.fullscreen_tool_diff.is_some() {
+        " tool diff · Esc to close ".to_owned()
+    } else if let Some(path) = &state.project.git_diff_path {
+        format!(" git diff · {} · Esc to close ", path.display())
+    } else {
+        " git diff · Esc to close ".to_owned()
+    };
     frame.render_widget(Clear, frame.area());
     frame.render_widget(
-        Paragraph::new(diff.get(state, true).as_slice())
+        Paragraph::new(diff.get(state).as_slice())
             .scroll((state.git_diff_scroll, 0))
-            .block(Block::default().borders(Borders::ALL).title(if tool_diff {
-                " tool diff · Esc to close "
-            } else {
-                " git diff · Esc to close "
-            })),
+            .block(Block::default().borders(Borders::ALL).title(title)),
         frame.area(),
     );
 }
 
 fn git_diff_max_scroll(state: &UiState, height: u16, diff: &mut DiffMemo) -> u16 {
-    let line_count = diff.get(state, true).len().max(1);
+    let line_count = diff.get(state).len().max(1);
     let visible = height.saturating_sub(2).max(1) as usize;
     line_count.saturating_sub(visible).min(u16::MAX as usize) as u16
 }
@@ -1991,25 +2017,6 @@ fn git_status_title(state: &UiState, height: u16) -> String {
     let offset = (state.git_status_scroll as usize).min(total.saturating_sub(visible));
     let end = (offset + visible).min(total);
     format!(" git status · {}-{end}/{total} ", offset + 1)
-}
-
-fn git_panel_diff_max_scroll(state: &UiState, height: u16, diff: &mut DiffMemo) -> u16 {
-    let line_count = diff.get(state, false).len().max(1);
-    let visible = height.saturating_sub(3).max(1) as usize;
-    line_count.saturating_sub(visible).min(u16::MAX as usize) as u16
-}
-
-fn git_panel_diff_title(state: &UiState, height: u16, diff: &mut DiffMemo) -> String {
-    let total = diff.get(state, false).len().max(1);
-    let visible = height.saturating_sub(3).max(1) as usize;
-    let offset = (state.git_panel_diff_scroll as usize).min(total.saturating_sub(visible));
-    let end = (offset + visible).min(total);
-    let path = state
-        .project
-        .git_diff_path
-        .as_ref()
-        .map_or_else(|| "git diff".into(), |path| path.display().to_string());
-    format!(" {}-{end}/{total} · {path} ", offset + 1)
 }
 
 fn draw_toast(frame: &mut ratatui::Frame, state: &UiState) {
@@ -2108,34 +2115,7 @@ fn draw_command_palette(frame: &mut ratatui::Frame, state: &UiState, input: Rect
     );
 }
 
-fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect, diff: &mut DiffMemo) {
-    if state.git_diff_mode {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(git_panel_diff_title(state, area.height, diff));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if inner.height == 0 {
-            return;
-        }
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                " ← git status",
-                Style::default().fg(Color::Cyan),
-            )),
-            Rect::new(inner.x, inner.y, inner.width, 1),
-        );
-        if inner.height > 1 {
-            frame.render_widget(
-                Paragraph::new(diff.get(state, false).as_slice())
-                    .scroll((state.git_panel_diff_scroll, 0))
-                    .wrap(Wrap { trim: false }),
-                Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1),
-            );
-        }
-        return;
-    }
-
+fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
     let (title, lines, scroll, wrap) = if !state.project.git_available {
         (
             " git ".to_owned(),
@@ -2328,6 +2308,84 @@ fn draw_chat(
 
 fn wrapped_input_lines(state: &UiState, width: u16) -> Vec<Line<'static>> {
     wrap_chat_lines(state.input_lines(), width).0
+}
+
+/// Maps the composer's rendered cells to input text: `cells[row][column]` is
+/// the byte range the cell stands for — a real character maps to itself, a
+/// collapsed-paste or image label maps to the range it stands in for, and
+/// padding maps to the empty range at that position. The layout mirrors
+/// `input_lines` + `wrap_chat_lines`, so cells line up with what is drawn.
+fn input_cells(state: &UiState, width: u16) -> Vec<Vec<(usize, usize)>> {
+    let width = width.max(1) as usize;
+    let input = &state.input;
+    // Logical lines, each beginning with its padding cell, exactly as
+    // `input_lines` builds them.
+    let mut logical: Vec<Vec<(usize, usize)>> = vec![vec![(0, 0)]];
+    let emit = |text: &str, offset: usize, cells: &mut Vec<Vec<(usize, usize)>>| {
+        for (index, character) in text.char_indices() {
+            if character == '\n' {
+                cells.push(vec![(offset + index, offset + index)]);
+                continue;
+            }
+            let start = offset + index;
+            cells
+                .last_mut()
+                .unwrap()
+                .push((start, start + character.len_utf8()));
+        }
+    };
+    let mut offset = 0usize;
+    for (start, end, label, _, gap) in state.input_plates() {
+        emit(&input[offset..start], offset, &mut logical);
+        for _ in label.chars() {
+            logical.last_mut().unwrap().push((start, end));
+        }
+        if gap && end < input.len() {
+            logical.last_mut().unwrap().push((end, end));
+        }
+        offset = end;
+    }
+    emit(&input[offset..], offset, &mut logical);
+    // Physical lines: fixed-width chunks, matching `wrap_chat_lines`.
+    logical
+        .iter()
+        .flat_map(|line| line.chunks(width).map(|chunk| chunk.to_vec()))
+        .collect()
+}
+
+fn input_point(state: &UiState, input: Rect, column: u16, row: u16) -> TextPoint {
+    let width = input.width.saturating_sub(2).max(1);
+    let rows = input_cells(state, width).len();
+    TextPoint {
+        row: row
+            .saturating_sub(input.y + 1)
+            .min(rows.saturating_sub(1) as u16),
+        column: column
+            .saturating_sub(input.x + 1)
+            .min(width.saturating_sub(1)),
+    }
+}
+
+/// Resolves a composer selection to an inclusive-exclusive byte range of
+/// `state.input`. A character cell includes the character it stands for; a
+/// padding cell contributes only its position.
+fn input_selection_range(
+    state: &UiState,
+    width: u16,
+    selection: TextSelection,
+) -> Option<(usize, usize)> {
+    let (start, end) = selection_bounds(selection);
+    let cells = input_cells(state, width);
+    let cell = |point: TextPoint| -> Option<(usize, usize)> {
+        cells
+            .get(point.row as usize)
+            .and_then(|line| line.get(point.column as usize))
+            .copied()
+    };
+    let (start_cell, end_cell) = (cell(start)?, cell(end)?);
+    let begin = start_cell.0.min(end_cell.0);
+    let stop = start_cell.1.max(end_cell.1);
+    (begin < stop).then_some((begin, stop))
 }
 
 fn chat_max_scroll(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> u16 {
@@ -2952,6 +3010,39 @@ fn highlight_selection(lines: &mut [Line<'static>], selection: TextSelection) {
         for span in spans {
             for character in span.content.chars() {
                 let style = if column >= from && column <= to {
+                    span.style.bg(Color::Blue).fg(Color::White)
+                } else {
+                    span.style
+                };
+                push_styled_char(&mut highlighted, character, style);
+                column += 1;
+            }
+        }
+        line.spans = highlighted.spans;
+    }
+}
+
+/// Highlights the composer lines whose cells fall inside a resolved byte
+/// range, mirroring `highlight_selection` for the chat.
+fn highlight_input_selection(
+    lines: &mut [Line<'static>],
+    cells: &[Vec<(usize, usize)>],
+    range: (usize, usize),
+) {
+    let (from, to) = range;
+    for (row, line) in lines.iter_mut().enumerate() {
+        let Some(row_cells) = cells.get(row) else {
+            continue;
+        };
+        let spans = std::mem::take(&mut line.spans);
+        let mut highlighted = Line::default();
+        let mut column = 0usize;
+        for span in spans {
+            for character in span.content.chars() {
+                let selected = row_cells
+                    .get(column)
+                    .is_some_and(|&(start, end)| start < end && start < to && end > from);
+                let style = if selected {
                     span.style.bg(Color::Blue).fg(Color::White)
                 } else {
                     span.style
@@ -4115,26 +4206,8 @@ mod tests {
         assert_eq!(git_status_title(&state, 5), " git status · 6-8/8 ");
     }
 
-    #[test]
-    fn git_panel_diff_viewport_accounts_for_fixed_back_row() {
-        let mut renders = RenderState::new();
-        let mut state = UiState::new();
-        state.project.git_diff = (1..=8)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        state.project.git_diff_path = Some("src/main.rs".into());
-        state.git_panel_diff_scroll = 3;
-
-        assert_eq!(git_panel_diff_max_scroll(&state, 5, &mut renders.diff), 6);
-        assert_eq!(
-            git_panel_diff_title(&state, 5, &mut renders.diff),
-            " 4-5/8 · src/main.rs "
-        );
-    }
-
     #[tokio::test]
-    async fn git_status_mouse_scroll_preserves_file_hit_testing() {
+    async fn git_status_file_click_opens_fullscreen_diff() {
         let mut state = UiState::new();
         let mut renders = RenderState::new();
         state.project.git_available = true;
@@ -4191,56 +4264,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(state.git_diff_mode);
+        assert!(state.git_fullscreen_diff);
+        assert_eq!(
+            state.project.git_diff_path.as_deref(),
+            Some(Path::new("file-3"))
+        );
         match events.recv().await.unwrap() {
             Command::GitDiff(Some(path)) => assert_eq!(path, Path::new("file-3")),
             _ => panic!("expected a file diff command"),
         }
-
-        state.project.git_diff = (1..=8)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        handle_mouse(
-            mouse(MouseEventKind::ScrollDown, git.y + 2),
-            &mut state,
-            MouseAreas {
-                body,
-                conversation,
-                side: Some(git),
-                git: Some(git),
-                plan: None,
-                input,
-            },
-            &commands,
-            &mut renders,
-        )
-        .await
-        .unwrap();
-        assert_eq!(state.git_panel_diff_scroll, 3);
-
-        handle_mouse(
-            mouse(MouseEventKind::Down(MouseButton::Left), git.y + 1),
-            &mut state,
-            MouseAreas {
-                body,
-                conversation,
-                side: Some(git),
-                git: Some(git),
-                plan: None,
-                input,
-            },
-            &commands,
-            &mut renders,
-        )
-        .await
-        .unwrap();
-        assert!(!state.git_diff_mode);
-        assert_eq!(state.git_panel_diff_scroll, 0);
-        assert!(matches!(
-            events.recv().await.unwrap(),
-            Command::RefreshProject
-        ));
     }
 
     #[tokio::test]
@@ -5466,5 +5498,222 @@ mod tests {
         highlight_selection(&mut lines, selection);
         assert_eq!(lines[0].spans.last().unwrap().style.bg, Some(Color::Blue));
         assert_eq!(lines[1].spans[0].style.bg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn input_cells_mirror_the_rendered_composer_layout() {
+        let mut state = UiState::new();
+        state.set_input("hello world\nsecond line".into());
+        let width = 12u16;
+        let cells = input_cells(&state, width);
+        let lines = wrapped_input_lines(&state, width);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(lines.len(), cells.len());
+        for (line, row) in lines.iter().zip(&cells) {
+            let drawn: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            assert_eq!(drawn, row.len());
+        }
+        assert_eq!(cells[0][0], (0, 0)); // padding
+        assert_eq!(cells[0][1], (0, 1)); // first character
+        assert_eq!(cells[1][0], (11, 11)); // the newline position
+        assert_eq!(cells[1][1], (12, 13));
+        assert_eq!(cells[1][11], (22, 23));
+    }
+
+    #[test]
+    fn input_selection_range_covers_characters_and_plates() {
+        let mut state = UiState::new();
+        state.set_input("hello world\nsecond line".into());
+        let full = input_selection_range(
+            &state,
+            12,
+            TextSelection {
+                start: TextPoint { row: 0, column: 1 },
+                end: TextPoint { row: 1, column: 11 },
+            },
+        );
+        assert_eq!(full, Some((0, 23)));
+        let reversed = input_selection_range(
+            &state,
+            12,
+            TextSelection {
+                start: TextPoint { row: 0, column: 4 },
+                end: TextPoint { row: 0, column: 2 },
+            },
+        );
+        assert_eq!(reversed, Some((1, 4)));
+        let padding_only = input_selection_range(
+            &state,
+            12,
+            TextSelection {
+                start: TextPoint { row: 0, column: 0 },
+                end: TextPoint { row: 0, column: 0 },
+            },
+        );
+        assert_eq!(padding_only, None);
+
+        // A collapsed paste label stands in for the pasted text.
+        state.set_input("a".into());
+        state.insert_paste("long paste", 4);
+        state.insert_char('z');
+        let with_plate = input_selection_range(
+            &state,
+            80,
+            TextSelection {
+                start: TextPoint { row: 0, column: 1 },
+                end: TextPoint { row: 0, column: 19 },
+            },
+        );
+        assert_eq!(with_plate, Some((0, 12)));
+    }
+
+    #[test]
+    fn input_selection_highlights_only_selected_cells() {
+        let mut state = UiState::new();
+        state.set_input("hello".into());
+        let width = 80u16;
+        let mut lines = wrapped_input_lines(&state, width);
+        let cells = input_cells(&state, width);
+        highlight_input_selection(&mut lines, &cells, (1, 4));
+        let spans = &lines[0].spans;
+        assert_eq!(spans[0].content, " h");
+        assert_eq!(spans[1].content, "ell");
+        assert_eq!(spans[1].style.bg, Some(Color::Blue));
+        assert_eq!(spans[2].content, "o");
+        assert_eq!(spans[2].style.bg, None);
+    }
+
+    #[tokio::test]
+    async fn composer_click_and_drag_select_input_without_moving_cursor() {
+        let mut state = UiState::new();
+        let mut renders = RenderState::new();
+        state.set_input("hello".into());
+        let body = Rect::new(0, 0, 80, 8);
+        let conversation = Rect::new(0, 3, 80, 5);
+        let input = Rect::new(0, 8, 80, 3);
+        let (commands, _events) = mpsc::channel(1);
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let areas = MouseAreas {
+            body,
+            conversation,
+            side: None,
+            git: None,
+            plan: None,
+            input,
+        };
+
+        handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                input.x + 1 + 2,
+                input.y + 1,
+            ),
+            &mut state,
+            areas,
+            &commands,
+            &mut renders,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.input_selection_anchor,
+            Some(TextPoint { row: 0, column: 2 })
+        );
+        // The click focuses the composer but leaves the cursor where it was.
+        assert_eq!(
+            state.input_cursor(input.width.saturating_sub(2).max(1)),
+            (0, 6)
+        );
+
+        handle_mouse(
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                input.x + 1 + 5,
+                input.y + 1,
+            ),
+            &mut state,
+            areas,
+            &commands,
+            &mut renders,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.input_selection,
+            Some(TextSelection {
+                start: TextPoint { row: 0, column: 2 },
+                end: TextPoint { row: 0, column: 5 },
+            })
+        );
+        handle_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                input.x + 1 + 5,
+                input.y + 1,
+            ),
+            &mut state,
+            areas,
+            &commands,
+            &mut renders,
+        )
+        .await
+        .unwrap();
+        assert!(state.input_selection_anchor.is_none());
+        assert!(state.input_selection.is_some());
+        assert_eq!(state.toast(), Some("copied to clipboard"));
+
+        // A bare click clears any selection instead of copying.
+        handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                input.x + 1 + 3,
+                input.y + 1,
+            ),
+            &mut state,
+            areas,
+            &commands,
+            &mut renders,
+        )
+        .await
+        .unwrap();
+        handle_mouse(
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                input.x + 1 + 3,
+                input.y + 1,
+            ),
+            &mut state,
+            areas,
+            &commands,
+            &mut renders,
+        )
+        .await
+        .unwrap();
+        assert!(state.input_selection.is_none());
+        assert!(state.input_selection_anchor.is_none());
+    }
+
+    #[test]
+    fn editing_the_composer_clears_its_selection() {
+        let mut state = UiState::new();
+        state.set_input("hello".into());
+        state.input_selection = Some(TextSelection {
+            start: TextPoint { row: 0, column: 1 },
+            end: TextPoint { row: 0, column: 3 },
+        });
+        state.input_selection_anchor = Some(TextPoint { row: 0, column: 1 });
+
+        state.insert_char('!');
+        assert!(state.input_selection.is_none());
+        assert!(state.input_selection_anchor.is_none());
     }
 }

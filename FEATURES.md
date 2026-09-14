@@ -91,9 +91,9 @@ External tools receive their function arguments as JSON on stdin and must return
 - full-width conversation view with deliberate trailing whitespace
 - bounded bottom-follow chat scrolling that holds the viewport through streaming, collapses, and full-screen diff visits
 - distinctly colored session, token, context, price, and current-directory fields on the status bar, plus estimated live generation speed and the exact reported average while idle
-- asynchronously refreshed Git pane that updates after every tool call as well as at turn end, cancel, and failure, with git runs serialized and coalesced so at most one refresh is in flight; mouse-resizable split, clickable files, independently scrollable status and diff views, fixed back navigation, and viewport indicators; plus a bounded full-screen `/diff` view
+- asynchronously refreshed Git pane that updates after every tool call as well as at turn end, cancel, and failure, with git runs serialized and coalesced so at most one refresh is in flight; mouse-resizable split, clickable files that open the file's diff in the full-screen view, independently scrollable status view, and viewport indicators; plus a bounded full-screen `/diff` view whose title names the file when a single-file diff is shown
 - auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
-- drag-to-copy conversation selection with a non-blocking clipboard toast
+- drag-to-copy selection in the conversation and in the composer (the composer copies the underlying text, expanding collapsed paste/image plates and dropping image sentinels), with a non-blocking clipboard toast
 - recent-first filtered slash-command palette with keyboard navigation and command hotkeys
 - non-blocking clipboard and `/image` image attachments with an elapsed processing plate
 - inline, vertically sliced Sixel, iTerm2, and Kitty image rendering that follows chat scrolling when supported by the terminal, with text fallback
@@ -104,4 +104,4 @@ External tools receive their function arguments as JSON on stdin and must return
 
 - per-block memoized chat rendering keyed on content revisions: streaming re-lays-out only the changed block, so long sessions stay responsive instead of re-parsing and re-wrapping the whole transcript on every frame
 - dirty-driven frame loop that skips redraws entirely while idle, and keeps redrawing only while the display ticks on its own (live timers, streaming, toasts, pending image loads)
-- memoized git diff line rendering for the Git pane and the full-screen diff
+- memoized git diff line rendering for the full-screen diff

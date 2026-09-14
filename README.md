@@ -98,9 +98,9 @@ rope "what is this repo up to?"
   automatic compaction with visible markers, and global/project
   `AGENTS.md` instructions.
 - Terminal UI: CommonMark rendering with syntax-colored code, image
-  attachments (Sixel / iTerm2 / Kitty), live git status and diff panes
-  (when the directory is a git worktree), plan pane, chat search, model
-  picker, and prompt history.
+  attachments (Sixel / iTerm2 / Kitty), live git status pane with a
+  full-screen diff view (when the directory is a git worktree), plan pane,
+  chat search, model picker, and prompt history.
 
 ## Disclaimer
 Rope is a simple harness meant for power users and developers. It has a very basic permission system and no sandbox. Models can leak your data via tools or perform undesired actions on live system. Use it at your own risk.
