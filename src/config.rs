@@ -146,6 +146,7 @@ pub struct ToolPolicies {
     pub search_files: Approval,
     #[serde(alias = "glob")]
     pub list_files: Approval,
+    pub org_outline: Approval,
     pub web_browser: Approval,
     pub web_search: Approval,
     pub external: Approval,
@@ -160,6 +161,7 @@ impl Default for ToolPolicies {
             shell: Approval::Ask,
             search_files: Approval::Allow,
             list_files: Approval::Allow,
+            org_outline: Approval::Allow,
             web_browser: Approval::Ask,
             web_search: Approval::Ask,
             external: Approval::Ask,

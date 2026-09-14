@@ -69,7 +69,7 @@ impl ListFilesTool {
     }
 }
 
-fn path(root: &Path, value: &str) -> PathBuf {
+pub(crate) fn path(root: &Path, value: &str) -> PathBuf {
     let path = PathBuf::from(value);
     if path.is_absolute() {
         path
@@ -78,7 +78,7 @@ fn path(root: &Path, value: &str) -> PathBuf {
     }
 }
 
-fn object(properties: Value, required: &[&str]) -> Value {
+pub(crate) fn object(properties: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": properties, "required": required, "additionalProperties": false })
 }
 

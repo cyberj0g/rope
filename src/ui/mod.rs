@@ -380,6 +380,9 @@ pub async fn run(
         tokio::select! {
             event = events.recv() => if let Some(event) = event {
                 let history_loaded = matches!(&event, Event::History(_));
+                if matches!(event, Event::GenerationFinished) {
+                    ring_bell(&mut io::stdout())?;
+                }
                 chat_height = apply_runtime_event(&mut state, event, chat, chat_height, &mut renders);
                 if history_loaded && let Some(request) = request.take() {
                     submit(request, Vec::new(), &mut state, &mut history, &commands).await?;
@@ -506,6 +509,12 @@ fn apply_runtime_event(
     }
     set_chat_scroll_max(state, chat.height, new_height);
     new_height
+}
+
+/// Ring the terminal bell, handled by the terminal itself even in raw mode.
+fn ring_bell<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(b"\x07")?;
+    writer.flush()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3759,6 +3768,13 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_end_bell_writes_the_bell_character() {
+        let mut out = Vec::new();
+        ring_bell(&mut out).unwrap();
+        assert_eq!(out, b"\x07");
+    }
 
     #[test]
     fn markdown_hides_fences_and_styles_code() {

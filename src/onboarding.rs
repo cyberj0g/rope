@@ -482,11 +482,11 @@ fn report(
     let web_available = browser.runtime_ready && browser.executable.is_some();
     if web_available {
         success(
-            "Tools: read, write, edit, shell, search_files, list_files, view_image, update_plan, web_search, web_browser",
+            "Tools: read, write, edit, shell, search_files, list_files, org_outline, view_image, update_plan, web_search, web_browser",
         );
     } else {
         success(
-            "Tools: read, write, edit, shell, search_files, list_files, view_image, update_plan",
+            "Tools: read, write, edit, shell, search_files, list_files, org_outline, view_image, update_plan",
         );
         warning("Web tools: unavailable until both Patchright and Chrome are available");
     }

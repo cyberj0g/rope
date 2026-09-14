@@ -1,6 +1,7 @@
 mod builtin;
 mod external;
 mod headless;
+mod org_outline;
 mod web_browser;
 mod web_search;
 
@@ -19,6 +20,7 @@ use builtin::{
 };
 use external::ExternalTool;
 use headless::HeadlessBrowser;
+use org_outline::OrgOutlineTool;
 use web_browser::WebBrowserTool;
 use web_search::WebSearchTool;
 
@@ -194,6 +196,7 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
         ListFilesTool::new(cwd.clone(), ripgrep),
         config.tools.list_files,
     );
+    registry.insert(OrgOutlineTool(cwd.clone()), config.tools.org_outline);
     registry.insert(ViewImageTool(cwd.clone()), config.tools.read);
     add_web_tools(
         &mut registry,

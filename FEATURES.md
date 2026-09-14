@@ -45,7 +45,8 @@
 - preserved visible transcripts with persisted `Context compacted` markers whose summary stays in history as a collapsed chat section, inserted before the current user with every stored tool-block index shifted so mid-turn results still land on the active tool block
 - model-managed `update_plan` state persisted across restarts, with visible tool calls and only the latest full plan projected into model context
 - tool approval controls in the composer with paused execution timing across batched calls, session-persisted approvals, and decision markers retained in conversation history
-- built-in `read`, `write`, `edit`, `shell`, `shell_poll`, `shell_cancel`, `search_files`, and `list_files` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks
+- built-in `read`, `write`, `edit`, `shell`, `shell_poll`, `shell_cancel`, `search_files`, `list_files`, and `org_outline` tools, with optimized ripgrep execution and ignore-aware built-in fallbacks
+- `org_outline` returns the Org-mode heading hierarchy of a file as a flat, source-ordered node list with inclusive 1-based line ranges for each subtree, from a single linear scan that ignores heading-like text inside `#+begin_...#+end_` blocks, so large Org files can be navigated with `read`/`edit` ranges instead of loading whole files into context
 - model-driven long-polling `shell`: each call returns a compact status/job_id/output envelope once the command exits, the yield period (default 10s, capped at 30s) expires, or the envelope's output payload fills the budget; finished and cancelled results drain in budgeted chunks marked `has_more`, and `shell_poll` retrieves the remainder without gaps or repeats until the final chunk, after which the job is gone; running envelopes always fit their output budget with the status and job_id prioritized, and `shell_cancel` stops a job deliberately and returns its remaining output as cancelled
 - bounded retention of shell job output: the job keeps only a 256 KiB tail of the stream, delivered prefixes are compacted away, and oldest undelivered bytes beyond the cap are discarded with a discard note in the envelope, so a verbose command cannot grow memory without bound
 - `shell_poll` and `shell_cancel` are always allowed because they can only observe or stop an already-approved command; shell jobs never outlive the turn that started them — turn end, failure, Escape, and shutdown all kill them together with their whole process tree: the full process group on Unix (held until turn end, including already-delivered jobs) and a Windows job object the shell is assigned to while still suspended, so a containment failure or a failed thread resume fails the call and the kill-on-close job handle terminates the suspended tree
@@ -82,6 +83,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - one-space conversation content padding with flush section headers
 - blank lines around You, Steer, Assistant, and System messages only; thinking and tool blocks render line after line with no spacing between them
 - fixed-width, color-coded connecting, waiting-for-first-response, generating, tool-running, idle, and error status
+- terminal bell that rings when the agent's turn finishes
 - failed turns preserve the visible transcript and append the error to the conversation
 - case-insensitive `Ctrl+F` chat search with highlighted, wrapping `F3` navigation
 - separately colored model and reasoning details on the padded input box; session tokens and cost on the status bar
