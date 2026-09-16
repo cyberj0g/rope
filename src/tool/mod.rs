@@ -321,4 +321,16 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("at most one"));
     }
+
+    #[tokio::test]
+    async fn update_plan_rejects_the_stored_history_marker() {
+        let error = UpdatePlanTool
+            .run(serde_json::json!({ "stored": true }))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("missing `plan`"));
+        assert!(message.contains("complete plan"));
+        assert!(message.contains("\"stored\": true"));
+    }
 }

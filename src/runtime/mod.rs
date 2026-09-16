@@ -905,6 +905,18 @@ fn apply_plan_context(messages: &mut Vec<Message>, plan: Option<&ExecutionPlan>)
 }
 
 fn compact_plan_history(messages: &mut [Message]) -> usize {
+    // The latest update_plan call stays un-compacted: it is the model's only
+    // in-context example of the call shape. Compacting every call taught
+    // weaker models to imitate the {"stored": true} marker instead of
+    // sending the complete plan.
+    let latest_plan_call = messages.iter().rev().find_map(|message| match message {
+        Message::Assistant { tool_calls, .. } => tool_calls
+            .iter()
+            .rev()
+            .find(|call| call.name == "update_plan")
+            .map(|call| call.id.clone()),
+        _ => None,
+    });
     let mut call_ids = HashSet::new();
     let mut compacted = 0;
     for message in messages {
@@ -914,6 +926,9 @@ fn compact_plan_history(messages: &mut [Message]) -> usize {
                     .iter_mut()
                     .filter(|call| call.name == "update_plan")
                 {
+                    if Some(&call.id) == latest_plan_call.as_ref() {
+                        continue;
+                    }
                     call_ids.insert(call.id.clone());
                     call.arguments = serde_json::json!({ "stored": true });
                 }
@@ -3116,9 +3131,12 @@ mod tests {
     }
 
     #[test]
-    fn model_context_contains_only_the_latest_full_plan() {
+    fn model_context_keeps_only_the_latest_full_plan_call() {
         let old_plan = serde_json::json!({
-            "plan": [{ "step": "obsolete step", "status": "in_progress" }]
+            "plan": [{ "step": "obsolete step", "status": "completed" }]
+        });
+        let latest_plan = serde_json::json!({
+            "plan": [{ "step": "current step", "status": "in_progress" }]
         });
         let mut messages = vec![
             Message::assistant(
@@ -3132,9 +3150,20 @@ mod tests {
                 }],
             ),
             Message::tool("plan-1".into(), old_plan.to_string(), None, None),
+            Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "plan-2".into(),
+                    name: "update_plan".into(),
+                    arguments: latest_plan.clone(),
+                }],
+            ),
+            Message::tool("plan-2".into(), latest_plan.to_string(), None, None),
         ];
         let current = ExecutionPlan {
-            explanation: Some("revised".into()),
+            explanation: None,
             plan: vec![crate::tool::PlanStep {
                 step: "current step".into(),
                 status: crate::tool::PlanStatus::InProgress,
@@ -3144,8 +3173,13 @@ mod tests {
         apply_plan_context(&mut messages, Some(&current));
         let encoded = serde_json::to_string(&messages).unwrap();
 
+        // Older calls collapse to the stored marker.
         assert!(!encoded.contains("obsolete step"));
-        assert_eq!(encoded.matches("current step").count(), 1);
+        assert_eq!(encoded.matches("Latest plan is provided separately").count(), 1);
+        // The latest call stays un-compacted (call args, result, and the
+        // plan system message) so the model always has a complete
+        // in-context example of the update_plan shape.
+        assert_eq!(encoded.matches("current step").count(), 3);
         assert_eq!(
             messages
                 .iter()
@@ -3153,7 +3187,26 @@ mod tests {
                 .count(),
             1
         );
-        assert!(encoded.contains("Latest plan is provided separately"));
+    }
+
+    #[test]
+    fn plan_context_still_applies_without_any_plan_call_in_context() {
+        let mut messages = vec![Message::user("continue".into())];
+        let current = ExecutionPlan {
+            explanation: None,
+            plan: vec![crate::tool::PlanStep {
+                step: "current step".into(),
+                status: crate::tool::PlanStatus::Pending,
+            }],
+        };
+
+        apply_plan_context(&mut messages, Some(&current));
+
+        let Message::System { content } = &messages[0] else {
+            panic!("expected the plan system message first");
+        };
+        assert!(content.starts_with(PLAN_CONTEXT_PREFIX));
+        assert!(content.contains("current step"));
     }
 
     #[test]

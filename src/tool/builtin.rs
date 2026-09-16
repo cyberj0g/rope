@@ -1485,6 +1485,14 @@ impl Tool for UpdatePlanTool {
         )
     }
     async fn run(&self, args: Value) -> Result<ToolResult> {
+        if !args.get("plan").is_some_and(Value::is_array) {
+            bail!(
+                "missing `plan`: send the complete plan on every update — a non-empty array of \
+                {{\"step\": string, \"status\": \"pending\" | \"in_progress\" | \"completed\"}} objects. \
+                {{\"stored\": true}} is only the marker history shows for already-stored plans; \
+                it does not update the plan"
+            );
+        }
         let mut plan: ExecutionPlan = serde_json::from_value(args)?;
         if plan.plan.is_empty() {
             bail!("plan must contain at least one step");
