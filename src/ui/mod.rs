@@ -1,4 +1,5 @@
 mod history;
+mod links;
 mod state;
 
 use std::{
@@ -45,6 +46,7 @@ use crate::{
     tool::PlanStatus,
 };
 use history::PromptHistory;
+use links::{LinkRange, merge_line_links, open_in_browser, openable_url, url_at, wrap_links};
 use state::{ChatBlock, MessageKind, TextPoint, TextSelection, ToolStatus, UiState};
 
 #[derive(Clone, Copy)]
@@ -184,6 +186,8 @@ struct RenderedBlock {
     /// separator), valid while `revision`, `width`, `image_max_height`, and
     /// `expanded` match the block.
     lines: Vec<Line<'static>>,
+    /// Clickable links per wrapped body line, aligned with `lines`.
+    links: Vec<Vec<LinkRange>>,
     /// `(image index, row within `lines`, cell width, cell height)` for each
     /// reserved image placeholder.
     images: Vec<(usize, u16, u16, u16)>,
@@ -1281,6 +1285,30 @@ fn apply_input_load(load: InputLoad, config: &Config, state: &mut UiState) {
     }
 }
 
+/// Open a clicked link in the default browser, surfacing failures.
+fn open_url(state: &mut UiState, url: String) {
+    match open_in_browser(&url) {
+        Ok(()) => state.show_toast(format!("opening {url}")),
+        Err(error) => state.notice = Some(format!("could not open {url}: {error}")),
+    }
+}
+
+/// The link under a chat text point, if any.
+fn chat_url_at(
+    state: &UiState,
+    area: Rect,
+    point: TextPoint,
+    cache: &mut ChatRenderCache,
+) -> Option<String> {
+    let layout = chat_layout(state, area, cache);
+    layout
+        .links
+        .get(point.row as usize)?
+        .iter()
+        .find(|link| point.column >= link.start && point.column < link.end)
+        .map(|link| link.url.clone())
+}
+
 async fn handle_mouse(
     mouse: MouseEvent,
     state: &mut UiState,
@@ -1314,6 +1342,15 @@ async fn handle_mouse(
                             conversation.height,
                             &mut renders.diff,
                         ))
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let row = mouse.row.saturating_sub(1) as usize + state.git_diff_scroll as usize;
+                let column = mouse.column.saturating_sub(1) as usize;
+                if let Some(line) = renders.diff.get(state).get(row)
+                    && let Some(url) = url_at(&line_text(line), column)
+                {
+                    open_url(state, url);
+                }
             }
             _ => {}
         }
@@ -1403,10 +1440,17 @@ async fn handle_mouse(
             MouseEventKind::Down(MouseButton::Left) => {
                 let row = mouse.row.saturating_sub(area.y + 1) as usize
                     + state.git_status_scroll as usize;
-                if let Some(file) = state.project.git_files.get(row) {
-                    let path = file.path.clone();
-                    state.open_fullscreen_git_diff(Some(path.clone()));
-                    commands.send(Command::GitDiff(Some(path))).await?;
+                let column = mouse.column.saturating_sub(area.x + 1) as usize;
+                let file = state.project.git_files.get(row).cloned();
+                if let Some(file) = file {
+                    let text = format!(" {} {}", file.status, file.path.display());
+                    if let Some(url) = url_at(&text, column) {
+                        open_url(state, url);
+                    } else {
+                        let path = file.path.clone();
+                        state.open_fullscreen_git_diff(Some(path.clone()));
+                        commands.send(Command::GitDiff(Some(path))).await?;
+                    }
                 }
             }
             _ => {}
@@ -1425,6 +1469,16 @@ async fn handle_mouse(
                     .plan_scroll
                     .saturating_add(3)
                     .min(plan_max_scroll(state, area.height));
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let row =
+                    mouse.row.saturating_sub(area.y + 1) as usize + state.plan_scroll as usize;
+                let column = mouse.column.saturating_sub(area.x + 1) as usize;
+                if let Some(line) = plan_lines(state).get(row)
+                    && let Some(url) = url_at(&line_text(line), column)
+                {
+                    open_url(state, url);
+                }
             }
             _ => {}
         }
@@ -1545,7 +1599,9 @@ async fn handle_mouse(
                 );
                 if start == end {
                     state.text_selection = None;
-                    if let Some(index) =
+                    if let Some(url) = chat_url_at(state, conversation, start, &mut renders.chat) {
+                        open_url(state, url);
+                    } else if let Some(index) =
                         chat_hit_test(state, conversation, mouse.row, &mut renders.chat)
                     {
                         state.focus_input();
@@ -2147,10 +2203,13 @@ fn draw_git(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
                 .git_files
                 .iter()
                 .map(|file| {
-                    Line::from(vec![
+                    let mut line = Line::from(vec![
                         Span::styled(format!(" {} ", file.status), git_status_color(&file.status)),
                         Span::raw(file.path.display().to_string()),
-                    ])
+                    ]);
+                    let links = merge_line_links(&line_text(&line), Vec::new());
+                    style_line_links(&mut line, &links);
+                    line
                 })
                 .collect()
         };
@@ -2179,30 +2238,26 @@ fn plan_max_scroll(state: &UiState, height: u16) -> u16 {
     lines.saturating_sub(visible).min(u16::MAX as usize) as u16
 }
 
-fn draw_plan(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
-    let (title, lines) = state.plan.as_ref().map_or_else(
+/// The plan pane's rendered lines.
+fn plan_lines(state: &UiState) -> Vec<Line<'static>> {
+    state.plan.as_ref().map_or_else(
         || {
-            (
-                " plan ".into(),
-                vec![Line::styled(
-                    " no plan yet",
-                    Style::default().fg(Color::DarkGray),
-                )],
-            )
+            vec![Line::styled(
+                " no plan yet",
+                Style::default().fg(Color::DarkGray),
+            )]
         },
         |plan| {
-            let completed = plan
-                .plan
-                .iter()
-                .filter(|step| step.status == PlanStatus::Completed)
-                .count();
             let mut lines =
                 Vec::with_capacity(plan.plan.len() + usize::from(plan.explanation.is_some()));
             if let Some(explanation) = &plan.explanation {
-                lines.push(Line::styled(
+                let mut line = Line::styled(
                     format!(" {explanation}"),
                     Style::default().fg(Color::DarkGray),
-                ));
+                );
+                let links = merge_line_links(&line_text(&line), Vec::new());
+                style_line_links(&mut line, &links);
+                lines.push(line);
             }
             lines.extend(plan.plan.iter().map(|step| {
                 let (marker, style) = match step.status {
@@ -2215,13 +2270,30 @@ fn draw_plan(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
                     ),
                     PlanStatus::Pending => ("○", Style::default().fg(Color::Gray)),
                 };
-                Line::styled(format!(" {marker} {}", step.step), style)
+                let mut line = Line::styled(format!(" {marker} {}", step.step), style);
+                let links = merge_line_links(&line_text(&line), Vec::new());
+                style_line_links(&mut line, &links);
+                line
             }));
-            (format!(" plan · {completed}/{} ", plan.plan.len()), lines)
+            lines
+        },
+    )
+}
+
+fn draw_plan(frame: &mut ratatui::Frame, state: &UiState, area: Rect) {
+    let title = state.plan.as_ref().map_or_else(
+        || " plan ".into(),
+        |plan| {
+            let completed = plan
+                .plan
+                .iter()
+                .filter(|step| step.status == PlanStatus::Completed)
+                .count();
+            format!(" plan · {completed}/{} ", plan.plan.len())
         },
     );
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(plan_lines(state))
             .scroll((state.plan_scroll, 0))
             .block(Block::default().borders(Borders::ALL).title(title)),
         area,
@@ -2259,7 +2331,10 @@ fn diff_lines(diff: &str) -> Vec<Line<'static>> {
             } else {
                 Color::Gray
             };
-            Line::styled(format!(" {line}"), Style::default().fg(color))
+            let mut line = Line::styled(format!(" {line}"), Style::default().fg(color));
+            let links = merge_line_links(&line_text(&line), Vec::new());
+            style_line_links(&mut line, &links);
+            line
         })
         .collect()
 }
@@ -2457,6 +2532,8 @@ fn search_chat(state: &mut UiState, area: Rect, next: bool, cache: &mut ChatRend
 
 struct ChatLayout {
     lines: Vec<Line<'static>>,
+    /// Clickable links per line, aligned with `lines`.
+    links: Vec<Vec<LinkRange>>,
     headers: Vec<(usize, u16, u16)>,
     sections: Vec<(usize, u16, u16)>,
     diff_buttons: Vec<(usize, u16, u16)>,
@@ -2485,6 +2562,7 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
     cache.sync(state);
     let width = area.width.saturating_sub(2).max(1);
     let mut lines = Vec::new();
+    let mut links: Vec<Vec<LinkRange>> = Vec::new();
     let mut headers = Vec::new();
     let mut sections = Vec::new();
     let mut diff_buttons = Vec::new();
@@ -2497,6 +2575,7 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
             .is_some_and(|previous| is_decorated_message(&state.blocks[previous]));
         if decorated && !previous_decorated {
             lines.push(Line::default());
+            links.push(Vec::new());
             row = row.saturating_add(1);
         }
         let section_start = row;
@@ -2511,6 +2590,7 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
         let header_row = row;
         let header_height = u16::try_from(header.len()).unwrap_or(u16::MAX).max(1);
         lines.extend(header.iter().cloned());
+        links.extend(header.iter().map(|_| Vec::new()));
         row = row.saturating_add(header_height);
         for (image_index, offset, cell_width, cell_height) in entry.images.iter().copied() {
             images.push(ChatImagePlacement {
@@ -2523,10 +2603,12 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
         }
         let body_rows = u16::try_from(entry.lines.len()).unwrap_or(0);
         lines.extend(entry.lines.iter().cloned());
+        links.extend(entry.links.iter().cloned());
         row = row.saturating_add(body_rows);
         let section_end = row;
         if decorated {
             lines.push(Line::default());
+            links.push(Vec::new());
             row = row.saturating_add(1);
         }
         if has_block_header(block) {
@@ -2540,6 +2622,7 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
         }
     }
     lines.push(Line::default());
+    links.push(Vec::new());
     row = row.saturating_add(1);
     if let Some(notice) = &state.notice {
         let notice = wrap_chat_lines(
@@ -2551,7 +2634,8 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
         )
         .0;
         row = row.saturating_add(u16::try_from(notice.len()).unwrap_or(0));
-        lines.extend(notice);
+        lines.extend(notice.iter().cloned());
+        links.extend(notice.iter().map(|_| Vec::new()));
     }
     // The last section reaches the bottom of the chat, matching how the
     // trailing blank rows belong to the final block.
@@ -2579,6 +2663,7 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
     }
     ChatLayout {
         lines,
+        links,
         headers,
         sections,
         diff_buttons,
@@ -2628,25 +2713,65 @@ fn render_block_body(
                 entry.argument_summary = argument_summary(arguments);
             }
         }
-        let (raw, raw_images) = block_body_lines(block, state, area);
-        let (wrapped, starts) = wrap_chat_lines(raw, width);
+        let (raw, raw_images, raw_links) = block_body_lines(block, state, area);
+        let (mut wrapped, starts) = wrap_chat_lines(raw, width);
         entry.images = raw_images
             .into_iter()
             .map(|(image_index, raw_line, cell_width, cell_height)| {
                 (image_index, starts[raw_line], cell_width, cell_height)
             })
             .collect();
+        entry.links = wrap_links(&raw_links, &starts, width as usize, wrapped.len());
+        for (line, links) in wrapped.iter_mut().zip(&entry.links) {
+            style_line_links(line, links);
+        }
         entry.lines = wrapped;
     }
+}
+
+/// Push rendered markdown lines and their merged link ranges in parallel,
+/// applying `transform` to each line. Link ranges are re-measured on the
+/// transformed line so padding and other text shifts stay in sync.
+fn extend_rendered_lines<F>(
+    lines: &mut Vec<Line<'static>>,
+    links: &mut Vec<Vec<LinkRange>>,
+    rendered: Vec<Line<'static>>,
+    rendered_links: Vec<Vec<LinkRange>>,
+    mut transform: F,
+) where
+    F: FnMut(Line<'static>) -> Line<'static>,
+{
+    for (line, mut explicit) in rendered.into_iter().zip(rendered_links) {
+        let before = line_text(&line);
+        let transformed = transform(line);
+        let text = line_text(&transformed);
+        let delta = text.len().saturating_sub(before.len());
+        if delta > 0 {
+            for link in explicit.iter_mut() {
+                link.start += delta as u16;
+                link.end += delta as u16;
+            }
+        }
+        links.push(merge_line_links(&text, explicit));
+        lines.push(transformed);
+    }
+}
+/// The plain text of a rendered line, for raw-URL detection.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
 }
 
 fn block_body_lines(
     block: &ChatBlock,
     state: &UiState,
     area: Rect,
-) -> (Vec<Line<'static>>, Vec<RawImageCell>) {
+) -> (Vec<Line<'static>>, Vec<RawImageCell>, Vec<Vec<LinkRange>>) {
     let mut lines = Vec::new();
     let mut images = Vec::new();
+    let mut links: Vec<Vec<LinkRange>> = Vec::new();
     match block {
         ChatBlock::Message {
             content,
@@ -2656,15 +2781,24 @@ fn block_body_lines(
             summary,
             ..
         } => match kind {
-            MessageKind::User | MessageKind::Steer | MessageKind::Assistant
+            MessageKind::User
+            | MessageKind::Steer
+            | MessageKind::Assistant
             | MessageKind::Status => {
                 if *expanded {
-                    let rendered = if matches!(kind, MessageKind::User | MessageKind::Steer) {
-                        markdown_preserving_breaks(content)
-                    } else {
-                        markdown(content)
-                    };
-                    lines.extend(rendered.into_iter().map(pad_line));
+                    let (rendered, rendered_links) =
+                        if matches!(kind, MessageKind::User | MessageKind::Steer) {
+                            markdown_preserving_breaks(content)
+                        } else {
+                            markdown(content)
+                        };
+                    extend_rendered_lines(
+                        &mut lines,
+                        &mut links,
+                        rendered,
+                        rendered_links,
+                        pad_line,
+                    );
                     for (image_index, image) in block_images.iter().enumerate() {
                         if let Some(font_size) = state.image_cell_size
                             && image.width > 0
@@ -2673,6 +2807,7 @@ fn block_body_lines(
                             let (cell_width, cell_height) = image_cell_area(image, area, font_size);
                             images.push((image_index, lines.len(), cell_width, cell_height));
                             lines.extend((0..cell_height).map(|_| Line::default()));
+                            links.extend((0..cell_height).map(|_| Vec::new()));
                         } else {
                             let dimensions = if image.width == 0 || image.height == 0 {
                                 String::new()
@@ -2683,6 +2818,7 @@ fn block_body_lines(
                                 format!(" Image{dimensions}"),
                                 Style::default().fg(Color::Cyan),
                             ));
+                            links.push(Vec::new());
                         }
                     }
                 }
@@ -2690,21 +2826,37 @@ fn block_body_lines(
             MessageKind::System => {
                 if let Some(summary) = summary {
                     if *expanded {
-                        lines.extend(markdown(summary).into_iter().map(pad_line));
+                        let (rendered, rendered_links) = markdown(summary);
+                        extend_rendered_lines(
+                            &mut lines,
+                            &mut links,
+                            rendered,
+                            rendered_links,
+                            pad_line,
+                        );
                     }
                 } else {
-                    lines.extend(markdown(content).into_iter().map(pad_line));
+                    let (rendered, rendered_links) = markdown(content);
+                    extend_rendered_lines(
+                        &mut lines,
+                        &mut links,
+                        rendered,
+                        rendered_links,
+                        pad_line,
+                    );
                 }
             }
             MessageKind::Error => {
-                lines.extend(markdown(content).into_iter().map(pad_line));
+                let (rendered, rendered_links) = markdown(content);
+                extend_rendered_lines(&mut lines, &mut links, rendered, rendered_links, pad_line);
             }
         },
         ChatBlock::Thinking {
             content, expanded, ..
         } => {
             if *expanded {
-                lines.extend(markdown(content).into_iter().map(|line| {
+                let (rendered, rendered_links) = markdown(content);
+                extend_rendered_lines(&mut lines, &mut links, rendered, rendered_links, |line| {
                     pad_line(
                         line.style(
                             Style::default()
@@ -2712,7 +2864,7 @@ fn block_body_lines(
                                 .add_modifier(Modifier::ITALIC),
                         ),
                     )
-                }));
+                });
             }
         }
         ChatBlock::Tool {
@@ -2726,24 +2878,31 @@ fn block_body_lines(
                     " arguments",
                     Style::default().fg(Color::DarkGray),
                 ));
-                lines.extend(arguments.lines().map(|line| {
-                    Line::styled(format!(" {line}"), Style::default().fg(Color::Cyan))
-                }));
+                links.push(Vec::new());
+                for line in arguments.lines() {
+                    let line = format!(" {line}");
+                    links.push(merge_line_links(&line, Vec::new()));
+                    lines.push(Line::styled(line, Style::default().fg(Color::Cyan)));
+                }
                 if let Some(output) = output {
                     lines.push(Line::styled(
                         " output",
                         Style::default().fg(Color::DarkGray),
                     ));
-                    lines.extend(
-                        markdown_preserving_breaks(output)
-                            .into_iter()
-                            .map(|line| pad_line(line.style(Style::default().fg(Color::Gray)))),
+                    links.push(Vec::new());
+                    let (rendered, rendered_links) = markdown_preserving_breaks(output);
+                    extend_rendered_lines(
+                        &mut lines,
+                        &mut links,
+                        rendered,
+                        rendered_links,
+                        |line| pad_line(line.style(Style::default().fg(Color::Gray))),
                     );
                 }
             }
         }
     }
-    (lines, images)
+    (lines, images, links)
 }
 
 fn block_header(
@@ -2770,7 +2929,9 @@ fn block_header(
                 MessageKind::Error => Color::Red,
             };
             let line = match kind {
-                MessageKind::User | MessageKind::Steer | MessageKind::Assistant
+                MessageKind::User
+                | MessageKind::Steer
+                | MessageKind::Assistant
                 | MessageKind::Status => {
                     let header = format!("{} {label}", if *expanded { "▾" } else { "▸" });
                     if matches!(kind, MessageKind::Assistant) && !model.is_empty() {
@@ -2883,8 +3044,7 @@ fn is_decorated_message(block: &ChatBlock) -> bool {
     matches!(
         block,
         ChatBlock::Message {
-            kind:
-                MessageKind::User
+            kind: MessageKind::User
                 | MessageKind::Steer
                 | MessageKind::Assistant
                 | MessageKind::Status
@@ -2990,6 +3150,37 @@ fn push_styled_char(line: &mut Line<'static>, character: char, style: Style) {
     } else {
         line.spans.push(Span::styled(character.to_string(), style));
     }
+}
+
+/// The foreground color of clickable link text, which is also underlined.
+const LINK_COLOR: Color = Color::Cyan;
+
+/// Restyles the characters of a rendered line covered by `links` as
+/// clickable: link color plus underline. Other span styling (bold,
+/// italic, background) is kept, and column positions stay the basis the
+/// click lookups use.
+fn style_line_links(line: &mut Line<'static>, links: &[LinkRange]) {
+    if links.is_empty() {
+        return;
+    }
+    let spans = std::mem::take(&mut line.spans);
+    let mut styled = Line::default().style(line.style);
+    let mut column = 0u16;
+    for span in spans {
+        for character in span.content.chars() {
+            let style = if links
+                .iter()
+                .any(|link| link.start <= column && column < link.end)
+            {
+                span.style.fg(LINK_COLOR).add_modifier(Modifier::UNDERLINED)
+            } else {
+                span.style
+            };
+            push_styled_char(&mut styled, character, style);
+            column = column.saturating_add(1);
+        }
+    }
+    line.spans = styled.spans;
 }
 
 fn selection_bounds(selection: TextSelection) -> (TextPoint, TextPoint) {
@@ -3356,15 +3547,18 @@ fn tool_color(status: ToolStatus) -> Color {
     }
 }
 
-fn markdown(content: &str) -> Vec<Line<'static>> {
+fn markdown(content: &str) -> (Vec<Line<'static>>, Vec<Vec<LinkRange>>) {
     render_markdown(content, false)
 }
 
-fn markdown_preserving_breaks(content: &str) -> Vec<Line<'static>> {
+fn markdown_preserving_breaks(content: &str) -> (Vec<Line<'static>>, Vec<Vec<LinkRange>>) {
     render_markdown(content, true)
 }
 
-fn render_markdown(content: &str, preserve_soft_breaks: bool) -> Vec<Line<'static>> {
+fn render_markdown(
+    content: &str,
+    preserve_soft_breaks: bool,
+) -> (Vec<Line<'static>>, Vec<Vec<LinkRange>>) {
     let options = Options::ENABLE_GFM
         | Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
@@ -3391,16 +3585,29 @@ struct MarkdownRenderer {
     code_block: bool,
     table: Option<MarkdownTable>,
     preserve_soft_breaks: bool,
+    /// Clickable links of the line being built.
+    line_links: Vec<LinkRange>,
+    /// Links of every finished line, aligned with `lines`.
+    links: Vec<Vec<LinkRange>>,
+    /// Links open on the current line: the link target and the column where
+    /// its visible text started on this line, if anywhere yet.
+    open_links: Vec<OpenLink>,
+}
+
+#[derive(Default)]
+struct OpenLink {
+    url: Option<String>,
+    start: Option<usize>,
 }
 
 struct MarkdownTable {
     alignments: Vec<Alignment>,
     rows: Vec<TableRow>,
-    cells: Vec<Vec<Span<'static>>>,
+    cells: Vec<(Vec<Span<'static>>, Vec<LinkRange>)>,
 }
 
 struct TableRow {
-    cells: Vec<Vec<Span<'static>>>,
+    cells: Vec<(Vec<Span<'static>>, Vec<LinkRange>)>,
     header: bool,
 }
 
@@ -3439,6 +3646,7 @@ impl MarkdownRenderer {
                     "─".repeat(24),
                     Style::default().fg(Color::DarkGray),
                 ));
+                self.links.push(Vec::new());
             }
             MarkdownEvent::TaskListMarker(checked) => {
                 self.span(
@@ -3484,11 +3692,17 @@ impl MarkdownRenderer {
             Tag::Superscript | Tag::Subscript => {
                 self.push_style(self.style.add_modifier(Modifier::ITALIC))
             }
-            Tag::Link { .. } => self.push_style(
-                self.style
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::UNDERLINED),
-            ),
+            Tag::Link { dest_url, .. } => {
+                self.push_style(
+                    self.style
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+                self.open_links.push(OpenLink {
+                    url: openable_url(&dest_url),
+                    start: None,
+                });
+            }
             Tag::Image { .. } => {
                 self.span("image: ".into(), self.style.fg(Color::DarkGray));
                 self.push_style(self.style.add_modifier(Modifier::ITALIC));
@@ -3537,15 +3751,31 @@ impl MarkdownRenderer {
             | TagEnd::Strikethrough
             | TagEnd::Superscript
             | TagEnd::Subscript
-            | TagEnd::Link
             | TagEnd::Image
             | TagEnd::DefinitionListTitle => self.pop_style(),
+            TagEnd::Link => {
+                self.pop_style();
+                if let Some(open) = self.open_links.pop()
+                    && let Some(url) = open.url
+                    && let Some(start) = open.start
+                {
+                    let end = self.line_width();
+                    if start < end {
+                        self.line_links.push(LinkRange {
+                            start: start as u16,
+                            end: end as u16,
+                            url,
+                        });
+                    }
+                }
+            }
             TagEnd::TableCell => {
+                let links = std::mem::take(&mut self.line_links);
                 self.table
                     .as_mut()
                     .unwrap()
                     .cells
-                    .push(std::mem::take(&mut self.spans));
+                    .push((std::mem::take(&mut self.spans), links));
             }
             TagEnd::TableHead => {
                 self.pop_style();
@@ -3574,6 +3804,7 @@ impl MarkdownRenderer {
         self.line();
         for line in code.lines() {
             self.lines.push(highlight_code(line));
+            self.links.push(Vec::new());
         }
     }
 
@@ -3587,12 +3818,49 @@ impl MarkdownRenderer {
     }
 
     fn span(&mut self, content: String, style: Style) {
+        // Record where a link's visible text starts on this line.
+        if !self.open_links.is_empty() {
+            let width = self.line_width();
+            if let Some(open) = self.open_links.last_mut()
+                && open.url.is_some()
+                && open.start.is_none()
+                && !content.is_empty()
+            {
+                open.start = Some(width);
+            }
+        }
         self.spans.push(Span::styled(content, style));
+    }
+
+    fn line_width(&self) -> usize {
+        self.spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum()
+    }
+
+    /// Close any open link fragments at the end of the current line; the
+    /// link stays open for its continuation line.
+    fn close_line_links(&mut self) {
+        let end = self.line_width();
+        for open in self.open_links.iter_mut() {
+            if let (Some(url), Some(start)) = (open.url.clone(), open.start.take())
+                && start < end
+            {
+                self.line_links.push(LinkRange {
+                    start: start as u16,
+                    end: end as u16,
+                    url,
+                });
+            }
+        }
     }
 
     fn line(&mut self) {
         if !self.spans.is_empty() {
+            self.close_line_links();
             self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+            self.links.push(std::mem::take(&mut self.line_links));
         }
     }
 
@@ -3623,18 +3891,19 @@ impl MarkdownRenderer {
             .unwrap_or(0);
         let mut widths = vec![0; columns];
         for row in &table.rows {
-            for (column, cell) in row.cells.iter().enumerate() {
+            for (column, (cell, _)) in row.cells.iter().enumerate() {
                 widths[column] = widths[column].max(Line::from(cell.clone()).width());
             }
         }
 
         for row in table.rows {
             let mut spans = Vec::new();
+            let mut row_links = Vec::new();
             for (column, width) in widths.iter().copied().enumerate() {
                 if column > 0 {
                     spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
                 }
-                let cell = row.cells.get(column).cloned().unwrap_or_default();
+                let (cell, cell_links) = row.cells.get(column).cloned().unwrap_or_default();
                 let padding = width.saturating_sub(Line::from(cell.clone()).width());
                 let (left, right) = match table
                     .alignments
@@ -3649,12 +3918,22 @@ impl MarkdownRenderer {
                 if left > 0 {
                     spans.push(Span::raw(" ".repeat(left)));
                 }
+                let cell_start = spans
+                    .iter()
+                    .map(|span| span.content.chars().count())
+                    .sum::<usize>();
+                row_links.extend(cell_links.into_iter().map(|mut link| {
+                    link.start += cell_start as u16;
+                    link.end += cell_start as u16;
+                    link
+                }));
                 spans.extend(cell);
                 if right > 0 {
                     spans.push(Span::raw(" ".repeat(right)));
                 }
             }
             self.lines.push(Line::from(spans));
+            self.links.push(row_links);
             if row.header && !widths.is_empty() {
                 self.lines.push(Line::styled(
                     widths
@@ -3664,13 +3943,14 @@ impl MarkdownRenderer {
                         .join("─┼─"),
                     Style::default().fg(Color::DarkGray),
                 ));
+                self.links.push(Vec::new());
             }
         }
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> (Vec<Line<'static>>, Vec<Vec<LinkRange>>) {
         self.line();
-        self.lines
+        (self.lines, self.links)
     }
 }
 
@@ -3778,14 +4058,14 @@ mod tests {
 
     #[test]
     fn markdown_hides_fences_and_styles_code() {
-        let lines = markdown("# Title\n```rust\nfn main() {}\n```");
+        let (lines, _) = markdown("# Title\n```rust\nfn main() {}\n```");
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].width(), 5);
     }
 
     #[test]
     fn markdown_renders_inline_emphasis() {
-        let lines = markdown("plain **bold** and *italic*");
+        let (lines, _) = markdown("plain **bold** and *italic*");
         assert!(lines[0].spans.iter().any(|span| {
             span.content == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
@@ -3796,7 +4076,7 @@ mod tests {
 
     #[test]
     fn user_markdown_preserves_original_soft_breaks() {
-        let lines = markdown_preserving_breaks("first line\nsecond line\nthird line");
+        let (lines, _) = markdown_preserving_breaks("first line\nsecond line\nthird line");
         let text = lines
             .iter()
             .map(|line| {
@@ -3808,12 +4088,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(text, ["first line", "second line", "third line"]);
-        assert_eq!(markdown("first line\nsecond line").len(), 1);
+        assert_eq!(markdown("first line\nsecond line").0.len(), 1);
     }
 
     #[test]
     fn markdown_renders_tables_as_rows_and_cells() {
-        let lines = markdown("| Name | Value |\n| --- | ---: |\n| first | 42 |");
+        let (lines, _) = markdown("| Name | Value |\n| --- | ---: |\n| first | 42 |");
         let text = lines
             .iter()
             .map(|line| {
@@ -3832,7 +4112,7 @@ mod tests {
 
     #[test]
     fn markdown_table_pipes_align_by_display_width() {
-        let lines = markdown("| A | Longer |\n| :-: | --: |\n| wide | 7 |\n| x | 123 |");
+        let (lines, _) = markdown("| A | Longer |\n| :-: | --: |\n| wide | 7 |\n| x | 123 |");
         let rows = [&lines[0], &lines[2], &lines[3]];
         let pipes = rows
             .iter()
@@ -3846,6 +4126,144 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(pipes, [Some(5), Some(5), Some(5)]);
+    }
+
+    #[test]
+    fn markdown_records_explicit_link_ranges() {
+        let (lines, links) = markdown("see [the docs](https://docs.example.com/guide) now");
+        assert_eq!(
+            lines[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "see the docs now"
+        );
+        assert_eq!(
+            links,
+            vec![vec![LinkRange {
+                start: 4,
+                end: 12,
+                url: "https://docs.example.com/guide".into(),
+            }]]
+        );
+    }
+
+    #[test]
+    fn markdown_records_autolink_and_skips_relative() {
+        let (_, links) = markdown("go to <https://example.com> or [rel](sub/page.md)");
+        assert_eq!(
+            links,
+            vec![vec![LinkRange {
+                start: 6,
+                end: 25,
+                url: "https://example.com/".into(),
+            }]]
+        );
+    }
+
+    #[test]
+    fn chat_layout_exposes_clickable_links_with_columns() {
+        let mut state = UiState::new();
+        state.push_user("docs at https://docs.example.com/guide".into());
+        let mut renders = RenderState::new();
+        let area = Rect::new(0, 0, 60, 12);
+        let layout = chat_layout(&state, area, &mut renders.chat);
+        let mut found = None;
+        for (row, links) in layout.links.iter().enumerate() {
+            for link in links {
+                let text = line_text(&layout.lines[row]);
+                found = Some((
+                    row,
+                    link.clone(),
+                    text[link.start as usize..link.end as usize].to_string(),
+                ));
+            }
+        }
+        let (row, link, text) = found.expect("a clickable link in the message");
+        assert_eq!(link.url, "https://docs.example.com/guide");
+        assert_eq!(text, "https://docs.example.com/guide");
+
+        // The same lookup a click performs resolves the link under a point.
+        let point = TextPoint {
+            row: row as u16,
+            column: link.start + 2,
+        };
+        assert_eq!(
+            chat_url_at(&state, area, point, &mut renders.chat).as_deref(),
+            Some(link.url.as_str())
+        );
+    }
+
+    #[test]
+    fn chat_links_render_underlined_in_link_color() {
+        let mut state = UiState::new();
+        state.push_user("docs at https://docs.example.com/guide now".into());
+        let mut renders = RenderState::new();
+        let area = Rect::new(0, 0, 60, 12);
+        let layout = chat_layout(&state, area, &mut renders.chat);
+        let (row, link) = layout
+            .links
+            .iter()
+            .enumerate()
+            .find_map(|(row, links)| links.first().map(|link| (row, link)))
+            .expect("a clickable link in the message");
+        let mut column = 0u16;
+        for span in &layout.lines[row].spans {
+            for _ in span.content.chars() {
+                if column >= link.start && column < link.end {
+                    assert_eq!(span.style.fg, Some(LINK_COLOR));
+                    assert!(span.style.add_modifier.contains(Modifier::UNDERLINED));
+                } else {
+                    assert!(!span.style.add_modifier.contains(Modifier::UNDERLINED));
+                }
+                column += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn style_line_links_restyles_only_linked_columns() {
+        let mut line = Line::from(vec![
+            Span::raw("go to "),
+            Span::styled(
+                "https://x.com",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" back"),
+        ]);
+        let links = vec![LinkRange {
+            start: 6,
+            end: 19,
+            url: "https://x.com/".into(),
+        }];
+        style_line_links(&mut line, &links);
+        assert_eq!(line_text(&line), "go to https://x.com back");
+        let chars: Vec<(char, Style)> = line
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars().map(|c| (c, span.style)))
+            .collect();
+        for (_, style) in &chars[6..19] {
+            assert_eq!(style.fg, Some(LINK_COLOR));
+            assert!(style.add_modifier.contains(Modifier::UNDERLINED));
+            // Other span styling survives the link restyle.
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+        }
+        for (_, style) in chars[..6].iter().chain(&chars[19..]) {
+            assert!(!style.add_modifier.contains(Modifier::UNDERLINED));
+            assert_ne!(style.fg, Some(LINK_COLOR));
+        }
+    }
+
+    #[test]
+    fn style_line_links_is_a_noop_without_links() {
+        let mut line = Line::styled("plain text", Style::default().fg(Color::Gray));
+        let before = line.clone();
+        style_line_links(&mut line, &[]);
+        assert_eq!(line, before);
     }
 
     #[test]
@@ -4921,7 +5339,11 @@ mod tests {
         let status_line = layout
             .lines
             .iter()
-            .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "▾ Status"))
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == "▾ Status")
+            })
             .expect("status header");
         let span = status_line
             .spans
@@ -4942,7 +5364,11 @@ mod tests {
         let steer_line = layout
             .lines
             .iter()
-            .find(|line| line.spans.iter().any(|span| span.content.as_ref() == "▾ Steer"))
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref() == "▾ Steer")
+            })
             .expect("steer header");
         let span = steer_line
             .spans
@@ -4983,7 +5409,8 @@ mod tests {
         assert!(matches!(
             state.blocks[1],
             ChatBlock::Message {
-                expanded: false, ..
+                expanded: false,
+                ..
             }
         ));
     }
@@ -4995,9 +5422,15 @@ mod tests {
         let mut history = PromptHistory::empty();
         let (commands, mut rx) = mpsc::channel(1);
 
-        send_prompt("keep going".into(), Vec::new(), &mut state, &mut history, &commands)
-            .await
-            .unwrap();
+        send_prompt(
+            "keep going".into(),
+            Vec::new(),
+            &mut state,
+            &mut history,
+            &commands,
+        )
+        .await
+        .unwrap();
 
         match rx.recv().await.unwrap() {
             Command::Steer(prompt) => assert_eq!(prompt.content, "keep going"),
@@ -5019,9 +5452,15 @@ mod tests {
         let mut history = PromptHistory::empty();
         let (commands, mut rx) = mpsc::channel(1);
 
-        send_prompt("fresh request".into(), Vec::new(), &mut state, &mut history, &commands)
-            .await
-            .unwrap();
+        send_prompt(
+            "fresh request".into(),
+            Vec::new(),
+            &mut state,
+            &mut history,
+            &commands,
+        )
+        .await
+        .unwrap();
 
         match rx.recv().await.unwrap() {
             Command::Submit(prompt) => assert_eq!(prompt.content, "fresh request"),
