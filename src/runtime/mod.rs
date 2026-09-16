@@ -137,6 +137,8 @@ pub enum Command {
     ResumeSession(String),
     SelectModel(String),
     NextReasoningEffort,
+    /// Manually compacts the idle conversation into a continuation summary.
+    Compact,
     RememberCommand(String),
     GitDiff(Option<std::path::PathBuf>),
     Shutdown(oneshot::Sender<SessionSummary>),
@@ -475,6 +477,36 @@ async fn run<P: Provider>(
                     Ok(()) => send_settings(&events, &config).await,
                     Err(error) => { events.send(Event::Error(format!("save reasoning setting: {error:#}"))).await.ok(); }
                 },
+                Command::Compact if generation.is_none() => {
+                    // A manual compaction: summarize exactly what the next
+                    // request would send — the previous summary plus the
+                    // messages that outlived it — while the full transcript
+                    // stays in the session file.
+                    let context = request_context(&messages, &session.meta);
+                    if context.len() <= 1 {
+                        events.send(Event::Error("nothing to compact yet".into())).await.ok();
+                    } else {
+                        let compacted = async {
+                            let summary =
+                                summarize(provider.clone(), &config, &context, &events, &internal_tx).await?;
+                            let marker =
+                                Message::system(format!("{COMPACTION_MARKER}\n{summary}"));
+                            session.meta.compaction_summary = Some(summary);
+                            session.meta.compacted_through = messages.len();
+                            session.append(std::slice::from_ref(&marker)).await?;
+                            messages.push(marker);
+                            session.meta.context_tokens =
+                                estimate_tokens(&request_context(&messages, &session.meta));
+                            session.save().await
+                        }
+                        .await;
+                        if let Err(error) = compacted {
+                            events.send(Event::Error(format!("compact: {error:#}"))).await.ok();
+                        } else {
+                            send_context(&events, &session, &config).await;
+                        }
+                    }
+                }
                 Command::RememberCommand(command) => {
                     if let Err(error) = config.remember_command(&command) {
                         events.send(Event::Error(format!("save command history: {error:#}"))).await.ok();
@@ -512,7 +544,8 @@ async fn run<P: Provider>(
                 Command::NewSession(_)
                 | Command::ResumeSession(_)
                 | Command::SelectModel(_)
-                | Command::NextReasoningEffort => {}
+                | Command::NextReasoningEffort
+                | Command::Compact => {}
             },
             Some(event) = internal_rx.recv() => match event {
                 InternalEvent::Finished(result) if generation.is_some() => {
@@ -1061,39 +1094,116 @@ async fn summarize<P: Provider>(
         .await
         .ok();
     let max_context = config.active_model().max_context_tokens;
-    let preferred_output = (max_context / 8).clamp(512, 4096);
     let mut request_messages = vec![Message::system(
         "Summarize this conversation for seamless continuation. Preserve requirements, decisions, files, commands, errors, results, and unresolved work. Be dense and factual. Return only the summary."
             .into(),
     )];
     request_messages.extend(messages.iter().cloned());
-    // A long conversation can crowd the summary's own input past the
-    // context. Drop the oldest messages — a tool result leaves only with
-    // the assistant message that called it — until the input leaves room
-    // for at least the minimum summary.
-    while estimate_tokens(&request_messages) + SUMMARY_MIN_OUTPUT_TOKENS > max_context
+    // The instruction is repeated as the final user turn. A system prompt
+    // alone at the top of a long conversation — especially one that
+    // replays the model's own earlier reasoning — is routinely ignored:
+    // the model role-plays the conversation's continuation and never
+    // writes the summary.
+    request_messages.push(Message::user_with_images(
+        "Write the continuation summary of the conversation above now. Return only the summary."
+            .into(),
+        Vec::new(),
+    ));
+    // The request must leave the summary inside the context, and the
+    // summary should not outgrow a sane fraction of the conversation it
+    // replaces. The budget also must not be a small fixed number: a
+    // reasoning model spends part of the same output budget on thinking
+    // before it writes the summary, so scale it to the conversation
+    // (one eighth), floored at 4096 tokens.
+    //
+    // A long conversation can crowd the request past the context. Drop
+    // the oldest messages — a tool result leaves only with the assistant
+    // message that called it — until the input *and* the scaled output
+    // budget both fit. Trimming only to the minimum would leave a
+    // reasoning model a few hundred tokens to think and answer in, so it
+    // runs out mid-thought and writes no summary at all.
+    let mut input_tokens = estimate_tokens(&request_messages);
+    while input_tokens + summary_output_budget(input_tokens) > max_context
         && drop_oldest_message(&mut request_messages)
-    {}
-    let input_tokens = estimate_tokens(&request_messages);
+    {
+        input_tokens = estimate_tokens(&request_messages);
+    }
     let max_tokens = max_context
         .saturating_sub(input_tokens)
-        .min(preferred_output);
+        .min(summary_output_budget(input_tokens));
     if max_tokens < SUMMARY_MIN_OUTPUT_TOKENS {
         bail!("context exhausted: the compaction request itself does not fit the context");
     }
+    // The summary is extraction, not problem solving: with reasoning on,
+    // the model can spend the entire shared output budget thinking and
+    // never write the summary. Run it without reasoning when the model
+    // allows, at the lightest effort otherwise.
+    let first_effort = if config
+        .active_model()
+        .reasoning_efforts
+        .contains(&ReasoningEffort::None)
+    {
+        Some(ReasoningEffort::None)
+    } else {
+        config.light_reasoning_effort()
+    };
     let request = CompletionRequest {
         provider: config.provider_name().to_owned(),
         model: config.model_id().to_owned(),
         messages: request_messages,
         temperature: config.effective_temperature(),
-        reasoning_effort: config.light_reasoning_effort(),
+        reasoning_effort: first_effort,
         max_tokens: Some(max_tokens.min(u32::MAX as u64) as u32),
         stream: true,
         tools: Vec::new(),
     };
-    let mut stream = stream_with_retry(&provider, request, events).await?;
+    let (summary, end) = summarize_stream(&provider, request, events, internal).await?;
+    // The summary must be real output text. A reasoning block is the
+    // model's chain of thought, not a dense continuation summary, and
+    // persisting it is exactly the "thinking leak" that corrupts the
+    // replayed context — so an answer-less response fails instead of
+    // masquerading as a summary.
+    let summary = summary.trim().to_owned();
+    if summary.is_empty() {
+        let why = match end {
+            SummaryEnd::Completed => "completed without writing any summary text".to_string(),
+            SummaryEnd::Truncated(reason) => {
+                format!("was truncated ({reason}) before writing any summary text")
+            }
+            SummaryEnd::Ended => "ended before finishing without writing any summary text".to_string(),
+        };
+        bail!("compaction produced no summary text: {why}");
+    }
+    events
+        .send(Event::ContextCompacted {
+            summary: summary.clone(),
+        })
+        .await
+        .ok();
+    Ok(summary)
+}
+
+/// How a compaction response ended.
+enum SummaryEnd {
+    /// A terminal event confirmed the response finished.
+    Completed,
+    /// The response ran out of its output budget.
+    Truncated(String),
+    /// The stream closed without any terminal event.
+    Ended,
+}
+
+/// Runs one compaction request and returns its final output text and how
+/// the response ended. Reasoning deltas are not part of the answer.
+async fn summarize_stream<P: Provider>(
+    provider: &Arc<P>,
+    request: CompletionRequest,
+    events: &mpsc::Sender<Event>,
+    internal: &mpsc::Sender<InternalEvent>,
+) -> Result<(String, SummaryEnd)> {
+    let mut stream = stream_with_retry(provider, request, events).await?;
     let mut summary = String::new();
-    let mut reasoning = String::new();
+    let mut end = None;
     let mut started = false;
     while let Some(delta) = stream.next().await {
         let delta = delta?;
@@ -1103,29 +1213,24 @@ async fn summarize<P: Provider>(
         }
         match delta {
             ResponseDelta::Text(text) => summary.push_str(&text),
-            ResponseDelta::Reasoning(text) => reasoning.push_str(&text),
+            ResponseDelta::Completed => end = Some(SummaryEnd::Completed),
+            ResponseDelta::Truncated(reason) => end = Some(SummaryEnd::Truncated(reason)),
             ResponseDelta::Usage(usage) => {
                 internal.send(InternalEvent::AuxiliaryUsage(usage)).await?;
             }
-            ResponseDelta::ToolCall { .. } | ResponseDelta::OutputItem(_) => {}
+            ResponseDelta::Reasoning(_)
+            | ResponseDelta::ToolCall { .. }
+            | ResponseDelta::OutputItem(_) => {}
         }
     }
-    let summary = if summary.trim().is_empty() {
-        reasoning.trim()
-    } else {
-        summary.trim()
-    };
-    if summary.is_empty() {
-        bail!("compaction returned an empty summary");
-    }
-    let summary = summary.to_owned();
-    events
-        .send(Event::ContextCompacted {
-            summary: summary.clone(),
-        })
-        .await
-        .ok();
-    Ok(summary)
+    Ok((summary, end.unwrap_or(SummaryEnd::Ended)))
+}
+
+/// The compaction's output budget: one eighth of the conversation it
+/// summarizes, floored at 4096 tokens so a reasoning model has room to
+/// think before it writes the summary.
+fn summary_output_budget(input_tokens: u64) -> u64 {
+    input_tokens.div_ceil(8).max(4_096)
 }
 
 /// Drops the oldest summarized message from a compaction request, along
@@ -1221,6 +1326,10 @@ async fn generate_session_title<P: Provider>(
                     internal.send(InternalEvent::AuxiliaryUsage(usage)).await?;
                 }
                 ResponseDelta::ToolCall { .. } | ResponseDelta::OutputItem(_) => {}
+                // The title is best-effort; a truncated stream still
+                // yields whatever text arrived.
+                ResponseDelta::Truncated(_) => {}
+                ResponseDelta::Completed => {}
             }
         }
         Ok((text, reasoning))
@@ -1835,6 +1944,10 @@ async fn collect(
             }
             ResponseDelta::Usage(tokens) => usage = Some(tokens),
             ResponseDelta::OutputItem(item) => response_items.push(item),
+            // The main request has no output cap, so a provider-side
+            // truncation still yields whatever text arrived.
+            ResponseDelta::Truncated(_) => {}
+            ResponseDelta::Completed => {}
             ResponseDelta::ToolCall {
                 index,
                 id,
@@ -3343,24 +3456,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_accepts_a_reasoning_only_summary() {
+    async fn compaction_rejects_a_reasoning_only_response() {
+        // A response that only thinks and never writes output text is not
+        // a summary: the chain of thought must not be persisted as one.
         let provider = Arc::new(MockProvider::new(vec![vec![
-            ResponseDelta::Reasoning("Dense continuation summary".into()),
+            ResponseDelta::Reasoning("Let me think about what to preserve...".into()),
+            ResponseDelta::Completed,
             ResponseDelta::Usage(Usage {
                 prompt_tokens: 90,
                 total_tokens: 100,
             }),
         ]]));
         let mut config = Config::default();
-        config.models[0].reasoning_efforts = vec![
-            ReasoningEffort::None,
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-        ];
+        config.models[0].reasoning_efforts =
+            vec![ReasoningEffort::Low, ReasoningEffort::Medium];
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
 
-        let summary = summarize(
+        let error = summarize(
             provider.clone(),
             &config,
             &[Message::user("old turn".into())],
@@ -3368,9 +3481,13 @@ mod tests {
             &internal_tx,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(summary, "Dense continuation summary");
+        assert!(
+            error
+                .to_string()
+                .contains("compaction produced no summary text")
+        );
         assert_eq!(
             provider.requests()[0].reasoning_effort,
             Some(ReasoningEffort::Low)
@@ -3385,21 +3502,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_output_is_capped_to_the_remaining_context() {
+    async fn compaction_runs_without_reasoning_when_supported() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::Text("dense summary".into()),
+            ResponseDelta::Completed,
+        ]]));
+        let mut config = Config::default();
+        config.models[0].reasoning_efforts = vec![
+            ReasoningEffort::None,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+        ];
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        let summary = summarize(
+            provider.clone(),
+            &config,
+            &[Message::user("old turn".into())],
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary, "dense summary");
+        // Reasoning would only spend the shared output budget.
+        assert_eq!(
+            provider.requests()[0].reasoning_effort,
+            Some(ReasoningEffort::None)
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_fails_rather_than_persisting_truncated_reasoning() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::Reasoning("cut off mid-thought".into()),
+            ResponseDelta::Truncated("max_output_tokens".into()),
+        ]]));
+        let config = Config::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        let error = summarize(
+            provider,
+            &config,
+            &[Message::user("old turn".into())],
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("was truncated (max_output_tokens) before writing any summary text")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_fails_rather_than_persisting_a_dropped_reasoning_stream() {
+        // The stream closed without any terminal event — e.g. the output
+        // budget ran out inside the reasoning and the connection ended.
+        // The cut-off monologue must not become the summary.
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::Reasoning("cut off mid-thought".into()),
+            ResponseDelta::Usage(Usage {
+                prompt_tokens: 90,
+                total_tokens: 4186,
+            }),
+        ]]));
+        let config = Config::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        let error = summarize(
+            provider,
+            &config,
+            &[Message::user("old turn".into())],
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("ended before finishing")
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_trim_leaves_room_for_the_scaled_budget() {
         let provider = Arc::new(MockProvider::new(vec![vec![ResponseDelta::Text(
             "dense summary".into(),
         )]]));
         let mut config = Config::default();
-        config.models[0].max_context_tokens = 4_096;
+        config.models[0].max_context_tokens = 16_384;
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
 
-        // ~1,800 tokens per message: the input leaves less than the
-        // preferred 512-token summary room.
-        let messages = vec![
-            Message::user("a".repeat(7_200)),
-            Message::assistant("a".repeat(7_200), "model".into(), String::new(), Vec::new()),
-        ];
+        // 20 messages of ~1,000 tokens: the input alone nearly fills the
+        // context, so the trim must drop messages until the 4096-token
+        // output floor fits alongside it.
+        let messages = vec![Message::user("a".repeat(4_000)); 20];
         summarize(
             provider.clone(),
             &config,
@@ -3412,13 +3620,56 @@ mod tests {
 
         let request = &provider.requests()[0];
         let input_tokens = estimate_tokens(&request.messages);
-        assert_eq!(request.messages.len(), 3, "no message may be dropped");
         assert!(
-            request.max_tokens.unwrap() < 512,
-            "output must shrink below the preferred 512"
+            request.messages.len() < 21,
+            "messages must be dropped to free room"
         );
         assert!(
-            input_tokens + request.max_tokens.unwrap() as u64 <= 4_096,
+            request.max_tokens.unwrap() as u64 >= 4_096,
+            "a reasoning model needs the full floor, not the sliver the input left behind"
+        );
+        assert!(
+            input_tokens + request.max_tokens.unwrap() as u64 <= 16_384,
+            "input + output must fit the context"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_output_budget_scales_with_the_conversation() {
+        let provider = Arc::new(MockProvider::new(vec![vec![ResponseDelta::Text(
+            "dense summary".into(),
+        )]]));
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 1_048_576;
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let (internal_tx, _internal_rx) = mpsc::channel(2);
+
+        // ~50k tokens of conversation: the budget must grow well past the
+        // old 4096 ceiling so a reasoning model can think first.
+        let messages = vec![Message::user("a".repeat(200_000))];
+        summarize(
+            provider.clone(),
+            &config,
+            &messages,
+            &event_tx,
+            &internal_tx,
+        )
+        .await
+        .unwrap();
+
+        let request = &provider.requests()[0];
+        let input_tokens = estimate_tokens(&request.messages);
+        assert_eq!(
+            request.max_tokens.unwrap() as u64,
+            summary_output_budget(input_tokens),
+            "the output budget scales with the conversation"
+        );
+        assert!(
+            request.max_tokens.unwrap() as u64 > 4_096,
+            "a large conversation needs a large budget"
+        );
+        assert!(
+            input_tokens + request.max_tokens.unwrap() as u64 <= 1_048_576,
             "input + output must fit the context"
         );
     }
@@ -3433,8 +3684,9 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
 
-        // ~1,800 tokens per message: even the minimum 128-token summary
-        // does not fit the full input.
+        // ~1,800 tokens per message: neither message can sit next to the
+        // 4096-token floor, so the trim falls back to the summarizer
+        // prompt alone rather than an impossible request.
         let messages = vec![
             Message::user("a".repeat(7_200)),
             Message::assistant("a".repeat(7_200), "model".into(), String::new(), Vec::new()),
@@ -3453,8 +3705,8 @@ mod tests {
         let input_tokens = estimate_tokens(&request.messages);
         assert_eq!(
             request.messages.len(),
-            2,
-            "the oldest message must be dropped"
+            1,
+            "the whole conversation must be dropped"
         );
         assert!(
             request.max_tokens.unwrap() as u64 >= 128,
@@ -3909,6 +4161,143 @@ mod tests {
         assert!(resubmitted.last().is_some_and(|message| {
             matches!(message, Message::Steer { content, .. } if content == "steered")
         }));
+    }
+
+    #[tokio::test]
+    async fn compact_command_summarizes_the_idle_conversation() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::Text("dense summary".into()),
+            ResponseDelta::Usage(Usage {
+                prompt_tokens: 90,
+                total_tokens: 120,
+            }),
+        ]]));
+        let root = std::env::temp_dir().join(format!(
+            "rope-compact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create_in(root.clone(), "compact".into()).await.unwrap();
+        let messages = vec![
+            Message::user("build the feature".into()),
+            Message::assistant("done".to_string(), "model".into(), String::new(), Vec::new()),
+        ];
+        let tools = ToolRegistry::default();
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let run_task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                run(
+                    Config::default(),
+                    provider,
+                    tools,
+                    session,
+                    messages.clone(),
+                    ProjectState::new().await.unwrap(),
+                    command_rx,
+                    event_tx,
+                )
+                .await
+            }
+        });
+
+        command_tx.send(Command::Compact).await.unwrap();
+        let summary = loop {
+            let event = event_rx.recv().await.unwrap();
+            if let Event::ContextCompacted { summary } = event {
+                break summary;
+            }
+        };
+        assert_eq!(summary, "dense summary");
+
+        let (reply, _summary) = tokio::sync::oneshot::channel();
+        command_tx.send(Command::Shutdown(reply)).await.unwrap();
+        run_task.await.unwrap();
+
+        // One model request: the summarizer prompt, the idle
+        // conversation, and the trailing summary instruction — no turn in
+        // between.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].messages.len(), 4);
+        assert!(matches!(
+            requests[0].messages.last(),
+            Some(Message::User { content, .. })
+                if content.starts_with("Write the continuation summary")
+        ));
+
+        // The session persists the summary, the boundary, and the
+        // transcript marker the UI renders as a collapsed section.
+        let (saved, saved_messages) = Session::resume_in(root.clone(), "compact").await.unwrap();
+        assert_eq!(
+            saved.meta.compaction_summary.as_deref(),
+            Some("dense summary")
+        );
+        assert_eq!(saved.meta.compacted_through, 2);
+        assert!(saved_messages.last().is_some_and(|message| {
+            matches!(
+                message,
+                Message::System { content }
+                    if content.starts_with("Context compacted\ndense summary")
+            )
+        }));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn compact_command_refuses_an_empty_conversation() {
+        let provider = Arc::new(MockProvider::new(Vec::new()));
+        let root = std::env::temp_dir().join(format!(
+            "rope-compact-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create_in(root.clone(), "empty".into()).await.unwrap();
+        let tools = ToolRegistry::default();
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let run_task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                run(
+                    Config::default(),
+                    provider,
+                    tools,
+                    session,
+                    Vec::new(),
+                    ProjectState::new().await.unwrap(),
+                    command_rx,
+                    event_tx,
+                )
+                .await
+            }
+        });
+
+        command_tx.send(Command::Compact).await.unwrap();
+        let error = loop {
+            let event = event_rx.recv().await.unwrap();
+            if let Event::Error(error) = event {
+                break error;
+            }
+        };
+        assert!(error.contains("nothing to compact yet"));
+
+        let (reply, _summary) = tokio::sync::oneshot::channel();
+        command_tx.send(Command::Shutdown(reply)).await.unwrap();
+        run_task.await.unwrap();
+        assert!(provider.requests().is_empty());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]

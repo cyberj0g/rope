@@ -351,6 +351,8 @@ fn parse_delta(data: &str) -> Result<Vec<ResponseDelta>> {
     #[derive(Deserialize)]
     struct Choice {
         delta: Delta,
+        #[serde(default)]
+        finish_reason: Option<String>,
     }
     #[derive(Deserialize)]
     struct Delta {
@@ -381,7 +383,13 @@ fn parse_delta(data: &str) -> Result<Vec<ResponseDelta>> {
 
     let chunk: Chunk = serde_json::from_str(data).context("decode response chunk")?;
     let mut output = Vec::new();
-    if let Some(delta) = chunk.choices.into_iter().next().map(|choice| choice.delta) {
+    if let Some(choice) = chunk.choices.into_iter().next() {
+        match choice.finish_reason.as_deref() {
+            Some("length") => output.push(ResponseDelta::Truncated("max_tokens".into())),
+            Some(_) => output.push(ResponseDelta::Completed),
+            None => {}
+        }
+        let delta = choice.delta;
         if let Some(reasoning) = delta
             .reasoning
             .or(delta.reasoning_content)
@@ -474,6 +482,32 @@ mod tests {
         assert_eq!(
             parse_delta(legacy).unwrap(),
             vec![ResponseDelta::Reasoning("legacy".into())]
+        );
+
+        let truncated =
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":200,"total_tokens":4098}}"#;
+        assert_eq!(
+            parse_delta(truncated).unwrap(),
+            vec![
+                ResponseDelta::Truncated("max_tokens".into()),
+                ResponseDelta::Usage(crate::provider::Usage {
+                    prompt_tokens: 200,
+                    total_tokens: 4098,
+                })
+            ]
+        );
+
+        let stopped =
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"total_tokens":321}}"#;
+        assert_eq!(
+            parse_delta(stopped).unwrap(),
+            vec![
+                ResponseDelta::Completed,
+                ResponseDelta::Usage(crate::provider::Usage {
+                    prompt_tokens: 200,
+                    total_tokens: 321,
+                })
+            ]
         );
     }
 

@@ -1386,19 +1386,25 @@ impl UiState {
                     expanded: false,
                     summary: Some(summary),
                 };
-                let index = self
-                    .blocks
-                    .iter()
-                    .rposition(|block| {
-                        matches!(
-                            block,
-                            ChatBlock::Message {
-                                kind: MessageKind::User | MessageKind::Steer,
-                                ..
-                            }
-                        )
-                    })
-                    .unwrap_or_else(|| self.blocks.len());
+                let index = if self.generating {
+                    self
+                        .blocks
+                        .iter()
+                        .rposition(|block| {
+                            matches!(
+                                block,
+                                ChatBlock::Message {
+                                    kind: MessageKind::User | MessageKind::Steer,
+                                    ..
+                                }
+                            )
+                        })
+                        .unwrap_or_else(|| self.blocks.len())
+                } else {
+                    // A manual compaction: the marker goes at the end of
+                    // the conversation, where it is persisted.
+                    self.blocks.len()
+                };
                 self.blocks.insert(index, block);
                 self.render_revisions.insert(index, 0);
                 self.layout_generation = self.layout_generation.wrapping_add(1);
@@ -1914,6 +1920,7 @@ mod tests {
     #[test]
     fn context_compaction_marker_precedes_pending_user_message() {
         let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
         state.push_user("continue".into());
         state.apply(Event::ContextChanged {
             tokens: 750,
@@ -1955,6 +1962,38 @@ mod tests {
                 kind: MessageKind::System,
                 summary: Some(_),
                 expanded: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn manual_compaction_marker_appends_to_the_conversation_end() {
+        let mut state = UiState::new();
+        state.push_user("build the feature".into());
+        state.apply(Event::TextDelta("done".into()));
+        state.apply(Event::GenerationFinished);
+        // No active generation: a manual /compact marker lands where the
+        // transcript persists it — after the last assistant answer.
+        state.apply(Event::ContextCompacted {
+            summary: "dense summary".into(),
+        });
+
+        assert_eq!(state.blocks.len(), 3);
+        assert!(matches!(
+            &state.blocks[2],
+            ChatBlock::Message {
+                kind: MessageKind::System,
+                content,
+                summary,
+                ..
+            } if content == "context compacted"
+                && summary.as_deref() == Some("dense summary")
+        ));
+        assert!(matches!(
+            state.blocks[1],
+            ChatBlock::Message {
+                kind: MessageKind::Assistant,
                 ..
             }
         ));

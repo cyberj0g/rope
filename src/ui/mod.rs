@@ -267,6 +267,12 @@ const COMMANDS: &[SlashCommand] = &[
         argument: false,
     },
     SlashCommand {
+        name: "/compact",
+        title: "Compact context now",
+        hotkey: "—",
+        argument: false,
+    },
+    SlashCommand {
         name: "/image",
         title: "Attach image file",
         hotkey: "Ctrl+V",
@@ -1071,6 +1077,16 @@ async fn dispatch(
                     }
                     Err(error) => state.set_error(format!("list sessions: {error:#}")),
                 }
+            }
+            true
+        }
+        "/compact" if argument.is_empty() => {
+            if state.generating {
+                state.notice = Some(
+                    "finish or cancel the current response before compacting".into(),
+                );
+            } else {
+                commands.send(Command::Compact).await?;
             }
             true
         }
@@ -4328,6 +4344,7 @@ mod tests {
     fn compaction_marker_renders_a_collapsed_summary_section() {
         let mut renders = RenderState::new();
         let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
         state.push_user("continue".into());
         state.apply(Event::ContextCompacted {
             summary: "dense summary".into(),

@@ -266,9 +266,31 @@ impl ResponsesDecoder {
             "response.output_item.added" => Ok(self.tool_added(&event)),
             "response.function_call_arguments.delta" => Ok(self.tool_arguments_delta(&event)),
             "response.output_item.done" => Ok(self.item_done(&event)),
-            "response.completed" | "response.incomplete" => Ok(usage(&event)
-                .map(|usage| vec![ResponseDelta::Usage(usage)])
-                .unwrap_or_default()),
+            "response.completed" | "response.incomplete" => {
+                // A spec-compliant server reports a budget-exhausted
+                // response as `response.incomplete`, but vLLM reports it
+                // as `response.completed` with `incomplete_details` set.
+                // Either way the response stopped before finishing,
+                // usually because reasoning consumed the shared output
+                // budget.
+                let mut deltas = usage(&event)
+                    .map(|usage| vec![ResponseDelta::Usage(usage)])
+                    .unwrap_or_default();
+                let truncated = event
+                    .pointer("/response/incomplete_details")
+                    .is_some_and(|details| !details.is_null());
+                if truncated || kind == "response.incomplete" {
+                    let reason = event
+                        .pointer("/response/incomplete_details/reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("incomplete")
+                        .to_owned();
+                    deltas.push(ResponseDelta::Truncated(reason));
+                } else {
+                    deltas.push(ResponseDelta::Completed);
+                }
+                Ok(deltas)
+            }
             "response.failed" | "error" => {
                 let error = event
                     .pointer("/response/error/message")
@@ -601,10 +623,71 @@ mod tests {
             decoder
                 .parse(r#"{"type":"response.completed","response":{"usage":{"input_tokens":20,"total_tokens":35}}}"#)
                 .unwrap(),
-            vec![ResponseDelta::Usage(Usage {
-                prompt_tokens: 20,
-                total_tokens: 35,
-            })]
+            vec![
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 20,
+                    total_tokens: 35,
+                }),
+                ResponseDelta::Completed,
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_vllm_truncated_response_reported_as_completed() {
+        // vLLM reports a budget-exhausted response as
+        // `response.completed` with `incomplete_details` set, instead of
+        // the spec's `response.incomplete`. It must still surface as a
+        // truncation, or a reasoning-only cut-off stream masquerades as a
+        // finished answer.
+        let mut decoder = ResponsesDecoder::default();
+        assert_eq!(
+            decoder
+                .parse(r#"{"type":"response.completed","response":{"status":"completed","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":20,"total_tokens":35}}}"#)
+                .unwrap(),
+            vec![
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 20,
+                    total_tokens: 35,
+                }),
+                ResponseDelta::Truncated("max_output_tokens".into()),
+            ]
+        );
+        // An explicit null details is a clean finish.
+        assert_eq!(
+            decoder
+                .parse(r#"{"type":"response.completed","response":{"incomplete_details":null}}"#)
+                .unwrap(),
+            vec![ResponseDelta::Completed]
+        );
+    }
+
+    #[test]
+    fn decodes_incomplete_response_as_usage_and_truncation() {
+        let mut decoder = ResponsesDecoder::default();
+        let deltas = decoder
+            .parse(r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":20,"total_tokens":35}}}"#)
+            .unwrap();
+        assert!(deltas.contains(&ResponseDelta::Usage(Usage {
+            prompt_tokens: 20,
+            total_tokens: 35,
+        })));
+        assert_eq!(
+            deltas,
+            vec![
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 20,
+                    total_tokens: 35,
+                }),
+                ResponseDelta::Truncated("max_output_tokens".into()),
+            ]
+        );
+        // Without details the reason degrades gracefully.
+        assert_eq!(
+            decoder
+                .parse(r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#)
+                .unwrap(),
+            vec![ResponseDelta::Truncated("incomplete".into())]
         );
     }
 }

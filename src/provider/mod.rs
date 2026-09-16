@@ -17,6 +17,11 @@ pub type ResponseStream = Pin<Box<dyn Stream<Item = Result<ResponseDelta>> + Sen
 pub enum ResponseDelta {
     Reasoning(String),
     Text(String),
+    /// The response finished normally (final chunk / completed event).
+    Completed,
+    /// The response ran out of its output budget (e.g. the model's
+    /// reasoning consumed the shared `max_output_tokens` cap).
+    Truncated(String),
     Usage(Usage),
     OutputItem(serde_json::Value),
     ToolCall {
