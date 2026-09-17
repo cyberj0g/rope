@@ -35,7 +35,11 @@ impl ScriptedProvider {
     fn script(&self) -> Vec<ResponseDelta> {
         match self.scripts.lock().unwrap().pop_front() {
             Some(script) => script,
-            None => text_only("(Scripted responses are exhausted — the e2e scenario is complete.)"),
+            // The scripted conversation is position-based and finite; anything
+            // after it gets the catch-all. It is deliberately long so the
+            // regression scenarios have a stable running window to exercise
+            // steering, cancellation, and the composer controls mid-turn.
+            None => catchall(),
         }
     }
 
@@ -45,6 +49,7 @@ impl ScriptedProvider {
         use rope::runtime::Message;
         if let Some(Message::System { content }) = request.messages.first() {
             if content.contains("2-3 word title") {
+                eprintln!("[script] title request (no consume)");
                 return text_only("Scripted e2e session");
             }
         }
@@ -53,9 +58,17 @@ impl ScriptedProvider {
             Some(Message::User { images, .. } | Message::Steer { images, .. }) if !images.is_empty()
         );
         if has_image {
+            eprintln!("[script] image turn (no consume)");
             return text_only("I can see the image you attached — it came through end to end, and I'd frame the logo with a little more padding.");
         }
-        self.script()
+        let rest = self.scripts.lock().unwrap().len();
+        let script = self.script();
+        if rest == 0 {
+            eprintln!("[script] catch-all turn (queue exhausted)");
+        } else {
+            eprintln!("[script] consumed a scripted turn; {rest} left in queue");
+        }
+        script
     }
 }
 
@@ -69,6 +82,30 @@ fn streamed(text: &str) -> Vec<ResponseDelta> {
     for chunk in chars.chunks(10) {
         deltas.push(ResponseDelta::Text(chunk.iter().collect()));
     }
+    deltas
+}
+
+/// The long-running reply handed out for every turn once the scripted
+/// conversation is exhausted. About 3 seconds of streaming at DELTA_DELAY,
+/// which gives the mid-turn regression scenarios a stable window.
+fn catchall() -> Vec<ResponseDelta> {
+    let mut deltas = streamed(
+        "That's the scripted conversation. Anything else I'd answer with the same rendering, \
+         tools, and plans you just saw. I'm keeping this reply deliberately long on purpose \
+         because the e2e scenarios lean on a stable running window to exercise steering, \
+         cancellation, and the composer controls mid-turn. So consider this a steady, \
+         unhurried stream of words that stays in flight long enough for a steering message \
+         to be queued, for the cancel button to show up, and for an Escape from the focused \
+         composer to interrupt the turn cleanly. There is nothing remarkable in the prose \
+         itself; its only job is to hold the turn open while the driver pokes at the UI. \
+         By the time you reach this sentence the turn should still be generating, the phase \
+         should still read as active, and the turn id should still be present on the session \
+         state, which is exactly the state the regression checks are sampling for. If you are \
+         reading the tail end of this, then the window held as intended and the scenario can \
+         move on with confidence that the running turn behaved the way the driver expected.",
+    );
+    deltas.push(ResponseDelta::Usage(Usage { prompt_tokens: 1102, total_tokens: 1188 }));
+    deltas.push(ResponseDelta::Completed);
     deltas
 }
 
@@ -168,11 +205,6 @@ fn scripts() -> Vec<Vec<ResponseDelta>> {
         script(vec![
             streamed("Done — and I noted the steering message that arrived while I was working. The notes still land on the same three ideas."),
             vec![ResponseDelta::Usage(Usage { prompt_tokens: 1310, total_tokens: 1402 }), ResponseDelta::Completed],
-        ]),
-        // 9. Catch-all for any remaining turns.
-        script(vec![
-            streamed("That's the scripted conversation. Anything else I'd answer with the same rendering, tools, and plans you just saw."),
-            vec![ResponseDelta::Usage(Usage { prompt_tokens: 1102, total_tokens: 1188 }), ResponseDelta::Completed],
         ]),
     ]
 }

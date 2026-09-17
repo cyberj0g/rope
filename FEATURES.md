@@ -31,7 +31,7 @@
 - switching sessions or disconnecting leaves work running; late clients receive snapshots containing partial text, reasoning, tool arguments/output, queued steers, approval waits, timers, usage, and plans
 - sequenced session updates, bounded subscriptions with snapshot recovery on lag, and mutation reply deduplication across reconnects within a server lifetime
 - per-session shell jobs and browser contexts, project-bound session metadata, atomic metadata replacement, and exclusive session writer locks
-- loopback-default listener, server token authentication, explicit browser Origin allowlist, authenticated image upload/download, and a mobile-first web client served at `/` — conversation rendering, tools, thinking, plans, Git, approvals, steering with queued-steer badges, in-chat search, a session sidebar, and image/camera attachments
+- loopback-default listener, server token authentication, explicit browser Origin allowlist, authenticated image upload/download, and a mobile-first web client served at `/` — conversation rendering, tools, thinking, plans, Git, approvals, steering with queued-steer badges, in-chat search that survives editing and clears on close, a session sidebar, image/camera attachments whose plates spin only during the transfer, distinct Send/Steer and Cancel composer controls (Esc cancels even from the focused composer), tool results that render their published images and diffs, and a Git pane whose rows open per-file diffs
 - cancellable manual compaction and graceful process shutdown that preserves interrupted work and stops session tools
 - automatic sessions under `~/.local/share/harness/sessions`
 - persisted 2-3 word model-generated titles for automatically named sessions, created after the first completed response
