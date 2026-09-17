@@ -261,7 +261,8 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         if let Some(compaction) = compaction {
                             let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
                             session.meta.compaction_summary = Some(compaction.summary);
-                            session.meta.compacted_through = compaction.through;
+                            session.meta.compacted_through = compaction.through
+                                + usize::from(compaction.through > messages.len());
                             messages.push(marker.clone()); persisted.push(marker);
                         }
                         messages.extend(completed.clone()); persisted.extend(completed);
