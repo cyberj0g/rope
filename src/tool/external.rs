@@ -10,11 +10,12 @@ use super::{Tool, ToolResult};
 pub struct ExternalTool {
     name: String,
     path: PathBuf,
+    cwd: PathBuf,
 }
 
 impl ExternalTool {
-    pub fn new(name: String, path: PathBuf) -> Self {
-        Self { name, path }
+    pub fn new(name: String, path: PathBuf, cwd: PathBuf) -> Self {
+        Self { name, path, cwd }
     }
 }
 
@@ -33,6 +34,7 @@ impl Tool for ExternalTool {
     async fn run(&self, args: Value) -> Result<ToolResult> {
         let mut command = Command::new(&self.path);
         command
+            .current_dir(&self.cwd)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

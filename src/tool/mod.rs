@@ -176,7 +176,11 @@ impl ToolRegistry {
 }
 
 pub async fn discover(config: &Config) -> Result<ToolRegistry> {
-    let cwd = std::env::current_dir()?;
+    discover_at(config, &std::env::current_dir()?).await
+}
+
+pub async fn discover_at(config: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
+    let cwd = root.to_path_buf();
     let mut registry = ToolRegistry::default();
     registry.insert(ReadTool(cwd.clone()), config.tools.read);
     registry.insert(WriteTool(cwd.clone()), config.tools.write);
@@ -207,11 +211,12 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     if let Some(global) =
         directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("rope/tools"))
     {
-        add_external(&mut registry, global, config.tools.external).await?;
+        add_external(&mut registry, global, &cwd, config.tools.external).await?;
     }
     add_external(
         &mut registry,
         cwd.join(".rope/tools"),
+        &cwd,
         config.tools.external,
     )
     .await?;
@@ -236,6 +241,7 @@ fn add_web_tools(
 async fn add_external(
     registry: &mut ToolRegistry,
     directory: PathBuf,
+    cwd: &std::path::Path,
     approval: Approval,
 ) -> Result<()> {
     let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
@@ -253,7 +259,10 @@ async fn add_external(
         if name.is_empty() {
             bail!("external tool has an empty name");
         }
-        registry.insert(ExternalTool::new(name, entry.path()), approval);
+        registry.insert(
+            ExternalTool::new(name, entry.path(), cwd.to_path_buf()),
+            approval,
+        );
     }
     Ok(())
 }

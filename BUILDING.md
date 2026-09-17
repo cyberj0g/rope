@@ -25,8 +25,14 @@ and embeds it. Cargo never downloads dependencies from the network during the
 build itself.
 
 On the first browser tool call, Rope extracts the payload into its versioned user
-cache. Later launches reuse it. A temporary Chrome profile is shared by all web
-tool calls in one Rope process and removed during shutdown.
+cache. Later launches reuse it. Each loaded session lazily creates its own
+temporary Chrome profile, shared by that session's web tool calls and removed
+during shutdown. Shell-job managers are also scoped to sessions.
+
+The binary and library share the same core. `cargo test --locked` covers core
+concurrency, shared approvals, snapshots, request deduplication, transport
+authentication, attachments, and headless startup/shutdown. The integration
+tests use temporary projects and a controlled provider; they need no API key.
 
 Set `ROPE_BROWSER` to an external Chrome, Chromium, Brave, or Edge executable when
 automatic discovery is not sufficient. Developers can skip embedding and point

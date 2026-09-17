@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rope browser client</title>
+<style>
+body { max-width: 960px; margin: 2rem auto; padding: 0 1rem; font: 16px system-ui; color: #ddd; background: #17191d }
+input, select, textarea, button { font: inherit; color: inherit; background: #252a30; border: 1px solid #59616c; border-radius: 4px; padding: .5rem }
+header, nav, footer { display: flex; gap: .5rem; flex-wrap: wrap; margin: 1rem 0 }
+textarea { width: 100%; box-sizing: border-box; min-height: 6rem } pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.5 ui-monospace, monospace }
+#status { color: #b9c5d9 } #approval { padding: .8rem; background: #41391f } button { cursor: pointer }
+</style>
+<h1>Rope</h1><p>A minimal browser client for the shared core.</p>
+<header><input id="token" type="password" placeholder="Server token" autocomplete="off"><button id="connect">Connect</button></header>
+<p id="status">Disconnected</p>
+<nav><select id="sessions"><option value="">Choose a session</option></select><button id="new">New session</button><select id="models"></select><button id="compact">Compact</button><button id="cancel">Cancel turn</button></nav>
+<div id="approval" hidden><span id="approvalText"></span><button data-decision="allow_once">Allow once</button><button data-decision="allow_session">Allow for session</button><button data-decision="deny">Deny</button></div>
+<pre id="chat"></pre><textarea id="prompt" placeholder="Send a message, or steer a running turn"></textarea>
+<footer><input id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp"><button id="send">Send</button></footer>
+<script>
+const $ = id => document.getElementById(id);
+let socket, token, clientId, serverId, requestId = 0, selected = '', snapshot, reconnect, renderPending = false;
+const pending = new Map(), chunks = new Map();
+function notice(text) { $('status').textContent = text; }
+function request(value, done = () => {}) {
+  if (socket?.readyState !== WebSocket.OPEN || !clientId) { notice('Connect first'); return; }
+  const id = String(++requestId); pending.set(id, done); socket.send(JSON.stringify({request_id: id, ...value}));
+}
+function command(action, done) { if (selected) request({type: 'command', session_id: selected, action}, done); }
+function select(id) {
+  if (selected && selected !== id) request({type: 'unsubscribe', session_id: selected});
+  selected = id; snapshot = undefined; $('sessions').value = id;
+  if (id) request({type: 'subscribe', session_id: id}); render();
+}
+function connect() {
+  clearTimeout(reconnect);
+  if (socket) { socket.onclose = null; socket.close(); }
+  chunks.clear();
+  socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`);
+  socket.onopen = () => socket.send(JSON.stringify({protocol: 1, token, client_id: clientId || null, server_id: serverId || null}));
+  socket.onmessage = event => receive(JSON.parse(event.data));
+  socket.onerror = () => notice('Connection failed');
+  socket.onclose = () => {
+    const uncertain = pending.size > 0; pending.clear(); $('send').disabled = false;
+    notice(uncertain ? 'Disconnected; an action may have been accepted. Reconnecting without resending it.' : 'Disconnected; reconnecting…');
+    reconnect = setTimeout(connect, 1500);
+  };
+}
+function receive(message) {
+  if (message.type === 'chunk') {
+    const parts = chunks.get(message.id) || [];
+    if (message.index !== parts.length) { socket.close(); return; }
+    parts.push(message.data); chunks.set(message.id, parts); return;
+  }
+  if (message.type === 'chunk_end') {
+    const parts = chunks.get(message.id); chunks.delete(message.id);
+    if (!parts || parts.length !== message.count) { socket.close(); return; }
+    receive(JSON.parse(parts.join(''))); return;
+  }
+  switch (message.type) {
+    case 'hello':
+      clientId = message.client_id; serverId = message.server_id;
+      $('models').replaceChildren(...message.models.map(model => new Option(model.name, model.name)));
+      notice(`Connected · ${message.project_root}`);
+      if (selected) request({type: 'subscribe', session_id: selected}); break;
+    case 'catalog':
+      $('sessions').replaceChildren(new Option('Choose a session', ''), ...message.catalog.sessions.map(session => new Option(`${session.title || session.name} · ${session.activity}`, session.name)));
+      $('sessions').value = selected; break;
+    case 'snapshot': if (message.snapshot.session_id === selected) { snapshot = message.snapshot; render(); } break;
+    case 'event': {
+      const update = message.update;
+      if (!snapshot || update.session_id !== selected || update.seq <= snapshot.seq) break;
+      if (update.seq !== snapshot.seq + 1) { request({type: 'subscribe', session_id: selected}); break; }
+      for (const change of update.changes) {
+        if (change.type === 'insert') {
+          const index = change.before ? snapshot.blocks.findIndex(block => block.id === change.before) : -1;
+          snapshot.blocks.splice(index < 0 ? snapshot.blocks.length : index, 0, change.block);
+        } else if (change.type === 'replace') {
+          const index = snapshot.blocks.findIndex(block => block.id === change.block.id);
+          if (index >= 0) snapshot.blocks[index] = change.block;
+        } else if (change.type === 'append') {
+          const block = snapshot.blocks.find(block => block.id === change.block_id);
+          if (block) {
+            if (change.field === 'content') block.content += change.text;
+            else block.tool[change.field] = (block.tool[change.field] || '') + change.text;
+          }
+        } else if (change.type === 'state') snapshot.state = change.state;
+        else if (change.type === 'plan') snapshot.plan = change.plan;
+        else if (change.type === 'project') snapshot.project = change.project;
+      }
+      snapshot.seq = update.seq; render(); break;
+    }
+    case 'resync_required': if (message.session_id === selected) request({type: 'subscribe', session_id: selected}); break;
+    case 'reply': {
+      const done = pending.get(message.request_id); pending.delete(message.request_id);
+      if (message.error) notice(`${message.error.code}: ${message.error.message}`);
+      done?.(message.result, message.error); break;
+    }
+    case 'error':
+      notice(`${message.code}: ${message.message}`);
+      if (message.code === 'expired_client') { clientId = undefined; serverId = undefined; }
+      if (message.code === 'unauthorized') { socket.onclose = null; socket.close(); } break;
+  }
+}
+function render() {
+  if (renderPending) return; renderPending = true;
+  requestAnimationFrame(() => {
+    renderPending = false;
+    $('chat').textContent = (snapshot?.blocks || []).map(block => {
+      if (block.tool) return `${block.tool.name} [${block.tool.status}]\n${block.tool.arguments}\n${block.tool.output || ''}`;
+      return `${block.kind}${block.queued ? ' [queued]' : ''}\n${block.content}${block.summary ? '\n' + block.summary : ''}`;
+    }).join('\n\n');
+    const state = snapshot?.state;
+    if (state) { notice(`${state.title} · ${state.phase} · ${state.total_tokens} tokens${state.notice ? ' · ' + state.notice : ''}`); $('models').value = state.model; }
+    $('approval').hidden = !state?.approval;
+    $('approvalText').textContent = state?.approval ? `${state.approval.call.name}: ${JSON.stringify(state.approval.call.arguments)} ` : '';
+  });
+}
+$('connect').onclick = () => { token = $('token').value; clientId = undefined; serverId = undefined; connect(); };
+$('sessions').onchange = () => select($('sessions').value);
+$('new').onclick = () => request({type: 'create_session', name: null}, (result, error) => { if (!error) select(result.session_id); });
+$('models').onchange = () => { if (snapshot) command({type: 'set_model', model: $('models').value, revision: snapshot.state.settings_revision}); };
+$('compact').onclick = () => command({type: 'compact'});
+$('cancel').onclick = () => { if (snapshot?.state.turn_id) command({type: 'cancel', turn_id: snapshot.state.turn_id}); };
+document.querySelectorAll('[data-decision]').forEach(button => button.onclick = () => {
+  const state = snapshot?.state;
+  if (state?.approval) command({type: 'approve', turn_id: state.turn_id, approval_id: state.approval.id, decision: button.dataset.decision});
+});
+$('send').onclick = async () => {
+  if (!selected || socket?.readyState !== WebSocket.OPEN) return;
+  $('send').disabled = true;
+  try {
+    const attachments = [], file = $('file').files[0], content = $('prompt').value, session = selected;
+    if (file) {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session)}/attachments`, {method: 'POST', headers: {Authorization: `Bearer ${token}`}, body: file});
+      if (!response.ok) throw new Error(await response.text()); attachments.push((await response.json()).path);
+    }
+    request({type: 'command', session_id: session, action: {type: 'send_message', content, attachments}}, (_, error) => {
+      $('send').disabled = false;
+      if (!error && $('prompt').value === content && selected === session) { $('prompt').value = ''; $('file').value = ''; }
+    });
+  } catch (error) { $('send').disabled = false; notice(error.message); }
+};
+</script>
+</html>

@@ -143,6 +143,12 @@ pub enum ChatBlock {
 }
 
 pub struct UiState {
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub approval_id: Option<String>,
+    pub settings_revision: u64,
+    pub session_catalog: Vec<crate::session::SessionInfo>,
+    block_ids: Vec<String>,
     pub input: String,
     pub blocks: Vec<ChatBlock>,
     /// Content revision per block, parallel to `blocks`. Bumped whenever a
@@ -315,6 +321,12 @@ struct InputImage {
 impl UiState {
     pub fn new() -> Self {
         Self {
+            session_id: String::new(),
+            turn_id: None,
+            approval_id: None,
+            settings_revision: 0,
+            session_catalog: Vec::new(),
+            block_ids: Vec::new(),
             input: String::new(),
             blocks: Vec::new(),
             generating: false,
@@ -471,7 +483,6 @@ impl UiState {
         self.clear_input_selection();
     }
 
-    #[cfg(test)]
     pub fn insert_image(&mut self, image: ImageContent) {
         let id = self.begin_image_load("Processing image");
         self.finish_image_load(id, image);
@@ -1098,6 +1109,99 @@ impl UiState {
 
     pub fn apply(&mut self, event: Event) {
         match event {
+            Event::Update(update) => {
+                self.apply(update.event.clone());
+                for change in &update.changes {
+                    if let crate::core::state::Change::Insert { before, block } = change {
+                        let index = before
+                            .as_ref()
+                            .and_then(|id| self.block_ids.iter().position(|item| item == id))
+                            .unwrap_or(self.block_ids.len());
+                        self.block_ids.insert(index, block.id.clone());
+                    }
+                }
+            }
+            Event::Snapshot(snapshot) => self.set_snapshot(*snapshot),
+            Event::Catalog(sessions) => {
+                self.session_catalog = sessions;
+                if let Some(picker) = &mut self.session_picker {
+                    let selected = picker
+                        .sessions
+                        .get(picker.selected)
+                        .map(|session| session.name.clone());
+                    picker.sessions = self.session_catalog.clone();
+                    picker.selected = selected
+                        .and_then(|name| {
+                            picker
+                                .sessions
+                                .iter()
+                                .position(|session| session.name == name)
+                        })
+                        .unwrap_or(0);
+                }
+            }
+            Event::OperationStarted { id, compacting } => {
+                self.turn_id = Some(id);
+                if compacting {
+                    self.generating = true;
+                    self.notice = Some("compacting context".into());
+                }
+            }
+            Event::SettingsRevision(revision) => self.settings_revision = revision,
+            Event::MessageAccepted(Message::User { content, images }) => {
+                self.push_user_with_images(content, images)
+            }
+            Event::MessageAccepted(Message::Steer { content, images }) => {
+                self.push_steer_with_images(content, images)
+            }
+            Event::ApprovalResolved { tool, decision, .. } => {
+                self.approval = None;
+                self.approval_id = None;
+                let content = match decision {
+                    crate::runtime::ApprovalDecision::AllowOnce => {
+                        format!("Tool approved: {tool} · once")
+                    }
+                    crate::runtime::ApprovalDecision::AllowSession => {
+                        format!("Tool approved: {tool} · session")
+                    }
+                    crate::runtime::ApprovalDecision::Deny => format!("Tool denied: {tool}"),
+                };
+                self.push_block(ChatBlock::Message {
+                    label: "System".into(),
+                    content,
+                    images: Vec::new(),
+                    model: String::new(),
+                    kind: MessageKind::System,
+                    expanded: true,
+                    summary: None,
+                });
+            }
+            Event::Notice(notice) => self.notice = Some(notice),
+            Event::PromptRejected(prompt, error) => {
+                if self.input.is_empty() && !self.has_input_images() {
+                    self.set_input(prompt.content);
+                    for image in prompt.images {
+                        self.insert_image(image);
+                    }
+                } else {
+                    self.insert_paste(&format!("\n{}", prompt.content), usize::MAX);
+                    for image in prompt.images {
+                        self.insert_image(image);
+                    }
+                }
+                self.notice = Some(error);
+            }
+            Event::Diff { path, content } => {
+                self.project.git_diff_path = path;
+                self.project.git_diff = content;
+                self.diff_generation = self.diff_generation.wrapping_add(1);
+            }
+            Event::Ready
+            | Event::Barrier(_)
+            | Event::RefreshProject
+            | Event::SteersDelivered(_)
+            | Event::ToolImage { .. }
+            | Event::MessageAccepted(_) => {}
             Event::History(messages) => self.set_history(messages),
             Event::SessionChanged(session) => self.session = session,
             Event::UsageChanged {
@@ -1119,7 +1223,9 @@ impl UiState {
                 self.reasoning_effort = reasoning_effort;
             }
             Event::ProjectChanged(project) => {
-                self.project = project;
+                self.project.cwd = project.cwd;
+                self.project.git_available = project.git_available;
+                self.project.git_files = project.git_files;
                 self.diff_generation = self.diff_generation.wrapping_add(1);
             }
             Event::PlanChanged(plan) => {
@@ -1293,7 +1399,8 @@ impl UiState {
                 }
                 self.mark_assistant_status();
             }
-            Event::ApprovalRequested(call) => {
+            Event::ApprovalRequested { approval_id, call } => {
+                self.approval_id = Some(approval_id);
                 for block in self.tool_calls.values().copied() {
                     if let ChatBlock::Tool {
                         status: ToolStatus::Streaming | ToolStatus::Pending,
@@ -1387,8 +1494,7 @@ impl UiState {
                     summary: Some(summary),
                 };
                 let index = if self.generating {
-                    self
-                        .blocks
+                    self.blocks
                         .iter()
                         .rposition(|block| {
                             matches!(
@@ -1417,6 +1523,8 @@ impl UiState {
                 }
             }
             Event::GenerationFinished => {
+                self.turn_id = None;
+                self.approval_id = None;
                 self.finish_reasoning();
                 if !self.reported_generation_duration.is_zero() {
                     self.average_generation_speed = Some(
@@ -1435,6 +1543,8 @@ impl UiState {
                 self.reported_output_tokens = 0;
             }
             Event::GenerationCancelled => {
+                self.turn_id = None;
+                self.approval_id = None;
                 self.finish_reasoning();
                 let mut changed = Vec::new();
                 for (index, block) in self.blocks.iter_mut().enumerate() {
@@ -1490,6 +1600,8 @@ impl UiState {
                 self.reported_output_tokens = 0;
             }
             Event::Error(error) => {
+                self.turn_id = None;
+                self.approval_id = None;
                 self.finish_reasoning();
                 self.generating = false;
                 self.connecting = false;
@@ -1503,6 +1615,156 @@ impl UiState {
                 self.notice = None;
                 self.set_error(error);
             }
+        }
+    }
+
+    fn set_snapshot(&mut self, snapshot: crate::core::state::Snapshot) {
+        use crate::core::state::{BlockKind, ToolStatus as Status};
+        let same_session = self.session_id == snapshot.session_id;
+        let expanded = self
+            .block_ids
+            .iter()
+            .zip(&self.blocks)
+            .map(|(id, block)| {
+                let expanded = match block {
+                    ChatBlock::Message { expanded, .. }
+                    | ChatBlock::Thinking { expanded, .. }
+                    | ChatBlock::Tool { expanded, .. } => *expanded,
+                };
+                (id.clone(), expanded)
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.blocks.clear();
+        self.block_ids.clear();
+        self.render_revisions.clear();
+        self.tool_calls.clear();
+        self.tool_drafts.clear();
+        self.layout_generation = self.layout_generation.wrapping_add(1);
+        for block in &snapshot.blocks {
+            let saved = same_session
+                .then(|| expanded.get(&block.id).copied())
+                .flatten();
+            let elapsed = Elapsed {
+                started: block.timer.running().then(Instant::now),
+                duration: (block.timer.running() || !block.timer.value().is_zero())
+                    .then(|| block.timer.value()),
+            };
+            let rendered = match block.kind {
+                BlockKind::Thinking => ChatBlock::Thinking {
+                    content: block.content.clone(),
+                    expanded: saved.unwrap_or(self.thinking_expanded),
+                    elapsed,
+                },
+                BlockKind::Tool => {
+                    let tool = block.tool.as_ref().unwrap();
+                    let mut counter = ToolCounter::default();
+                    counter.push(&tool.arguments);
+                    if let Some(output) = &tool.output {
+                        counter.push(output);
+                    }
+                    if let Some(id) = &tool.call_id {
+                        self.tool_calls.insert(id.clone(), self.blocks.len());
+                    }
+                    ChatBlock::Tool {
+                        call_id: tool.call_id.clone(),
+                        name: tool.name.clone(),
+                        arguments: tool.arguments.clone(),
+                        output: tool.output.clone(),
+                        diff: tool.diff.clone(),
+                        status: match tool.status {
+                            Status::Streaming => ToolStatus::Streaming,
+                            Status::Pending => ToolStatus::Pending,
+                            Status::WaitingApproval => ToolStatus::WaitingApproval,
+                            Status::Running => ToolStatus::Running,
+                            Status::Done => ToolStatus::Done,
+                            Status::Failed => ToolStatus::Failed,
+                        },
+                        counter,
+                        elapsed,
+                        expanded: saved.unwrap_or(self.tools_expanded),
+                    }
+                }
+                kind => {
+                    let (label, kind) = match kind {
+                        BlockKind::User => ("You", MessageKind::User),
+                        BlockKind::Steer => ("Steer", MessageKind::Steer),
+                        BlockKind::Assistant => ("Assistant", MessageKind::Assistant),
+                        BlockKind::Status => ("Status", MessageKind::Status),
+                        BlockKind::Error => ("Error", MessageKind::Error),
+                        _ => ("System", MessageKind::System),
+                    };
+                    ChatBlock::Message {
+                        label: label.into(),
+                        kind,
+                        content: block.content.clone(),
+                        model: block.model.clone(),
+                        images: block.images.clone(),
+                        summary: block.summary.clone(),
+                        expanded: saved.unwrap_or(block.summary.is_none()),
+                    }
+                }
+            };
+            self.push_block(rendered);
+            self.block_ids.push(block.id.clone());
+        }
+        self.assistant = snapshot
+            .assistant_id
+            .and_then(|id| self.block_ids.iter().position(|value| *value == id));
+        self.reasoning = snapshot
+            .reasoning_id
+            .and_then(|id| self.block_ids.iter().position(|value| *value == id));
+        for (draft, id) in snapshot.drafts {
+            if let Some(index) = self.block_ids.iter().position(|value| *value == id) {
+                self.tool_drafts.insert(draft, index);
+            }
+        }
+        let state = snapshot.state;
+        self.session_id = snapshot.session_id;
+        self.session = state.title;
+        self.turn_id = state.turn_id;
+        self.generating = self.turn_id.is_some();
+        self.connecting = matches!(state.phase.as_str(), "connecting" | "retrying");
+        self.waiting = state.phase == "waiting";
+        self.tool_running = state.phase == "tool";
+        self.model = state.model;
+        self.response_model = state.response_model;
+        self.reasoning_effort = state.reasoning_effort;
+        self.settings_revision = state.settings_revision;
+        self.total_tokens = state.total_tokens;
+        self.total_cost = state.total_cost;
+        self.context_tokens = state.context_tokens;
+        self.max_context_tokens = state.max_context_tokens;
+        self.approval_id = state.approval.as_ref().map(|approval| approval.id.clone());
+        self.approval = state.approval.map(|approval| approval.call);
+        self.error = state.error;
+        self.notice = state.notice;
+        self.reported_output_tokens = state.output_tokens;
+        self.reported_generation_duration = Duration::from_millis(state.generation_ms);
+        self.average_generation_speed = (state.generation_ms > 0)
+            .then(|| state.output_tokens as f64 * 1000.0 / state.generation_ms as f64);
+        self.generation_started = None;
+        self.generated_bytes = 0;
+        self.plan = snapshot.plan;
+        if self.plan.is_some() {
+            self.plan_panel = true;
+        }
+        let diff = same_session.then(|| {
+            (
+                self.project.git_diff_path.clone(),
+                self.project.git_diff.clone(),
+            )
+        });
+        self.project = snapshot.project;
+        if let Some((path, content)) = diff {
+            self.project.git_diff_path = path;
+            self.project.git_diff = content;
+        }
+        self.diff_generation = self.diff_generation.wrapping_add(1);
+        if !same_session {
+            self.scroll = 0;
+            self.selected = None;
+            self.git_fullscreen_diff = false;
+            self.search = None;
         }
     }
 
@@ -1741,8 +2003,7 @@ fn collapsible(block: &ChatBlock) -> bool {
     matches!(
         block,
         ChatBlock::Message {
-            kind:
-                MessageKind::User
+            kind: MessageKind::User
                 | MessageKind::Steer
                 | MessageKind::Assistant
                 | MessageKind::Status,
@@ -1799,6 +2060,92 @@ fn next_word_start(text: &str, cursor: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_restores_live_tool_drafts_and_compaction_insertions() {
+        use crate::core::state::Projection;
+        let mut projection = Projection::new("shared".into());
+        for event in [
+            Event::MessageAccepted(Message::user("work".into())),
+            Event::OperationStarted {
+                id: "turn".into(),
+                compacting: false,
+            },
+            Event::GenerationStarted,
+            Event::ModelRequestStarted("model".into()),
+            Event::ReasoningDelta("thinking".into()),
+            Event::TextDelta("checking".into()),
+            Event::ToolCallDelta {
+                index: 0,
+                name: Some("shell".into()),
+                arguments: "{\"command\":".into(),
+            },
+        ] {
+            projection.apply(&event);
+        }
+        let mut state = UiState::new();
+        state.apply(Event::Snapshot(Box::new(projection.snapshot())));
+        state.project.git_diff_path = Some("file.rs".into());
+        state.project.git_diff = "local diff".into();
+        state.apply(Event::Snapshot(Box::new(projection.snapshot())));
+        assert_eq!(state.project.git_diff, "local diff");
+        assert!(state.generating);
+        let call = ToolCall {
+            id: "call".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command":"pwd"}),
+        };
+        for event in [
+            Event::ToolCallDelta {
+                index: 0,
+                name: None,
+                arguments: "\"pwd\"}".into(),
+            },
+            Event::ToolCallFinished { index: 0, call },
+            Event::ContextCompacted {
+                summary: "summary".into(),
+            },
+            Event::ToolStarted {
+                call_id: "call".into(),
+            },
+            Event::ToolOutputDelta {
+                call_id: "call".into(),
+                delta: "/project".into(),
+            },
+        ] {
+            let changes = projection.apply(&event);
+            state.apply(Event::Update(std::sync::Arc::new(crate::core::Update {
+                session_id: "shared".into(),
+                seq: projection.snapshot.seq,
+                changes,
+                event,
+            })));
+        }
+        assert_eq!(state.blocks.len(), projection.snapshot.blocks.len());
+        assert_eq!(
+            state.block_ids,
+            projection
+                .snapshot
+                .blocks
+                .iter()
+                .map(|block| block.id.clone())
+                .collect::<Vec<_>>()
+        );
+        let index = state.tool_calls["call"];
+        assert!(
+            matches!(&state.blocks[index], ChatBlock::Tool { arguments, output, status: ToolStatus::Running, .. }
+            if arguments.contains("pwd") && output.as_deref() == Some("/project"))
+        );
+        state.apply(Event::Snapshot(Box::new(projection.snapshot())));
+        state.apply(Event::ToolOutputDelta {
+            call_id: "call".into(),
+            delta: "\nnext".into(),
+        });
+        assert!(
+            matches!(&state.blocks[state.tool_calls["call"]], ChatBlock::Tool { output, .. }
+            if output.as_deref() == Some("/project\nnext"))
+        );
+    }
     use ratatui::style::Color;
     use serde_json::json;
 
@@ -2193,11 +2540,14 @@ mod tests {
             ChatBlock::Tool { counter, .. }
                 if counter.label() == format!("{} chars", arguments.chars().count())
         ));
-        state.apply(Event::ApprovalRequested(ToolCall {
-            id: "call_1".into(),
-            name: "read".into(),
-            arguments: json!({ "path": "src/main.rs" }),
-        }));
+        state.apply(Event::ApprovalRequested {
+            approval_id: "approval".into(),
+            call: ToolCall {
+                id: "call_1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+        });
         assert!(matches!(
             &state.blocks[0],
             ChatBlock::Tool {
@@ -2313,7 +2663,12 @@ mod tests {
                 }],
             ),
             Message::tool("call_1".into(), "contents".into(), None, None),
-            Message::assistant("All done.".into(), "test-model".into(), String::new(), vec![]),
+            Message::assistant(
+                "All done.".into(),
+                "test-model".into(),
+                String::new(),
+                vec![],
+            ),
         ]));
 
         // Blocks: you, status, tool, assistant.
@@ -2460,11 +2815,14 @@ mod tests {
             });
         }
 
-        state.apply(Event::ApprovalRequested(ToolCall {
-            id: "call_0".into(),
-            name: "read".into(),
-            arguments: json!({}),
-        }));
+        state.apply(Event::ApprovalRequested {
+            approval_id: "approval".into(),
+            call: ToolCall {
+                id: "call_0".into(),
+                name: "read".into(),
+                arguments: json!({}),
+            },
+        });
 
         assert!(matches!(
             &state.blocks[0],

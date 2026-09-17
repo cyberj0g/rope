@@ -46,10 +46,8 @@ impl PromptHistory {
     #[cfg(test)]
     pub fn empty() -> Self {
         Self {
-            path: std::env::temp_dir().join(format!(
-                "rope-test-prompt-history-{}",
-                std::process::id()
-            )),
+            path: std::env::temp_dir()
+                .join(format!("rope-test-prompt-history-{}", std::process::id())),
             entries: Vec::new(),
             index: None,
             draft: String::new(),

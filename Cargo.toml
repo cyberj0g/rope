@@ -8,6 +8,7 @@ build = "build.rs"
 anyhow = "1"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
@@ -30,9 +31,13 @@ serde_json = "1"
 similar = "2"
 tar = "0.4"
 tempfile = "3"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.9"
 url = "2.5"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
 
 [build-dependencies]
 sha2 = "0.10"

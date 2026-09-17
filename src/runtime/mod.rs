@@ -1,4 +1,8 @@
+mod actor;
 mod message;
+#[cfg(test)]
+use actor::run;
+pub use actor::spawn_session;
 
 use std::{
     collections::HashSet,
@@ -16,7 +20,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{Config, Startup},
+    config::Config,
     project::ProjectState,
     provider::{Provider, ResponseDelta, Usage},
     session::{Session, SessionMeta},
@@ -106,6 +110,7 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
 }
 
+#[derive(Clone, Debug)]
 pub struct UserPrompt {
     pub content: String,
     pub images: Vec<ImageContent>,
@@ -118,7 +123,8 @@ impl UserPrompt {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     AllowOnce,
     AllowSession,
@@ -126,6 +132,13 @@ pub enum ApprovalDecision {
 }
 
 pub enum Command {
+    Request {
+        action: crate::protocol::Action,
+        images: Vec<ImageContent>,
+        reply: oneshot::Sender<crate::protocol::Result<crate::protocol::Accepted>>,
+        published: oneshot::Sender<()>,
+    },
+    SetReasoning(Option<ReasoningEffort>),
     Submit(UserPrompt),
     /// A prompt sent while a turn is in progress. Queued for injection at
     /// the turn's next model request; if the turn already finished it
@@ -133,24 +146,50 @@ pub enum Command {
     Steer(UserPrompt),
     Cancel,
     Approve(ApprovalDecision),
-    NewSession(Option<String>),
-    ResumeSession(String),
     SelectModel(String),
-    NextReasoningEffort,
     /// Manually compacts the idle conversation into a continuation summary.
     Compact,
-    RememberCommand(String),
-    GitDiff(Option<std::path::PathBuf>),
     Shutdown(oneshot::Sender<SessionSummary>),
 }
 
+#[derive(Clone, Debug, Serialize)]
 pub struct SessionSummary {
+    pub error: Option<String>,
     pub name: String,
     pub total_tokens: u64,
     pub total_cost: Option<f64>,
 }
 
+#[derive(Clone, Debug)]
 pub enum Event {
+    Barrier(Arc<Mutex<Option<oneshot::Sender<()>>>>),
+    Update(Arc<crate::core::Update>),
+    PromptRejected(UserPrompt, String),
+    RefreshProject,
+    Ready,
+    Snapshot(Box<crate::core::state::Snapshot>),
+    Catalog(Vec<crate::session::SessionInfo>),
+    Notice(String),
+    Diff {
+        path: Option<std::path::PathBuf>,
+        content: String,
+    },
+    MessageAccepted(Message),
+    SteersDelivered(usize),
+    OperationStarted {
+        id: String,
+        compacting: bool,
+    },
+    SettingsRevision(u64),
+    ApprovalResolved {
+        approval_id: String,
+        tool: String,
+        decision: ApprovalDecision,
+    },
+    ToolImage {
+        call_id: String,
+        image: ImageContent,
+    },
     History(Vec<Message>),
     SessionChanged(String),
     UsageChanged {
@@ -189,7 +228,10 @@ pub enum Event {
     ToolStarted {
         call_id: String,
     },
-    ApprovalRequested(ToolCall),
+    ApprovalRequested {
+        approval_id: String,
+        call: ToolCall,
+    },
     ToolOutputDelta {
         call_id: String,
         delta: String,
@@ -213,6 +255,12 @@ pub enum Event {
 }
 
 enum InternalEvent {
+    Scoped {
+        id: String,
+        event: Box<InternalEvent>,
+    },
+    Visible(Event),
+    Compacted(Result<String, String>),
     Finished(TurnResult),
     Failed(String),
     Usage(Usage),
@@ -222,42 +270,7 @@ enum InternalEvent {
         call: ToolCall,
         reply: oneshot::Sender<ApprovalDecision>,
     },
-    ProjectChanged(ProjectState),
     ProjectRefresh,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ProjectRequest {
-    Refresh,
-    Diff(Option<std::path::PathBuf>),
-}
-
-/// Serializes git-backed project work: at most one task runs at a time.
-/// A request that arrives while a task is in flight replaces the stored
-/// pending request, so bursts of requests coalesce into a single follow-up run.
-#[derive(Default)]
-struct ProjectRequests {
-    in_flight: bool,
-    pending: Option<ProjectRequest>,
-}
-
-impl ProjectRequests {
-    /// Returns the request to run now, or stores it if one is already in flight.
-    fn request(&mut self, request: ProjectRequest) -> Option<ProjectRequest> {
-        if self.in_flight {
-            self.pending = Some(request);
-            None
-        } else {
-            self.in_flight = true;
-            Some(request)
-        }
-    }
-
-    /// Called after the in-flight task reports its result; returns the follow-up, if any.
-    fn completed(&mut self) -> Option<ProjectRequest> {
-        self.in_flight = false;
-        self.pending.take()
-    }
 }
 
 struct TurnResult {
@@ -284,6 +297,7 @@ type TurnProgressHandle = Arc<Mutex<TurnProgress>>;
 
 /// One active generation: the agent task and the progress it publishes.
 struct ActiveTurn {
+    id: String,
     task: JoinHandle<()>,
     progress: TurnProgressHandle,
 }
@@ -295,372 +309,9 @@ struct Compaction {
 }
 
 struct PendingApproval {
+    id: String,
     tool: String,
     reply: oneshot::Sender<ApprovalDecision>,
-}
-
-pub async fn spawn<P: Provider>(
-    config: Config,
-    startup: Startup,
-    provider: P,
-    tools: ToolRegistry,
-) -> Result<(mpsc::Sender<Command>, mpsc::Receiver<Event>)> {
-    let (session, messages) = Session::open(startup).await?;
-    let project = ProjectState::new().await?;
-    let (command_tx, command_rx) = mpsc::channel(16);
-    let (event_tx, event_rx) = mpsc::channel(64);
-    tokio::spawn(run(
-        config,
-        Arc::new(provider),
-        tools,
-        session,
-        messages,
-        project,
-        command_rx,
-        event_tx,
-    ));
-    Ok((command_tx, event_rx))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run<P: Provider>(
-    mut config: Config,
-    provider: Arc<P>,
-    tools: ToolRegistry,
-    mut session: Session,
-    mut messages: Vec<Message>,
-    mut project: ProjectState,
-    mut commands: mpsc::Receiver<Command>,
-    events: mpsc::Sender<Event>,
-) {
-    let (internal_tx, mut internal_rx) = mpsc::channel(8);
-    let mut generation: Option<ActiveTurn> = None;
-    let mut pending_approval: Option<PendingApproval> = None;
-    let mut project_requests = ProjectRequests::default();
-    // Steering prompts queued for the active turn. The turn's agent drains
-    // them into the conversation at each model request; whatever is left
-    // when the turn ends never reached the model and is resubmitted.
-    let mut pending_prompts: SteerQueue = Arc::new(Mutex::new(Vec::new()));
-
-    events.send(Event::History(messages.clone())).await.ok();
-    events
-        .send(Event::SessionChanged(session.display_name().to_owned()))
-        .await
-        .ok();
-    send_usage(&events, &session).await;
-    send_settings(&events, &config).await;
-    send_context(&events, &session, &config).await;
-    events
-        .send(Event::ProjectChanged(project.clone()))
-        .await
-        .ok();
-    events
-        .send(Event::PlanChanged(session.meta.plan.clone()))
-        .await
-        .ok();
-
-    loop {
-        tokio::select! {
-            Some(command) = commands.recv() => match command {
-                Command::Submit(prompt) if generation.is_none()
-                    => spawn_turn(
-                        &mut generation,
-                        &mut pending_prompts,
-                        &mut messages,
-                        &mut session,
-                        &project,
-                        &provider,
-                        &tools,
-                        &config,
-                        Message::user_with_images(prompt.content, prompt.images),
-                        &events,
-                        &internal_tx,
-                    )
-                    .await,
-                Command::Submit(_) => {}
-                // A steer arriving with no active turn is just a prompt:
-                // it starts a fresh turn, and keeps its Steer identity in
-                // history, as the UI rendered it.
-                Command::Steer(prompt) if generation.is_none() => {
-                    spawn_turn(
-                        &mut generation,
-                        &mut pending_prompts,
-                        &mut messages,
-                        &mut session,
-                        &project,
-                        &provider,
-                        &tools,
-                        &config,
-                        prompt.steer_message(),
-                        &events,
-                        &internal_tx,
-                    )
-                    .await;
-                }
-                Command::Steer(prompt) => {
-                    pending_prompts.lock().unwrap().push(prompt);
-                }
-                Command::Cancel => {
-                    if let Some(active) = generation.take() {
-                        active.task.abort();
-                        // Let the aborted generation fully unwind before
-                        // cancelling tools, so a shell job cannot be
-                        // registered after cancellation began.
-                        active.task.await.ok();
-                        tools.cancel_active().await;
-                        pending_approval = None;
-                        // Persist the work the interrupted turn already
-                        // completed, with the cancellation marker, so
-                        // the next turn continues from the real state of
-                        // the conversation instead of from before it.
-                        let saved = persist_interrupted_turn(
-                            &mut messages,
-                            &mut session,
-                            active.progress,
-                            &pending_prompts,
-                        )
-                        .await;
-                        events.send(Event::GenerationCancelled).await.ok();
-                        if let Err(error) = saved {
-                            events.send(Event::Error(format!("save cancelled turn: {error:#}"))).await.ok();
-                        }
-                        request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
-                    }
-                }
-                Command::Approve(decision) => {
-                    if let Some(pending) = pending_approval.take() {
-                        if decision == ApprovalDecision::AllowSession
-                            && !session.meta.approved_tools.contains(&pending.tool)
-                        {
-                            session.meta.approved_tools.push(pending.tool.clone());
-                            if let Err(error) = session.save().await {
-                                events.send(Event::Error(format!("save session approval: {error:#}"))).await.ok();
-                            }
-                        }
-                        pending.reply.send(decision).ok();
-                    }
-                }
-                Command::NewSession(name) if generation.is_none() => match Session::new_named(name).await {
-                    Ok(new_session) => {
-                        session = new_session; messages.clear();
-                        events.send(Event::History(Vec::new())).await.ok();
-                        events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
-                        send_usage(&events, &session).await;
-                        events.send(Event::PlanChanged(None)).await.ok();
-                        send_context(&events, &session, &config).await;
-                    }
-                    Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
-                }
-                Command::ResumeSession(name)
-                    if generation.is_none() && name != session.meta.name =>
-                {
-                    match Session::resume(&name).await {
-                        Ok((loaded_session, loaded_messages)) => {
-                            session = loaded_session; messages = loaded_messages;
-                            events.send(Event::History(messages.clone())).await.ok();
-                            events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
-                            send_usage(&events, &session).await;
-                            events.send(Event::PlanChanged(session.meta.plan.clone())).await.ok();
-                            send_context(&events, &session, &config).await;
-                        }
-                        Err(error) => { events.send(Event::Error(format!("{error:#}"))).await.ok(); }
-                    }
-                }
-                Command::SelectModel(model) if generation.is_none() => match config.set_model(&model) {
-                    Ok(()) => {
-                        send_settings(&events, &config).await;
-                        send_context(&events, &session, &config).await;
-                    },
-                    Err(error) => { events.send(Event::Error(format!("save model setting: {error:#}"))).await.ok(); }
-                },
-                Command::NextReasoningEffort if generation.is_none() => match config.next_reasoning_effort() {
-                    Ok(()) => send_settings(&events, &config).await,
-                    Err(error) => { events.send(Event::Error(format!("save reasoning setting: {error:#}"))).await.ok(); }
-                },
-                Command::Compact if generation.is_none() => {
-                    // A manual compaction: summarize exactly what the next
-                    // request would send — the previous summary plus the
-                    // messages that outlived it — while the full transcript
-                    // stays in the session file.
-                    let context = request_context(&messages, &session.meta);
-                    if context.len() <= 1 {
-                        events.send(Event::Error("nothing to compact yet".into())).await.ok();
-                    } else {
-                        let compacted = async {
-                            let summary =
-                                summarize(provider.clone(), &config, &context, &events, &internal_tx).await?;
-                            let marker =
-                                Message::system(format!("{COMPACTION_MARKER}\n{summary}"));
-                            session.meta.compaction_summary = Some(summary);
-                            session.meta.compacted_through = messages.len();
-                            session.append(std::slice::from_ref(&marker)).await?;
-                            messages.push(marker);
-                            session.meta.context_tokens =
-                                estimate_tokens(&request_context(&messages, &session.meta));
-                            session.save().await
-                        }
-                        .await;
-                        if let Err(error) = compacted {
-                            events.send(Event::Error(format!("compact: {error:#}"))).await.ok();
-                        } else {
-                            send_context(&events, &session, &config).await;
-                        }
-                    }
-                }
-                Command::RememberCommand(command) => {
-                    if let Err(error) = config.remember_command(&command) {
-                        events.send(Event::Error(format!("save command history: {error:#}"))).await.ok();
-                    }
-                }
-                Command::GitDiff(path) => {
-                    request_project(&mut project_requests, &project, ProjectRequest::Diff(path), &internal_tx);
-                }
-                Command::Shutdown(reply) => {
-                    if let Some(active) = generation.take() {
-                        active.task.abort();
-                        // Same ordering as Cancel: let the generation unwind
-                        // before shell-job cleanup starts.
-                        active.task.await.ok();
-                        // An interrupted turn keeps its completed work, as
-                        // Cancel does, so a resumed session continues from
-                        // the real state of the conversation.
-                        let _ = persist_interrupted_turn(
-                            &mut messages,
-                            &mut session,
-                            active.progress,
-                            &pending_prompts,
-                        )
-                        .await;
-                    }
-                    tools.shutdown().await;
-                    session.save().await.ok();
-                    reply.send(SessionSummary {
-                        name: session.meta.name.clone(),
-                        total_tokens: session.meta.total_tokens,
-                        total_cost: session.total_cost(),
-                    }).ok();
-                    break;
-                }
-                Command::NewSession(_)
-                | Command::ResumeSession(_)
-                | Command::SelectModel(_)
-                | Command::NextReasoningEffort
-                | Command::Compact => {}
-            },
-            Some(event) = internal_rx.recv() => match event {
-                InternalEvent::Finished(result) if generation.is_some() => {
-                    generation = None; pending_approval = None;
-                    // The agent already reaps its jobs on a clean return;
-                    // this guarantees no job outlives the turn on any path.
-                    tools.cancel_active().await;
-                    messages.truncate(messages.len().saturating_sub(1));
-                    let TurnResult { completed, compaction, title } = result;
-                    if let Some(title) = title {
-                        session.set_title(title);
-                        events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
-                    }
-                    let mut persisted = Vec::new();
-                    if let Some(compaction) = compaction {
-                        let marker =
-                            Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
-                        session.meta.compaction_summary = Some(compaction.summary);
-                        session.meta.compacted_through = compaction.through;
-                        messages.push(marker.clone());
-                        persisted.push(marker);
-                    }
-                    messages.extend(completed.clone());
-                    persisted.extend(completed);
-                    let projected = request_context(&messages, &session.meta);
-                    if projected.iter().any(is_ejected_web_result) {
-                        session.meta.context_tokens = estimate_tokens(&projected);
-                        send_context(&events, &session, &config).await;
-                    }
-                    let saved = async {
-                        session.append(&persisted).await?;
-                        session.save().await
-                    }.await;
-                    if let Err(error) = saved {
-                        events.send(Event::Error(format!("save session: {error:#}"))).await.ok();
-                    } else {
-                        events.send(Event::GenerationFinished).await.ok();
-                    }
-                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
-                    // Steering prompts queued after the turn's final model
-                    // request never reached the model: resubmit the first as
-                    // a fresh turn, keeping any stragglers queued for it.
-                    let mut steered = pending_prompts.lock().unwrap().drain(..).collect::<Vec<_>>();
-                    if !steered.is_empty() {
-                        let first = steered.remove(0);
-                        spawn_turn(
-                            &mut generation,
-                            &mut pending_prompts,
-                            &mut messages,
-                            &mut session,
-                            &project,
-                            &provider,
-                            &tools,
-                            &config,
-                            first.steer_message(),
-                            &events,
-                            &internal_tx,
-                        )
-                        .await;
-                        pending_prompts.lock().unwrap().extend(steered);
-                    }
-                }
-                InternalEvent::Failed(error) if generation.is_some() => {
-                    generation = None; pending_approval = None; messages.pop();
-                    // A failed turn may leave jobs behind (the agent's clean
-                    // return does not run on error); reap them here.
-                    tools.cancel_active().await;
-                    session.save().await.ok();
-                    events.send(Event::Error(error)).await.ok();
-                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
-                }
-                InternalEvent::Usage(usage) if generation.is_some() => {
-                    session.record_usage(usage.total_tokens, config.active_model().price_per_token);
-                    session.meta.context_tokens = usage.total_tokens;
-                    send_usage(&events, &session).await;
-                    send_context(&events, &session, &config).await;
-                }
-                InternalEvent::AuxiliaryUsage(usage) if generation.is_some() => {
-                    session.record_usage(usage.total_tokens, config.active_model().price_per_token);
-                    send_usage(&events, &session).await;
-                }
-                InternalEvent::PlanUpdated(plan) if generation.is_some() => {
-                    session.meta.plan = Some(plan.clone());
-                    session.save().await.ok();
-                    events.send(Event::PlanChanged(Some(plan))).await.ok();
-                }
-                InternalEvent::Approval { call, reply } => {
-                    if generation.is_none() || pending_approval.is_some() { reply.send(ApprovalDecision::Deny).ok(); }
-                    else if session.meta.approved_tools.contains(&call.name) {
-                        reply.send(ApprovalDecision::AllowSession).ok();
-                    } else {
-                        pending_approval = Some(PendingApproval { tool: call.name.clone(), reply });
-                        events.send(Event::ApprovalRequested(call)).await.ok();
-                    }
-                }
-                InternalEvent::ProjectChanged(changed) => {
-                    project = changed;
-                    events.send(Event::ProjectChanged(project.clone())).await.ok();
-                    if let Some(next) = project_requests.completed() {
-                        spawn_project_task(&project, next, &internal_tx);
-                    }
-                }
-                InternalEvent::ProjectRefresh => {
-                    request_project(&mut project_requests, &project, ProjectRequest::Refresh, &internal_tx);
-                }
-                InternalEvent::Finished(_)
-                | InternalEvent::Failed(_)
-                | InternalEvent::Usage(_)
-                | InternalEvent::AuxiliaryUsage(_)
-                | InternalEvent::PlanUpdated(_) => {}
-            },
-            else => break,
-        }
-    }
-    tools.shutdown().await;
 }
 
 /// Steering prompts queued for the active turn. Drained by the turn's agent
@@ -679,6 +330,7 @@ async fn persist_interrupted_turn(
     session: &mut Session,
     progress: TurnProgressHandle,
     pending_prompts: &SteerQueue,
+    marker: &str,
 ) -> Result<()> {
     // The turn's user prompt: spawn_turn pushed it when the turn began,
     // and the runtime appends nothing else while a turn is active.
@@ -687,7 +339,12 @@ async fn persist_interrupted_turn(
         messages: mut tail,
         compaction,
     } = progress.lock().unwrap().clone();
-    close_open_tool_calls(&mut tail);
+    let tool_error = if marker == CANCELLED_BY_USER {
+        CANCELLED_TOOL_OUTPUT.to_owned()
+    } else {
+        format!("Error: {marker}")
+    };
+    close_open_tool_calls(&mut tail, &tool_error);
     messages.truncate(turn_from);
     if let Some(compaction) = compaction {
         let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
@@ -705,7 +362,7 @@ async fn persist_interrupted_turn(
             .drain(..)
             .map(UserPrompt::steer_message),
     );
-    messages.push(Message::system(CANCELLED_BY_USER.into()));
+    messages.push(Message::system(marker.into()));
     session.append(&messages[turn_from..]).await?;
     session.save().await
 }
@@ -714,7 +371,7 @@ async fn persist_interrupted_turn(
 /// have been stopped between an assistant message and the results of its
 /// calls, and providers refuse a tool call without its result. Each
 /// unanswered call receives a cancellation result, in call order.
-fn close_open_tool_calls(tail: &mut Vec<Message>) {
+fn close_open_tool_calls(tail: &mut Vec<Message>, output: &str) {
     let Some(start) = tail
         .iter()
         .rposition(|message| matches!(message, Message::Assistant { .. }))
@@ -735,17 +392,12 @@ fn close_open_tool_calls(tail: &mut Vec<Message>) {
         .map(|call| call.id.clone())
         .collect::<Vec<_>>();
     for call_id in open {
-        tail.push(Message::tool(
-            call_id,
-            CANCELLED_TOOL_OUTPUT.into(),
-            None,
-            None,
-        ));
+        tail.push(Message::tool(call_id, output.into(), None, None));
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn spawn_turn<P: Provider>(
+async fn spawn_turn<P: Provider + ?Sized>(
     generation: &mut Option<ActiveTurn>,
     pending_prompts: &mut SteerQueue,
     messages: &mut Vec<Message>,
@@ -774,68 +426,94 @@ async fn spawn_turn<P: Provider>(
     let provider = provider.clone();
     let tools = tools.clone();
     let config = config.clone();
-    let events = events.clone();
-    let internal = internal.clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    events
+        .send(Event::OperationStarted {
+            id: id.clone(),
+            compacting: false,
+        })
+        .await
+        .ok();
     events.send(Event::GenerationStarted).await.ok();
+    let parent = internal.clone();
+    let (events, internal, forward) = worker_channels(&id, internal);
     *generation = Some(ActiveTurn {
+        id: id.clone(),
         progress: progress.clone(),
         task: tokio::spawn(async move {
             let result = match project_prompt {
-                Ok(prompt) => turn(
-                    provider,
-                    &tools,
-                    &config,
-                    request_messages,
-                    persist_from,
-                    context_tokens,
-                    prompt,
-                    generate_title,
-                    current_plan,
-                    steers,
-                    &progress,
-                    &events,
-                    &internal,
-                )
-                .await,
+                Ok(prompt) => {
+                    turn(
+                        provider,
+                        &tools,
+                        &config,
+                        request_messages,
+                        persist_from,
+                        context_tokens,
+                        prompt,
+                        generate_title,
+                        current_plan,
+                        steers,
+                        &progress,
+                        &events,
+                        &internal,
+                    )
+                    .await
+                }
                 Err(error) => Err(error),
             };
             let event = match result {
                 Ok(result) => InternalEvent::Finished(result),
                 Err(error) => InternalEvent::Failed(format!("{error:#}")),
             };
-            internal.send(event).await.ok();
+            drop(events);
+            drop(internal);
+            forward.await.ok();
+            parent
+                .send(InternalEvent::Scoped {
+                    id,
+                    event: Box::new(event),
+                })
+                .await
+                .ok();
         }),
     });
 }
 
-fn spawn_project_task(
-    project: &ProjectState,
-    request: ProjectRequest,
-    internal: &mpsc::Sender<InternalEvent>,
+fn worker_channels(
+    id: &str,
+    parent: &mpsc::Sender<InternalEvent>,
+) -> (
+    mpsc::Sender<Event>,
+    mpsc::Sender<InternalEvent>,
+    JoinHandle<()>,
 ) {
-    let mut snapshot = project.clone();
-    let internal = internal.clone();
-    tokio::spawn(async move {
-        match request {
-            ProjectRequest::Refresh => snapshot.refresh().await,
-            ProjectRequest::Diff(path) => snapshot.load_diff(path).await,
+    let (events, mut event_rx) = mpsc::channel(64);
+    let (internal, mut internal_rx) = mpsc::channel(8);
+    let id = id.to_owned();
+    let parent = parent.clone();
+    let forward = tokio::spawn(async move {
+        loop {
+            // visible events preceding an internal effect must be published first
+            let event = tokio::select! {
+                biased;
+                Some(event) = event_rx.recv() => InternalEvent::Visible(event),
+                Some(event) = internal_rx.recv() => event,
+                else => break,
+            };
+            if parent
+                .send(InternalEvent::Scoped {
+                    id: id.clone(),
+                    event: Box::new(event),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
-        internal
-            .send(InternalEvent::ProjectChanged(snapshot))
-            .await
-            .ok();
     });
-}
-
-fn request_project(
-    requests: &mut ProjectRequests,
-    project: &ProjectState,
-    request: ProjectRequest,
-    internal: &mpsc::Sender<InternalEvent>,
-) {
-    if let Some(request) = requests.request(request) {
-        spawn_project_task(project, request, internal);
-    }
+    (events, internal, forward)
 }
 
 async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {
@@ -1019,7 +697,7 @@ fn is_ejected_web_result(message: &Message) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn turn<P: Provider>(
+async fn turn<P: Provider + ?Sized>(
     provider: Arc<P>,
     tools: &ToolRegistry,
     config: &Config,
@@ -1042,7 +720,10 @@ async fn turn<P: Provider>(
     let (known, unknown) = if context_tokens == 0 {
         (0u64, &messages[..])
     } else {
-        (context_tokens, &messages[messages.len().saturating_sub(1)..])
+        (
+            context_tokens,
+            &messages[messages.len().saturating_sub(1)..],
+        )
     };
     let estimated = known.saturating_add(estimate_tokens(unknown));
     let max_tokens = config.active_model().max_context_tokens;
@@ -1096,7 +777,7 @@ async fn turn<P: Provider>(
 /// Summarizes `messages` into a dense continuation summary in its own
 /// light-reasoning model request. Used for the turn-start compaction and
 /// for the mid-turn compaction that frees room for a tool result.
-async fn summarize<P: Provider>(
+async fn summarize<P: Provider + ?Sized>(
     provider: Arc<P>,
     config: &Config,
     messages: &[Message],
@@ -1185,7 +866,9 @@ async fn summarize<P: Provider>(
             SummaryEnd::Truncated(reason) => {
                 format!("was truncated ({reason}) before writing any summary text")
             }
-            SummaryEnd::Ended => "ended before finishing without writing any summary text".to_string(),
+            SummaryEnd::Ended => {
+                "ended before finishing without writing any summary text".to_string()
+            }
         };
         bail!("compaction produced no summary text: {why}");
     }
@@ -1210,7 +893,7 @@ enum SummaryEnd {
 
 /// Runs one compaction request and returns its final output text and how
 /// the response ended. Reasoning deltas are not part of the answer.
-async fn summarize_stream<P: Provider>(
+async fn summarize_stream<P: Provider + ?Sized>(
     provider: &Arc<P>,
     request: CompletionRequest,
     events: &mpsc::Sender<Event>,
@@ -1276,7 +959,7 @@ fn drop_oldest_message(request: &mut Vec<Message>) -> bool {
     true
 }
 
-async fn generate_session_title<P: Provider>(
+async fn generate_session_title<P: Provider + ?Sized>(
     provider: Arc<P>,
     config: &Config,
     messages: &[Message],
@@ -1477,7 +1160,7 @@ fn tool_message_overhead(call: &ToolCall) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn agent<P: Provider>(
+async fn agent<P: Provider + ?Sized>(
     provider: Arc<P>,
     tools: &ToolRegistry,
     config: &Config,
@@ -1506,6 +1189,10 @@ async fn agent<P: Provider>(
             .map(UserPrompt::steer_message)
             .collect::<Vec<_>>();
         if !steered.is_empty() {
+            events
+                .send(Event::SteersDelivered(steered.len()))
+                .await
+                .ok();
             messages.extend(steered.iter().cloned());
             progress.lock().unwrap().messages.extend(steered);
         }
@@ -1705,6 +1392,15 @@ async fn agent<P: Provider>(
                 output,
                 message_budget,
             );
+            if let Some(image) = &image {
+                events
+                    .send(Event::ToolImage {
+                        call_id: call.id.clone(),
+                        image: image.clone(),
+                    })
+                    .await
+                    .ok();
+            }
             events
                 .send(Event::ToolResult {
                     call_id: call.id.clone(),
@@ -1869,7 +1565,7 @@ fn truncate_tool_output(
     output
 }
 
-async fn stream_with_retry<P: Provider>(
+async fn stream_with_retry<P: Provider + ?Sized>(
     provider: &Arc<P>,
     request: CompletionRequest,
     events: &mpsc::Sender<Event>,
@@ -3175,7 +2871,12 @@ mod tests {
 
         // Older calls collapse to the stored marker.
         assert!(!encoded.contains("obsolete step"));
-        assert_eq!(encoded.matches("Latest plan is provided separately").count(), 1);
+        assert_eq!(
+            encoded
+                .matches("Latest plan is provided separately")
+                .count(),
+            1
+        );
         // The latest call stays un-compacted (call args, result, and the
         // plan system message) so the model always has a complete
         // in-context example of the update_plan shape.
@@ -3275,35 +2976,6 @@ mod tests {
         assert_eq!(
             (0..6).map(retry_delay).collect::<Vec<_>>(),
             [2, 5, 10, 30, 30, 30]
-        );
-    }
-
-    #[test]
-    fn project_requests_serialize_and_coalesce() {
-        let mut requests = ProjectRequests::default();
-        assert_eq!(
-            requests.request(ProjectRequest::Refresh),
-            Some(ProjectRequest::Refresh)
-        );
-        // Requests arriving while one is in flight are coalesced, latest wins.
-        assert_eq!(requests.request(ProjectRequest::Refresh), None);
-        assert_eq!(
-            requests.request(ProjectRequest::Diff(Some(std::path::PathBuf::from("a.rs")))),
-            None
-        );
-        assert_eq!(
-            requests.request(ProjectRequest::Diff(Some(std::path::PathBuf::from("b.rs")))),
-            None
-        );
-        assert_eq!(
-            requests.completed(),
-            Some(ProjectRequest::Diff(Some(std::path::PathBuf::from("b.rs"))))
-        );
-        // No pending work means no follow-up.
-        assert_eq!(requests.completed(), None);
-        assert_eq!(
-            requests.request(ProjectRequest::Refresh),
-            Some(ProjectRequest::Refresh)
         );
     }
 
@@ -3470,12 +3142,7 @@ mod tests {
         // assistant message whose bulk (a long reasoning transcript) the
         // provider never charges for, but the last reported usage is well
         // below it: the next request is that usage plus one short word.
-        let bulky = Message::assistant(
-            "done".into(),
-            "model".into(),
-            "x".repeat(8000),
-            Vec::new(),
-        );
+        let bulky = Message::assistant("done".into(), "model".into(), "x".repeat(8000), Vec::new());
         assert!(estimate_tokens(&[bulky.clone()]) as f64 >= 2048.0 * 0.75);
 
         let result = turn(
@@ -3521,8 +3188,7 @@ mod tests {
             }),
         ]]));
         let mut config = Config::default();
-        config.models[0].reasoning_efforts =
-            vec![ReasoningEffort::Low, ReasoningEffort::Medium];
+        config.models[0].reasoning_efforts = vec![ReasoningEffort::Low, ReasoningEffort::Medium];
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
 
@@ -3640,11 +3306,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("ended before finishing")
-        );
+        assert!(error.to_string().contains("ended before finishing"));
     }
 
     #[tokio::test]
@@ -3944,6 +3606,8 @@ mod tests {
     fn request_context_projects_the_summary_and_drops_markers() {
         let summary = "dense summary";
         let meta = SessionMeta {
+            project_root: None,
+            settings: None,
             name: "test".into(),
             title: None,
             plan: None,
@@ -3989,13 +3653,10 @@ mod tests {
         let mut tools = ToolRegistry::default();
         tools.insert(Echo, Approval::Allow);
         let steers = no_steers();
-        steers
-            .lock()
-            .unwrap()
-            .push(UserPrompt {
-                content: "focus on the tests".into(),
-                images: Vec::new(),
-            });
+        steers.lock().unwrap().push(UserPrompt {
+            content: "focus on the tests".into(),
+            images: Vec::new(),
+        });
         let (event_tx, event_rx) = mpsc::channel(16);
         // Never read: drop the receiver so event sends fail fast instead
         // of blocking once the buffer fills.
@@ -4026,9 +3687,11 @@ mod tests {
             first_request.messages.last().unwrap(),
             Message::Steer { content, .. } if content == "focus on the tests"
         ));
-        assert!(completed
-            .iter()
-            .any(|message| matches!(message, Message::Steer { .. })));
+        assert!(
+            completed
+                .iter()
+                .any(|message| matches!(message, Message::Steer { .. }))
+        );
     }
 
     #[tokio::test]
@@ -4085,10 +3748,12 @@ mod tests {
 
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
-        assert!(!requests[0]
-            .messages
-            .iter()
-            .any(|message| matches!(message, Message::Steer { .. })));
+        assert!(
+            !requests[0]
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Steer { .. }))
+        );
         assert!(requests[1].messages.iter().any(|message| {
             matches!(message, Message::Steer { content, .. } if content == "also fix the docs")
         }));
@@ -4139,7 +3804,9 @@ mod tests {
         ));
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&root).await.unwrap();
-        let session = Session::create_in(root.clone(), "steer".into()).await.unwrap();
+        let session = Session::create_in(root.clone(), "steer".into())
+            .await
+            .unwrap();
         let mut tools = ToolRegistry::default();
         tools.insert(Echo, Approval::Allow);
         let (command_tx, command_rx) = mpsc::channel(16);
@@ -4203,10 +3870,12 @@ mod tests {
         let requests = provider.mock.requests();
         assert_eq!(requests.len(), 3);
         // The steer missed the turn's final request...
-        assert!(!requests[1]
-            .messages
-            .iter()
-            .any(|message| matches!(message, Message::Steer { .. })));
+        assert!(
+            !requests[1]
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Steer { .. }))
+        );
         // ...so it was resubmitted: the fresh turn carries it as its
         // prompt, on top of the finished conversation, keeping its Steer
         // identity as the UI rendered it.
@@ -4235,10 +3904,17 @@ mod tests {
         ));
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&root).await.unwrap();
-        let session = Session::create_in(root.clone(), "compact".into()).await.unwrap();
+        let session = Session::create_in(root.clone(), "compact".into())
+            .await
+            .unwrap();
         let messages = vec![
             Message::user("build the feature".into()),
-            Message::assistant("done".to_string(), "model".into(), String::new(), Vec::new()),
+            Message::assistant(
+                "done".to_string(),
+                "model".into(),
+                String::new(),
+                Vec::new(),
+            ),
         ];
         let tools = ToolRegistry::default();
         let (command_tx, command_rx) = mpsc::channel(16);
@@ -4316,7 +3992,9 @@ mod tests {
         ));
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&root).await.unwrap();
-        let session = Session::create_in(root.clone(), "empty".into()).await.unwrap();
+        let session = Session::create_in(root.clone(), "empty".into())
+            .await
+            .unwrap();
         let tools = ToolRegistry::default();
         let (command_tx, command_rx) = mpsc::channel(16);
         let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -4376,7 +4054,7 @@ mod tests {
                 ],
             ),
         ];
-        close_open_tool_calls(&mut tail);
+        close_open_tool_calls(&mut tail, CANCELLED_TOOL_OUTPUT);
         assert_eq!(tail.len(), 4);
         assert!(matches!(
             &tail[2],
@@ -4407,7 +4085,7 @@ mod tests {
             ),
             Message::tool("a".into(), "first".into(), None, None),
         ];
-        close_open_tool_calls(&mut tail);
+        close_open_tool_calls(&mut tail, CANCELLED_TOOL_OUTPUT);
         assert_eq!(tail.len(), 4);
         assert!(matches!(&tail[3], Message::Tool { call_id, .. } if call_id == "b"));
 
@@ -4427,7 +4105,7 @@ mod tests {
             Message::tool("a".into(), "first".into(), None, None),
             Message::assistant("done".into(), "model".into(), String::new(), Vec::new()),
         ];
-        close_open_tool_calls(&mut tail);
+        close_open_tool_calls(&mut tail, CANCELLED_TOOL_OUTPUT);
         assert_eq!(tail.len(), 4);
     }
 

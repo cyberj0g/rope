@@ -484,8 +484,7 @@ mod tests {
             vec![ResponseDelta::Reasoning("legacy".into())]
         );
 
-        let truncated =
-            r#"{"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":200,"total_tokens":4098}}"#;
+        let truncated = r#"{"choices":[{"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":200,"total_tokens":4098}}"#;
         assert_eq!(
             parse_delta(truncated).unwrap(),
             vec![
@@ -497,8 +496,7 @@ mod tests {
             ]
         );
 
-        let stopped =
-            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"total_tokens":321}}"#;
+        let stopped = r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"total_tokens":321}}"#;
         assert_eq!(
             parse_delta(stopped).unwrap(),
             vec![

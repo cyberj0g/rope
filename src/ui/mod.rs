@@ -1,4 +1,7 @@
+mod client;
 mod history;
+use crate::protocol::Action;
+use client::Command;
 mod links;
 mod state;
 
@@ -41,8 +44,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     config::{Config, ModelConfig},
-    runtime::{ApprovalDecision, Command, Event, ImageContent, SessionSummary, UserPrompt},
-    session::{Session, SessionInfo},
+    runtime::{ApprovalDecision, Event, ImageContent, SessionSummary, UserPrompt},
+    session::SessionInfo,
     tool::PlanStatus,
 };
 use history::PromptHistory;
@@ -324,10 +327,12 @@ const SPEED_WIDTH: usize = "avg. 9999.9 tokens/s".len();
 
 pub async fn run(
     config: Config,
-    commands: mpsc::Sender<Command>,
-    mut events: mpsc::Receiver<Event>,
+    core: crate::core::Core,
+    session_id: String,
     request: Option<String>,
 ) -> Result<SessionSummary> {
+    let (commands, mut events, _connection) =
+        client::connect(core, config.clone(), session_id).await?;
     let mut history = PromptHistory::load().await?;
     let mut terminal = TerminalGuard::new()?;
     let mut renders = RenderState::new();
@@ -389,8 +394,8 @@ pub async fn run(
         }
         tokio::select! {
             event = events.recv() => if let Some(event) = event {
-                let history_loaded = matches!(&event, Event::History(_));
-                if matches!(event, Event::GenerationFinished) {
+                let history_loaded = matches!(&event, Event::History(_) | Event::Snapshot(_));
+                if matches!(&event, Event::Update(update) if matches!(update.event, Event::GenerationFinished)) {
                     ring_bell(&mut io::stdout())?;
                 }
                 chat_height = apply_runtime_event(&mut state, event, chat, chat_height, &mut renders);
@@ -482,11 +487,16 @@ fn apply_runtime_event(
     old_height: usize,
     renders: &mut RenderState,
 ) -> usize {
+    let displayed_event = match &event {
+        Event::Update(update) => &update.event,
+        event => event,
+    };
     let preserve_viewport = old_height > 0
         && state.scroll > 0
         && matches!(
-            &event,
-            Event::GenerationStarted
+            displayed_event,
+            Event::MessageAccepted(_)
+                | Event::GenerationStarted
                 | Event::ModelRequestStarted(_)
                 | Event::ResponseHeadersReceived
                 | Event::ResponseStarted
@@ -496,7 +506,7 @@ fn apply_runtime_event(
                 | Event::ToolCallDelta { .. }
                 | Event::ToolCallFinished { .. }
                 | Event::ToolStarted { .. }
-                | Event::ApprovalRequested(_)
+                | Event::ApprovalRequested { .. }
                 | Event::ToolOutputDelta { .. }
                 | Event::ToolResult { .. }
                 | Event::Retrying { .. }
@@ -544,35 +554,27 @@ async fn handle_key(
     if handle_fullscreen_diff_key(key, state, screen.height, &mut renders.diff) {
         return Ok(false);
     }
-    if let Some(call) = &state.approval {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let detail = format!("{} · once", call.name);
-                state.approval = None;
-                push_tool_decision(state, "Tool approved", detail);
-                commands
-                    .send(Command::Approve(ApprovalDecision::AllowOnce))
-                    .await?;
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                let detail = format!("{} · session", call.name);
-                state.approval = None;
-                push_tool_decision(state, "Tool approved", detail);
-                commands
-                    .send(Command::Approve(ApprovalDecision::AllowSession))
-                    .await?;
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                let detail = call.name.clone();
-                state.approval = None;
-                push_tool_decision(state, "Tool denied", detail);
-                commands
-                    .send(Command::Approve(ApprovalDecision::Deny))
-                    .await?;
-            }
-            _ => {}
+    if state.approval.is_some()
+        && state.input.is_empty()
+        && state.session_picker.is_none()
+        && state.model_picker.is_none()
+    {
+        let decision = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::AllowOnce),
+            KeyCode::Char('s') | KeyCode::Char('S') => Some(ApprovalDecision::AllowSession),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(ApprovalDecision::Deny),
+            _ => None,
+        };
+        if let Some(decision) = decision {
+            commands
+                .send(Command::Action(Action::Approve {
+                    turn_id: state.turn_id.clone().unwrap_or_default(),
+                    approval_id: state.approval_id.clone().unwrap_or_default(),
+                    decision,
+                }))
+                .await?;
+            return Ok(false);
         }
-        return Ok(false);
     }
     if state.model_picker.is_some() {
         handle_model_picker_key(key, config, state, commands).await?;
@@ -583,7 +585,11 @@ async fn handle_key(
         return Ok(false);
     }
     if key.code == KeyCode::Esc && state.generating {
-        commands.send(Command::Cancel).await?;
+        commands
+            .send(Command::Action(Action::Cancel {
+                turn_id: state.turn_id.clone().unwrap_or_default(),
+            }))
+            .await?;
         return Ok(false);
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('f') {
@@ -666,7 +672,11 @@ async fn handle_key(
     if key.code == KeyCode::Esc
         || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('g'))
     {
-        commands.send(Command::Cancel).await?;
+        commands
+            .send(Command::Action(Action::Cancel {
+                turn_id: state.turn_id.clone().unwrap_or_default(),
+            }))
+            .await?;
         return Ok(false);
     }
     match key.code {
@@ -791,19 +801,6 @@ async fn handle_key(
     Ok(false)
 }
 
-fn push_tool_decision(state: &mut UiState, label: &str, content: String) {
-    state.render_revisions.push(0);
-    state.blocks.push(ChatBlock::Message {
-        label: label.into(),
-        content,
-        images: Vec::new(),
-        model: String::new(),
-        kind: MessageKind::System,
-        expanded: true,
-        summary: None,
-    });
-}
-
 async fn handle_model_picker_key(
     key: KeyEvent,
     config: &Config,
@@ -823,7 +820,12 @@ async fn handle_model_picker_key(
             state.recent_models.insert(0, model.clone());
             state.recent_models.truncate(12);
             state.model_picker = None;
-            commands.send(Command::SelectModel(model)).await?;
+            commands
+                .send(Command::Action(Action::SetModel {
+                    model,
+                    revision: state.settings_revision,
+                }))
+                .await?;
         }
         KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
         KeyCode::Down => {
@@ -1061,32 +1063,21 @@ async fn dispatch(
             true
         }
         "/session" => {
-            if state.generating {
-                state.notice =
-                    Some("finish or cancel the current response before switching sessions".into());
-            } else {
-                match Session::list().await {
-                    Ok(sessions) => {
-                        let query = argument.trim().to_owned();
-                        state.session_picker = Some(state::SessionPicker {
-                            query: query.clone(),
-                            cursor: query.len(),
-                            selected: 0,
-                            sessions,
-                        });
-                    }
-                    Err(error) => state.set_error(format!("list sessions: {error:#}")),
-                }
-            }
+            let query = argument.trim().to_owned();
+            state.session_picker = Some(state::SessionPicker {
+                query: query.clone(),
+                cursor: query.len(),
+                selected: 0,
+                sessions: state.session_catalog.clone(),
+            });
             true
         }
         "/compact" if argument.is_empty() => {
             if state.generating {
-                state.notice = Some(
-                    "finish or cancel the current response before compacting".into(),
-                );
+                state.notice =
+                    Some("finish or cancel the current response before compacting".into());
             } else {
-                commands.send(Command::Compact).await?;
+                commands.send(Command::Action(Action::Compact)).await?;
             }
             true
         }
@@ -1110,7 +1101,13 @@ async fn dispatch(
             true
         }
         "/reason" if argument.is_empty() => {
-            commands.send(Command::NextReasoningEffort).await?;
+            commands
+                .send(Command::NextReasoning {
+                    model: state.model.clone(),
+                    current: state.reasoning_effort,
+                    revision: state.settings_revision,
+                })
+                .await?;
             true
         }
         "/thinking" if argument.is_empty() => {
@@ -1144,7 +1141,7 @@ async fn dispatch(
         state.recent_commands.retain(|name| name != &command);
         state.recent_commands.insert(0, command.clone());
         state.recent_commands.truncate(12);
-        commands.send(Command::RememberCommand(command)).await?;
+        commands.send(Command::Remember(command)).await?;
     }
     if is_command {
         history.reset_navigation();
@@ -1180,7 +1177,6 @@ async fn submit(
     {
         state.notice = Some(format!("history was not saved: {error:#}"));
     }
-    state.push_user_with_images(content.clone(), images.clone());
     commands
         .send(Command::Submit(UserPrompt { content, images }))
         .await?;
@@ -1201,7 +1197,6 @@ async fn steer(
     {
         state.notice = Some(format!("history was not saved: {error:#}"));
     }
-    state.push_steer_with_images(content.clone(), images.clone());
     commands
         .send(Command::Steer(UserPrompt { content, images }))
         .await?;
@@ -1436,7 +1431,13 @@ async fn handle_mouse(
                 state.model_picker = Some(state::ModelPicker::default());
             }
         } else if (reason_start..reason_end).contains(&mouse.column) {
-            commands.send(Command::NextReasoningEffort).await?;
+            commands
+                .send(Command::NextReasoning {
+                    model: state.model.clone(),
+                    current: state.reasoning_effort,
+                    revision: state.settings_revision,
+                })
+                .await?;
         }
         return Ok(());
     }
@@ -4894,11 +4895,14 @@ mod tests {
         state.apply(Event::ResponseStarted);
         assert_eq!(app_status(&state), ("generating", Color::Green));
 
-        state.apply(Event::ApprovalRequested(crate::runtime::ToolCall {
-            id: "call-1".into(),
-            name: "shell".into(),
-            arguments: serde_json::json!({}),
-        }));
+        state.apply(Event::ApprovalRequested {
+            approval_id: "approval".into(),
+            call: crate::runtime::ToolCall {
+                id: "call-1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({}),
+            },
+        });
         assert_eq!(app_status(&state), ("approval", Color::Yellow));
         assert_eq!(
             tool_status(ToolStatus::WaitingApproval),
@@ -4935,8 +4939,16 @@ mod tests {
     #[test]
     fn tool_decisions_are_conversation_history_entries() {
         let mut state = UiState::new();
-        push_tool_decision(&mut state, "Tool approved", "shell · once".into());
-        push_tool_decision(&mut state, "Tool denied", "write".into());
+        state.apply(Event::ApprovalResolved {
+            approval_id: "one".into(),
+            tool: "shell".into(),
+            decision: ApprovalDecision::AllowOnce,
+        });
+        state.apply(Event::ApprovalResolved {
+            approval_id: "two".into(),
+            tool: "write".into(),
+            decision: ApprovalDecision::Deny,
+        });
 
         assert!(state.notice.is_none());
         assert!(matches!(
@@ -4946,7 +4958,7 @@ mod tests {
                 content,
                 kind: MessageKind::System,
                 ..
-            } if label == "Tool approved" && content == "shell · once"
+            } if label == "System" && content == "Tool approved: shell · once"
         ));
         assert!(matches!(
             &state.blocks[1],
@@ -4955,7 +4967,7 @@ mod tests {
                 content,
                 kind: MessageKind::System,
                 ..
-            } if label == "Tool denied" && content == "write"
+            } if label == "System" && content == "Tool denied: write"
         ));
     }
 
@@ -5453,6 +5465,11 @@ mod tests {
             Command::Steer(prompt) => assert_eq!(prompt.content, "keep going"),
             _ => panic!("expected a steer command"),
         }
+        assert!(state.blocks.is_empty());
+        state.apply(Event::MessageAccepted(crate::runtime::Message::steer(
+            "keep going".into(),
+            Vec::new(),
+        )));
         assert!(matches!(
             &state.blocks[0],
             ChatBlock::Message {
@@ -5483,6 +5500,10 @@ mod tests {
             Command::Submit(prompt) => assert_eq!(prompt.content, "fresh request"),
             _ => panic!("expected a submit command"),
         }
+        assert!(state.blocks.is_empty());
+        state.apply(Event::MessageAccepted(
+            crate::runtime::Message::user_with_images("fresh request".into(), Vec::new()),
+        ));
         assert!(matches!(
             &state.blocks[0],
             ChatBlock::Message {

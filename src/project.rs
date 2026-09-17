@@ -2,15 +2,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::Local;
+use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct GitFile {
     pub status: String,
     pub path: PathBuf,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ProjectState {
     pub cwd: PathBuf,
     pub git_available: bool,
@@ -21,8 +22,12 @@ pub struct ProjectState {
 
 impl ProjectState {
     pub async fn new() -> Result<Self> {
+        Self::at(std::env::current_dir()?).await
+    }
+
+    pub async fn at(cwd: PathBuf) -> Result<Self> {
         let mut state = Self {
-            cwd: std::env::current_dir()?,
+            cwd,
             ..Self::default()
         };
         state.refresh().await;
@@ -108,7 +113,7 @@ fn parse_status_line(line: &str) -> Option<GitFile> {
     })
 }
 
-async fn diff(cwd: &Path, path: Option<&Path>) -> Result<String> {
+pub async fn diff(cwd: &Path, path: Option<&Path>) -> Result<String> {
     let mut args = vec!["diff", "--"];
     if let Some(path) = path {
         args.push(path.to_str().context("git path is not UTF-8")?);

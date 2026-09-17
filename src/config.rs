@@ -18,6 +18,20 @@ pub struct Args {
     #[arg(long)]
     pub session: Option<String>,
     pub request: Option<String>,
+    #[arg(long, help = "Run the core server without the terminal UI")]
+    pub headless: bool,
+    #[arg(
+        long,
+        help = "Serve HTTP/WebSockets at this address (headless default: 127.0.0.1:8787)"
+    )]
+    pub listen: Option<std::net::SocketAddr>,
+    #[arg(
+        long,
+        help = "Read or create a server token file (ROPE_SERVER_TOKEN takes precedence)"
+    )]
+    pub token_file: Option<PathBuf>,
+    #[arg(long, help = "Allow this exact browser Origin; may be repeated")]
+    pub allow_origin: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -213,7 +227,10 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        let cwd = std::env::current_dir()?;
+        Self::load_at(&std::env::current_dir()?)
+    }
+
+    pub fn load_at(cwd: &std::path::Path) -> Result<Self> {
         let global = config_root()?.join("config.toml");
         let local_root = cwd.join(".rope");
         let local = local_root.join("config.toml");
@@ -311,7 +328,14 @@ impl Config {
         self.persist_settings()
     }
 
-    fn select_model(&mut self, value: &str) -> Result<()> {
+    pub fn remember_model_choice(&mut self, model: &str) -> Result<()> {
+        self.recent_models.retain(|name| name != model);
+        self.recent_models.insert(0, model.to_owned());
+        self.recent_models.truncate(12);
+        self.persist_settings()
+    }
+
+    pub(crate) fn select_model(&mut self, value: &str) -> Result<()> {
         let model = self
             .models
             .iter()
@@ -444,6 +468,9 @@ impl Config {
     }
 
     fn persist_settings(&self) -> Result<()> {
+        if self.settings_path.as_os_str().is_empty() {
+            return Ok(());
+        }
         let settings = PersistedSettings {
             model: Some(self.model.clone()),
             reasoning_effort: self.reasoning_effort,

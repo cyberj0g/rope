@@ -25,12 +25,20 @@
 
 ## Sessions
 
+- one shared core with an in-process TUI client, optional authenticated WebSocket clients via `--listen`, and terminal-free `--headless` server mode
+- one project directory per server, a live shared session catalog, concurrent turns in separate sessions, and multiple viewers/controllers of the same session
+- shared message acceptance and steering, first-wins approvals, turn-scoped cancellation, and revision-checked model/reasoning settings persisted per session
+- switching sessions or disconnecting leaves work running; late clients receive snapshots containing partial text, reasoning, tool arguments/output, queued steers, approval waits, timers, usage, and plans
+- sequenced session updates, bounded subscriptions with snapshot recovery on lag, and mutation reply deduplication across reconnects within a server lifetime
+- per-session shell jobs and browser contexts, project-bound session metadata, atomic metadata replacement, and exclusive session writer locks
+- loopback-default listener, server token authentication, explicit browser Origin allowlist, authenticated image upload/download, and a minimal browser client served at `/`
+- cancellable manual compaction and graceful process shutdown that preserves interrupted work and stops session tools
 - automatic sessions under `~/.local/share/harness/sessions`
 - persisted 2-3 word model-generated titles for automatically named sessions, created after the first completed response
 - JSONL conversation persistence after completed turns
 - persisted session token totals and per-model cost estimates, hidden when any model used in the session has no configured token price
 - `--session NAME` to create or resume a session, plus `/new [NAME]`
-- `/session` popup listing every past session — name, creation date, and summary (the generated title, else the first user message) — with a live filter and keyboard navigation, resuming the selected session in place
+- `/session` popup listing the project's sessions plus unbound legacy sessions — name, creation date, and summary (the generated title, else the first user message) — with a live filter and keyboard navigation, switching clients without interrupting running turns
 - `/compact` to compact the conversation on demand while idle: summarizes exactly what the next request would send (previous summary plus the messages that outlived it), persists the summary, the boundary, and the `Context compacted` transcript marker, and refreshes the context gauge; refuses with a notice while a response is running and with an error when there is nothing to compact yet
 - optional positional startup request submitted as soon as the terminal UI opens
 - exit summary with tokens used, estimated cost when available, and the exact session resume command
@@ -55,7 +63,7 @@
 - per-call tool output capped at roughly one fifth of the available model context with an explicit truncation marker, and live `shell` output streaming bounded by the same cap, sliced at a character boundary so one delta never overshoots it; the cap is measured on the populated, JSON-serialized Tool message — role, call id, and content escaping counted — after reserving the message's own framing, and floored at 32 tokens so control fields like a job_id survive near the context limit, so a tool result never pushes the next model request past the limit under Rope's own estimator; when even the floor no longer fits, the conversation is compacted mid-turn — keeping the user message, the assistant calls, and the results delivered so far — before the tool runs, and the turn fails with a clear error if compaction cannot free the room
 - image results counted in the context budget at the OpenAI `auto`-detail cost (85 base tokens plus 170 per 512px tile after the 2048px fit and 768px shortest-side cap; unknown dimensions reserve the per-image maximum), with `view_image` reading header dimensions so its reservation is exact, and a tool image that would crowd the result past its budget dropped with a note in the content so the next request still fits
 - persisted per-call diffs for `write` and `edit`, opened from the tool header without mixing in unrelated changes
-- Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a shared headless Chromium context, version-matched browser identity, a process-lifetime profile, automatic cookie-popup opt-out via DuckDuckGo AutoConsent, and a `ROPE_BROWSER` override
+- Patchright-backed `web_search` using DuckDuckGo with Bing fallback, a headless Chromium context shared within each session, version-matched browser identity, a session-lifetime profile, automatic cookie-popup opt-out via DuckDuckGo AutoConsent, and a `ROPE_BROWSER` override
 - text-first `web_browser` using browser-visible content after JavaScript rendering, with resolved visible links, a shared browser session, and no model-controlled truncation
 - reproducible, checksum-verified Node, Patchright, and AutoConsent runtime embedding with lazy versioned extraction on first browser use
 - eager Patchright extraction plus Chrome/Chromium diagnostics during first-run setup, including `ROPE_BROWSER` override guidance

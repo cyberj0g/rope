@@ -8,10 +8,24 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use crate::{config::Startup, runtime::Message, tool::ExecutionPlan};
+use crate::{
+    config::Startup,
+    runtime::{ImageContent, Message, ReasoningEffort},
+    tool::ExecutionPlan,
+};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SessionSettings {
+    pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionMeta {
+    #[serde(default)]
+    pub project_root: Option<PathBuf>,
+    #[serde(default)]
+    pub settings: Option<SessionSettings>,
     pub name: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -37,11 +51,12 @@ pub struct SessionMeta {
 pub struct Session {
     root: PathBuf,
     pub meta: SessionMeta,
+    creation_lock: Option<SessionLock>,
 }
 
 /// One row of the session picker: the persisted identity of a session plus
 /// the first user message, which summarizes sessions without a title.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionInfo {
     pub name: String,
     pub title: Option<String>,
@@ -81,10 +96,31 @@ impl Session {
         Self::create(root, name).await
     }
 
-    /// Creates a session under an explicit root; test-only.
-    #[cfg(test)]
+    /// creates a session under an explicit storage root
     pub async fn create_in(root: PathBuf, name: String) -> Result<Self> {
-        Self::create(root, name).await
+        Self::create(root, clean_name(&name)?).await
+    }
+
+    pub async fn new_in(root: PathBuf, name: Option<String>) -> Result<Self> {
+        tokio::fs::create_dir_all(&root).await?;
+        if let Some(name) = name {
+            return Self::create_in(root, name).await;
+        }
+        let mut suffix = now();
+        loop {
+            let name = format!("session-{suffix}");
+            match Self::create(root.clone(), name).await {
+                Ok(session) => return Ok(session),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) =>
+                {
+                    suffix += 1
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Every persisted session, most recent first.
@@ -141,13 +177,14 @@ impl Session {
 
     async fn create(root: PathBuf, name: String) -> Result<Self> {
         let directory = root.join(&name);
-        if directory.exists() {
-            bail!("session already exists: {name}");
-        }
         tokio::fs::create_dir(&directory).await?;
+        let creation_lock = Some(lock_session(&directory)?);
         let session = Self {
             root,
+            creation_lock,
             meta: SessionMeta {
+                project_root: None,
+                settings: None,
                 name,
                 title: None,
                 plan: None,
@@ -191,7 +228,14 @@ impl Session {
         for message in &mut messages {
             hydrate_images(&directory, message).await?;
         }
-        Ok((Self { root, meta }, messages))
+        Ok((
+            Self {
+                root,
+                meta,
+                creation_lock: None,
+            },
+            messages,
+        ))
     }
 
     pub async fn append(&self, messages: &[Message]) -> Result<()> {
@@ -210,11 +254,17 @@ impl Session {
     }
 
     pub async fn save(&self) -> Result<()> {
-        tokio::fs::write(
-            self.directory().join("session.json"),
-            serde_json::to_vec_pretty(&self.meta)?,
-        )
-        .await?;
+        let directory = self.directory();
+        let bytes = serde_json::to_vec_pretty(&self.meta)?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use std::io::Write;
+            let mut temp = tempfile::NamedTempFile::new_in(&directory)?;
+            temp.write_all(&bytes)?;
+            temp.flush()?;
+            temp.persist(directory.join("session.json"))?;
+            Ok(())
+        })
+        .await??;
         Ok(())
     }
 
@@ -245,8 +295,13 @@ impl Session {
         self.meta.title = Some(title);
     }
 
-    fn directory(&self) -> PathBuf {
+    pub fn directory(&self) -> PathBuf {
         self.root.join(&self.meta.name)
+    }
+    pub fn take_creation_lock(&mut self) -> SessionLock {
+        self.creation_lock
+            .take()
+            .expect("new session holds its creation lock")
     }
     fn messages_path(&self) -> PathBuf {
         self.directory().join("messages.jsonl")
@@ -270,11 +325,7 @@ async fn persist_images(directory: &Path, message: &mut Message, index: usize) -
             "image/webp" => "webp",
             _ => "png",
         };
-        let name = format!(
-            "{}-{}-{index}-{image_index}.{extension}",
-            now(),
-            std::process::id()
-        );
+        let name = format!("{}-{index}-{image_index}.{extension}", uuid::Uuid::new_v4());
         let relative = format!("attachments/{name}");
         let bytes = STANDARD
             .decode(&image.data)
@@ -311,11 +362,95 @@ async fn hydrate_images(directory: &Path, message: &mut Message) -> Result<()> {
     Ok(())
 }
 
+pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+
+pub struct SessionLock(std::fs::File);
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // unlock before close: forked tool children may briefly inherit the descriptor
+        self.0.unlock().ok();
+    }
+}
+
+pub fn lock_session(directory: &Path) -> Result<SessionLock> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("session.lock"))?;
+    file.try_lock()
+        .context("session is already owned by another Rope process")?;
+    Ok(SessionLock(file))
+}
+
+pub async fn store_attachment(directory: &Path, bytes: &[u8]) -> Result<ImageContent> {
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        bail!("image exceeds the 16 MiB attachment limit");
+    }
+    let format = image::guess_format(bytes).context("unsupported image")?;
+    let (extension, mime_type) = match format {
+        image::ImageFormat::Png => ("png", "image/png"),
+        image::ImageFormat::Jpeg => ("jpg", "image/jpeg"),
+        image::ImageFormat::Gif => ("gif", "image/gif"),
+        image::ImageFormat::WebP => ("webp", "image/webp"),
+        _ => bail!("use a PNG, JPEG, GIF, or WebP image"),
+    };
+    let (width, height) =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), format).into_dimensions()?;
+    if u64::from(width) * u64::from(height) > 64 * 1024 * 1024 {
+        bail!("image exceeds the 64 megapixel limit");
+    }
+    tokio::fs::create_dir_all(directory.join("attachments")).await?;
+    let path = format!("attachments/{}.{extension}", uuid::Uuid::new_v4());
+    tokio::fs::write(directory.join(&path), bytes).await?;
+    Ok(ImageContent {
+        mime_type: mime_type.into(),
+        data: STANDARD.encode(bytes),
+        path: Some(path),
+        width,
+        height,
+    })
+}
+
+pub async fn load_attachment(directory: &Path, id: &str) -> Result<ImageContent> {
+    let name = id
+        .strip_prefix("attachments/")
+        .context("invalid attachment ID")?;
+    if clean_name(name)? != name {
+        bail!("invalid attachment ID");
+    }
+    let root = tokio::fs::canonicalize(directory.join("attachments")).await?;
+    let path = tokio::fs::canonicalize(root.join(name)).await?;
+    if !path.starts_with(&root)
+        || tokio::fs::metadata(&path).await?.len() > MAX_ATTACHMENT_BYTES as u64
+    {
+        bail!("invalid attachment");
+    }
+    let bytes = tokio::fs::read(path).await?;
+    let mime_type = match image::guess_format(&bytes)? {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        _ => bail!("unsupported image"),
+    };
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    Ok(ImageContent {
+        mime_type: mime_type.into(),
+        data: STANDARD.encode(bytes),
+        path: Some(id.into()),
+        width,
+        height,
+    })
+}
+
 fn message_images_mut(message: &mut Message) -> Vec<&mut crate::runtime::ImageContent> {
     match message {
-        Message::User { images, .. } | Message::Steer { images, .. } => {
-            images.iter_mut().collect()
-        }
+        Message::User { images, .. } | Message::Steer { images, .. } => images.iter_mut().collect(),
         Message::Tool {
             image: Some(image), ..
         } => vec![image],
@@ -334,14 +469,19 @@ async fn first_user_message(path: &Path) -> Option<String> {
         .next()
 }
 
-fn sessions_root() -> Result<PathBuf> {
+pub fn sessions_root() -> Result<PathBuf> {
     let base = directories::BaseDirs::new().context("home directory not found")?;
     Ok(base.data_dir().join("harness/sessions"))
 }
 
-fn clean_name(name: &str) -> Result<String> {
+pub fn clean_name(name: &str) -> Result<String> {
     let name = name.trim();
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+    if name.is_empty()
+        || name.contains(['/', '\\', ':'])
+        || name.chars().any(char::is_control)
+        || name == "."
+        || name == ".."
+    {
         bail!("invalid session name");
     }
     Ok(name.to_owned())
@@ -389,7 +529,10 @@ mod tests {
     fn generated_titles_replace_only_automatic_names_for_display() {
         let mut session = Session {
             root: PathBuf::new(),
+            creation_lock: None,
             meta: SessionMeta {
+                project_root: None,
+                settings: None,
                 name: "session-123".into(),
                 title: None,
                 plan: None,
@@ -419,7 +562,10 @@ mod tests {
     fn session_cost_requires_a_price_for_every_usage() {
         let mut session = Session {
             root: PathBuf::new(),
+            creation_lock: None,
             meta: SessionMeta {
+                project_root: None,
+                settings: None,
                 name: "priced".into(),
                 title: None,
                 plan: None,

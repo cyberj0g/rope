@@ -34,6 +34,38 @@ Jump straight in by passing a startup request:
 rope "what is this repo up to?"
 ```
 
+## Shared core and browser clients
+
+The TUI is an in-process client of the same core used by remote clients. Start
+one server in your project directory:
+
+```sh
+rope --headless --listen 127.0.0.1:8787
+```
+
+Open `http://127.0.0.1:8787` for the included minimal browser client. Paste the
+token from the file whose path Rope prints at startup (normally
+`~/.config/rope/server-token`). You can also supply `ROPE_SERVER_TOKEN` or
+`--token-file PATH`. Open the served page over HTTP, rather than opening the
+example HTML file directly.
+
+Use `rope --listen 127.0.0.1:8787` to attach the TUI to that same core. With a
+listener enabled, exiting the TUI leaves the foreground server running; Ctrl-C
+stops it. Plain `rope` still starts a private core and TUI without a listener.
+Headless mode requires existing provider configuration and creates no session
+until requested, unless you supply `--session NAME` or a startup request.
+
+Clients share the catalog and can open the same session or work concurrently in
+different sessions. Every client can send, steer, cancel, and approve. Sending
+during a turn queues a steer; disconnecting or switching sessions leaves work
+running. Each session has its own model settings, approvals, shell jobs, and
+browser context. Sessions share the project's files.
+
+The listener defaults to loopback. For access through a reverse proxy, use
+HTTPS/WSS and add the browser's exact origin with `--allow-origin https://rope.example`.
+All authenticated clients have equal control. See [the protocol documentation](CLIENT_SERVER.md)
+for WebSocket messages, attachments, reconnect behavior, and current limits.
+
 
 ## Highlights
 
@@ -62,10 +94,10 @@ rope "what is this repo up to?"
   is found, the web tools are unavailable, but the rest of the harness
   works normally.
 - [Ripgrep](https://ripgrep.org/) is recommended. If missing, relevant tools use fallback utilities.
-- An interactive terminal (a real TTY): rope is a full-screen TUI that uses
+- For the TUI, an interactive terminal (a real TTY) supporting raw mode,
+  the alternate screen, mouse reporting, and bracketed paste.
+  `--headless` works without a terminal, including with redirected input/output.
 - A Rust toolchain to build from source.
-- Raw mode, the alternate screen, mouse reporting, and bracketed paste, so
-  it needs any modern terminal, and it does not work piped or redirected.
 
 ## Features
 
