@@ -285,9 +285,7 @@ struct TurnResult {
 /// with it and the next turn would start as if nothing had happened.
 #[derive(Clone, Default)]
 struct TurnProgress {
-    /// The turn's tail — its user prompt and everything delivered since,
-    /// exactly as the agent's working context holds it; the same tail the
-    /// turn would return on a clean finish.
+    /// the full turn transcript, including work removed from model context
     messages: Vec<Message>,
     /// Compaction the turn applied (turn-start or mid-turn), if any.
     compaction: Option<Compaction>,
@@ -339,6 +337,7 @@ async fn persist_interrupted_turn(
         messages: mut tail,
         compaction,
     } = progress.lock().unwrap().clone();
+    let compacted = compaction.is_some();
     let tool_error = if marker == CANCELLED_BY_USER {
         CANCELLED_TOOL_OUTPUT.to_owned()
     } else {
@@ -349,7 +348,9 @@ async fn persist_interrupted_turn(
     if let Some(compaction) = compaction {
         let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
         session.meta.compaction_summary = Some(compaction.summary);
-        session.meta.compacted_through = compaction.through;
+        // the marker precedes the turn, shifting boundaries inside it
+        session.meta.compacted_through =
+            compaction.through + usize::from(compaction.through > turn_from);
         messages.push(marker);
     }
     messages.extend(tail);
@@ -363,6 +364,9 @@ async fn persist_interrupted_turn(
             .map(UserPrompt::steer_message),
     );
     messages.push(Message::system(marker.into()));
+    if compacted {
+        session.meta.context_tokens = estimate_tokens(&request_context(messages, &session.meta));
+    }
     session.append(&messages[turn_from..]).await?;
     session.save().await
 }
@@ -744,6 +748,14 @@ async fn turn<P: Provider + ?Sized>(
     // so record it for interruption salvage: the summary subsumes the
     // history that stays in the session file but leaves the model context.
     progress.lock().unwrap().compaction = compaction.clone();
+    if let Some(compaction) = &compaction {
+        events
+            .send(Event::ContextCompacted {
+                summary: compaction.summary.clone(),
+            })
+            .await
+            .ok();
+    }
     let (completed, mid_turn_compaction) = agent(
         provider.clone(),
         tools,
@@ -818,15 +830,24 @@ async fn summarize<P: Provider + ?Sized>(
     // budget both fit. Trimming only to the minimum would leave a
     // reasoning model a few hundred tokens to think and answer in, so it
     // runs out mid-thought and writes no summary at all.
+    // small windows need a smaller output reserve to retain the source
+    let output_budget = |input| {
+        summary_output_budget(input)
+            .min(max_context / 4)
+            .max(SUMMARY_MIN_OUTPUT_TOKENS)
+    };
     let mut input_tokens = estimate_tokens(&request_messages);
-    while input_tokens + summary_output_budget(input_tokens) > max_context
+    while input_tokens + output_budget(input_tokens) > max_context
         && drop_oldest_message(&mut request_messages)
     {
         input_tokens = estimate_tokens(&request_messages);
     }
+    if request_messages.len() <= 2 {
+        bail!("context exhausted: no conversation fits in the compaction request");
+    }
     let max_tokens = max_context
         .saturating_sub(input_tokens)
-        .min(summary_output_budget(input_tokens));
+        .min(output_budget(input_tokens));
     if max_tokens < SUMMARY_MIN_OUTPUT_TOKENS {
         bail!("context exhausted: the compaction request itself does not fit the context");
     }
@@ -872,12 +893,6 @@ async fn summarize<P: Provider + ?Sized>(
         };
         bail!("compaction produced no summary text: {why}");
     }
-    events
-        .send(Event::ContextCompacted {
-            summary: summary.clone(),
-        })
-        .await
-        .ok();
     Ok(summary)
 }
 
@@ -931,12 +946,9 @@ fn summary_output_budget(input_tokens: u64) -> u64 {
     input_tokens.div_ceil(8).max(4_096)
 }
 
-/// Drops the oldest summarized message from a compaction request, along
-/// with the tool results it introduced, so the request never starts on
-/// an orphaned tool result. Returns false when only the system prompt
-/// remains.
+/// drops the oldest message and its tool results, retaining both summary instructions
 fn drop_oldest_message(request: &mut Vec<Message>) -> bool {
-    if request.len() <= 1 {
+    if request.len() <= 2 {
         return false;
     }
     let mut extra = 0;
@@ -1165,7 +1177,7 @@ async fn agent<P: Provider + ?Sized>(
     tools: &ToolRegistry,
     config: &Config,
     mut messages: Vec<Message>,
-    mut persist_from: usize,
+    persist_from: usize,
     user_full_index: usize,
     project_prompt: Option<String>,
     mut current_plan: Option<ExecutionPlan>,
@@ -1175,10 +1187,39 @@ async fn agent<P: Provider + ?Sized>(
     internal: &mpsc::Sender<InternalEvent>,
 ) -> Result<(Vec<Message>, Option<Compaction>)> {
     let mut compaction = None;
-    // One mid-turn compaction per turn: if it cannot free room, the turn
-    // fails instead of overflowing the context or looping.
-    let mut compacted_mid_turn = false;
+    let mut used_context_tokens: Option<u64> = None;
+    let mut recovered_truncation = false;
+    progress.lock().unwrap().messages = messages[persist_from..].to_vec();
     loop {
+        let queued = steers
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(UserPrompt::steer_message)
+            .collect::<Vec<_>>();
+        let predicted =
+            used_context_tokens.map(|used| used.saturating_add(estimate_tokens(&queued)));
+        let max_tokens = config.active_model().max_context_tokens;
+        let compact_before_request = predicted.is_some_and(|used| {
+            used as f64 >= max_tokens as f64 * config.compaction_threshold as f64
+        });
+        if compact_before_request {
+            let boundary = messages.len();
+            compaction = Some(
+                compact_mid_turn(
+                    provider.clone(),
+                    config,
+                    &mut messages,
+                    boundary,
+                    user_full_index,
+                    progress,
+                    events,
+                    internal,
+                )
+                .await?,
+            );
+        }
         // Steering prompts sent during this turn are injected here, so the
         // next model request carries them after everything delivered so
         // far — including in-flight tool results.
@@ -1195,6 +1236,24 @@ async fn agent<P: Provider + ?Sized>(
                 .ok();
             messages.extend(steered.iter().cloned());
             progress.lock().unwrap().messages.extend(steered);
+        }
+        if compact_before_request {
+            let available = available_context_tokens(
+                &messages,
+                config,
+                project_prompt.as_deref(),
+                current_plan.as_ref(),
+            );
+            if available == 0 {
+                bail!("context exhausted: compaction could not free room for the next request");
+            }
+            events
+                .send(Event::ContextChanged {
+                    tokens: max_tokens - available,
+                    max_tokens,
+                })
+                .await
+                .ok();
         }
         events
             .send(Event::ModelRequestStarted(config.model_id().to_owned()))
@@ -1217,7 +1276,7 @@ async fn agent<P: Provider + ?Sized>(
             tools: tools.definitions(config.active_model().vision),
         };
         let stream = stream_with_retry(&provider, request, events).await?;
-        let (reasoning, text, mut calls, usage, response_items) =
+        let (reasoning, text, mut calls, usage, response_items, truncated) =
             collect(stream, events, internal).await?;
         // The tool call cap applies between assistant messages, not per turn.
         calls.truncate(MAX_TOOL_CALLS_PER_MESSAGE);
@@ -1230,7 +1289,7 @@ async fn agent<P: Provider + ?Sized>(
         );
         messages.push(response.clone());
         progress.lock().unwrap().messages.push(response);
-        let mut used_context_tokens = usage.map_or_else(
+        let mut used = usage.map_or_else(
             || {
                 config
                     .active_model()
@@ -1245,10 +1304,21 @@ async fn agent<P: Provider + ?Sized>(
             |usage| usage.total_tokens,
         );
         if calls.is_empty() {
+            if let Some(reason) = truncated {
+                if !recovered_truncation
+                    && used as f64 >= max_tokens as f64 * config.compaction_threshold as f64
+                {
+                    // a full context can cut off the response before it emits a tool call
+                    recovered_truncation = true;
+                    used_context_tokens = Some(used);
+                    continue;
+                }
+                bail!("model response was truncated before finishing: {reason}");
+            }
             // The turn is done: no job outlives it, so a command the model
             // stopped polling is killed instead of running unattended.
             tools.cancel_active().await;
-            return Ok((messages[persist_from..].to_vec(), compaction));
+            return Ok((progress.lock().unwrap().messages.clone(), compaction));
         }
 
         for (index, call) in calls.iter().enumerate() {
@@ -1268,45 +1338,41 @@ async fn agent<P: Provider + ?Sized>(
             // bounds the next model request, not just the content.
             let overhead = tool_message_overhead(&call);
             let max_tokens = config.active_model().max_context_tokens;
-            let mut remaining = max_tokens.saturating_sub(used_context_tokens);
+            let mut remaining = max_tokens.saturating_sub(used);
             if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
-                // Not even the control envelope fits. Compact the
-                // conversation up to this turn's user message — the user,
-                // the assistant calls, and the results delivered so far
-                // all stay, so results still match their calls — and
-                // measure the freed context.
-                let boundary = persist_from;
-                if boundary == 0 || compacted_mid_turn {
-                    bail!("context exhausted: no room left for a tool result");
+                // keep the pending batch and its preceding prompts together
+                let mut boundary = messages
+                    .iter()
+                    .rposition(|message| matches!(message, Message::Assistant { .. }))
+                    .unwrap();
+                while boundary > 0
+                    && matches!(
+                        messages[boundary - 1],
+                        Message::User { .. } | Message::Steer { .. }
+                    )
+                {
+                    boundary -= 1;
                 }
-                let summary = summarize(
-                    provider.clone(),
-                    config,
-                    &messages[..boundary],
-                    events,
-                    internal,
-                )
-                .await?;
-                messages.splice(
-                    0..boundary,
-                    [Message::system(format!(
-                        "Conversation summary for continuation:\n{summary}"
-                    ))],
+                compaction = Some(
+                    compact_mid_turn(
+                        provider.clone(),
+                        config,
+                        &mut messages,
+                        boundary,
+                        user_full_index,
+                        progress,
+                        events,
+                        internal,
+                    )
+                    .await?,
                 );
-                persist_from = 1;
-                compacted_mid_turn = true;
-                compaction = Some(Compaction {
-                    summary,
-                    through: user_full_index,
-                });
-                progress.lock().unwrap().compaction = compaction.clone();
-                used_context_tokens = max_tokens.saturating_sub(available_context_tokens(
+                used = max_tokens.saturating_sub(available_context_tokens(
                     &messages,
                     config,
                     project_prompt.as_deref(),
                     current_plan.as_ref(),
                 ));
-                remaining = max_tokens.saturating_sub(used_context_tokens);
+                remaining = max_tokens.saturating_sub(used);
                 if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
                     bail!("context exhausted: compaction could not free room for a tool result");
                 }
@@ -1421,12 +1487,56 @@ async fn agent<P: Provider + ?Sized>(
                 internal.send(InternalEvent::PlanUpdated(plan)).await?;
             }
             let message = Message::tool(call.id, output, image, diff);
-            used_context_tokens =
-                used_context_tokens.saturating_add(estimate_tokens(std::slice::from_ref(&message)));
+            used = used.saturating_add(estimate_tokens(std::slice::from_ref(&message)));
             messages.push(message.clone());
             progress.lock().unwrap().messages.push(message);
         }
+        recovered_truncation = false;
+        used_context_tokens = Some(used);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compact_mid_turn<P: Provider + ?Sized>(
+    provider: Arc<P>,
+    config: &Config,
+    messages: &mut Vec<Message>,
+    boundary: usize,
+    user_full_index: usize,
+    progress: &TurnProgressHandle,
+    events: &mpsc::Sender<Event>,
+    internal: &mpsc::Sender<InternalEvent>,
+) -> Result<Compaction> {
+    let through = {
+        let progress = progress.lock().unwrap();
+        let through = user_full_index
+            + progress
+                .messages
+                .len()
+                .saturating_sub(messages.len() - boundary);
+        if boundary == 0
+            || progress
+                .compaction
+                .as_ref()
+                .is_some_and(|previous| previous.through == through)
+        {
+            bail!("context exhausted: no new history to compact");
+        }
+        through
+    };
+    let summary = summarize(provider, config, &messages[..boundary], events, internal).await?;
+    messages.splice(0..boundary, [Message::system(format!(
+        "Conversation summary for continuation:\n{summary}\n\nContinue the unfinished work from this summary."
+    ))]);
+    let compaction = Compaction { summary, through };
+    progress.lock().unwrap().compaction = Some(compaction.clone());
+    events
+        .send(Event::ContextCompacted {
+            summary: compaction.summary.clone(),
+        })
+        .await
+        .ok();
+    Ok(compaction)
 }
 
 fn available_context_tokens(
@@ -1631,12 +1741,14 @@ async fn collect(
     Vec<ToolCall>,
     Option<Usage>,
     Vec<serde_json::Value>,
+    Option<String>,
 )> {
     let mut reasoning = String::new();
     let mut text = String::new();
     let mut calls: Vec<ToolDraft> = Vec::new();
     let mut usage = None;
     let mut response_items = Vec::new();
+    let mut truncated = None;
     let mut started = None;
     while let Some(delta) = stream.next().await {
         let delta = delta?;
@@ -1655,9 +1767,7 @@ async fn collect(
             }
             ResponseDelta::Usage(tokens) => usage = Some(tokens),
             ResponseDelta::OutputItem(item) => response_items.push(item),
-            // The main request has no output cap, so a provider-side
-            // truncation still yields whatever text arrived.
-            ResponseDelta::Truncated(_) => {}
+            ResponseDelta::Truncated(reason) => truncated = Some(reason),
             ResponseDelta::Completed => {}
             ResponseDelta::ToolCall {
                 index,
@@ -1710,7 +1820,7 @@ async fn collect(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((reasoning, text, calls, usage, response_items))
+    Ok((reasoning, text, calls, usage, response_items, truncated))
 }
 
 #[cfg(test)]
@@ -2063,6 +2173,7 @@ mod tests {
         tools.insert(SlowEcho(vec!["12345678".into(); 32]), Approval::Allow);
         let mut config = Config::default();
         config.models[0].max_context_tokens = 200;
+        config.compaction_threshold = 1.0;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, mut internal_rx) = mpsc::channel(2);
         // Drain events while the agent runs: with enough tool output deltas
@@ -2137,6 +2248,7 @@ mod tests {
         tools.insert(SlowEcho(vec!["a".repeat(1_000)]), Approval::Allow);
         let mut config = Config::default();
         config.models[0].max_context_tokens = 200;
+        config.compaction_threshold = 1.0;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
         let collector = tokio::spawn(async move {
@@ -2309,6 +2421,7 @@ mod tests {
         tools.insert(Echo, Approval::Allow);
         let mut config = Config::default();
         config.models[0].max_context_tokens = 100;
+        config.compaction_threshold = 1.0;
         let (event_tx, _event_rx) = mpsc::channel(32);
         let (internal_tx, mut internal_rx) = mpsc::channel(4);
 
@@ -2367,6 +2480,7 @@ mod tests {
         tools.insert(ShellPollTool(jobs), Approval::Allow);
         let mut config = Config::default();
         config.models[0].max_context_tokens = 200;
+        config.compaction_threshold = 1.0;
         let (event_tx, event_rx) = mpsc::channel(16);
         drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(4);
@@ -2410,6 +2524,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mid_turn_compaction_summarizes_the_first_turn_and_repeats() {
+        let mut responses = Vec::new();
+        for index in 1..=2 {
+            responses.push(vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some(format!("call_{index}")),
+                    name: Some("echo".into()),
+                    arguments: json!({"value": format!("result {index}")}).to_string(),
+                },
+                ResponseDelta::Usage(Usage {
+                    prompt_tokens: 3_000,
+                    total_tokens: 3_200,
+                }),
+            ]);
+            responses.push(vec![
+                ResponseDelta::Text(format!("summary {index}")),
+                ResponseDelta::Completed,
+            ]);
+        }
+        responses.push(vec![ResponseDelta::Text("finished".into())]);
+        let provider = Arc::new(MockProvider::new(responses));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 4_096;
+        let (events, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let (internal, _receiver) = mpsc::channel(8);
+        let progress = fresh_progress();
+
+        let (completed, compaction) = agent(
+            provider.clone(),
+            &tools,
+            &config,
+            vec![Message::user("keep working".into())],
+            0,
+            0,
+            None,
+            None,
+            &no_steers(),
+            &progress,
+            &events,
+            &internal,
+        )
+        .await
+        .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        for index in 0..2 {
+            let summary = &requests[index * 2 + 1];
+            assert!(summary.tools.is_empty());
+            assert!(summary.messages.iter().any(|message| {
+                matches!(message, Message::Tool { content, .. } if content == &format!("result {}", index + 1))
+            }));
+            let continuation = &requests[index * 2 + 2];
+            assert!(
+                continuation.messages[0]
+                    .content()
+                    .contains(&format!("summary {}", index + 1))
+            );
+            assert!(
+                !continuation
+                    .messages
+                    .iter()
+                    .any(|message| matches!(message, Message::Tool { .. }))
+            );
+        }
+        assert!(
+            requests[3]
+                .messages
+                .iter()
+                .any(|message| message.content().contains("summary 1"))
+        );
+        assert_eq!(completed.len(), 6);
+        assert_eq!(completed[0].content(), "keep working");
+        assert_eq!(completed.last().unwrap().content(), "finished");
+        assert_eq!(progress.lock().unwrap().messages, completed);
+        assert_eq!(compaction.unwrap().through, 5);
+    }
+
+    #[tokio::test]
     async fn tool_output_budget_compacts_mid_turn_and_never_exceeds_the_context() {
         let provider = Arc::new(MockProvider::new(vec![
             vec![
@@ -2421,7 +2618,7 @@ mod tests {
                 },
                 ResponseDelta::Usage(Usage {
                     prompt_tokens: 0,
-                    total_tokens: 190,
+                    total_tokens: 1_014,
                 }),
             ],
             // The mid-turn compaction request: summarize the earlier
@@ -2434,7 +2631,7 @@ mod tests {
         tools.insert(ShellTool(jobs.clone()), Approval::Allow);
         tools.insert(ShellPollTool(jobs), Approval::Allow);
         let mut config = Config::default();
-        config.models[0].max_context_tokens = 200;
+        config.models[0].max_context_tokens = 1_024;
         let (event_tx, event_rx) = mpsc::channel(16);
         drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(4);
@@ -3399,12 +3596,15 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(8);
         let (internal_tx, _internal_rx) = mpsc::channel(2);
 
-        // ~1,800 tokens per message: neither message can sit next to the
-        // 4096-token floor, so the trim falls back to the summarizer
-        // prompt alone rather than an impossible request.
+        // retain recent work and the final instruction in a small window
         let messages = vec![
             Message::user("a".repeat(7_200)),
-            Message::assistant("a".repeat(7_200), "model".into(), String::new(), Vec::new()),
+            Message::assistant(
+                "recent work ".repeat(300),
+                "model".into(),
+                String::new(),
+                Vec::new(),
+            ),
         ];
         summarize(
             provider.clone(),
@@ -3420,8 +3620,17 @@ mod tests {
         let input_tokens = estimate_tokens(&request.messages);
         assert_eq!(
             request.messages.len(),
-            1,
-            "the whole conversation must be dropped"
+            3,
+            "retain both instructions and the recent work"
+        );
+        assert_eq!(request.messages[1], messages[1]);
+        assert!(
+            request
+                .messages
+                .last()
+                .unwrap()
+                .content()
+                .starts_with("Write the continuation summary")
         );
         assert!(
             request.max_tokens.unwrap() as u64 >= 128,
@@ -3431,6 +3640,26 @@ mod tests {
             input_tokens + request.max_tokens.unwrap() as u64 <= 2_048,
             "input + output must fit the context"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_refuses_to_summarize_an_empty_trimmed_context() {
+        let provider = Arc::new(MockProvider::new(Vec::new()));
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 2_048;
+        let (events, _receiver) = mpsc::channel(8);
+        let (internal, _receiver) = mpsc::channel(2);
+        let error = summarize(
+            provider.clone(),
+            &config,
+            &[Message::user("x".repeat(12_000))],
+            &events,
+            &internal,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no conversation fits"));
+        assert!(provider.requests().is_empty());
     }
 
     #[test]
@@ -3561,6 +3790,7 @@ mod tests {
         tools.insert(BigImage, Approval::Allow);
         let mut config = Config::default();
         config.models[0].max_context_tokens = 200;
+        config.compaction_threshold = 1.0;
         let (event_tx, event_rx) = mpsc::channel(16);
         // Never read: drop the receiver so event sends fail fast instead
         // of blocking once the buffer fills.

@@ -162,6 +162,7 @@ pub struct UiState {
     /// inserted into), so the per-index render cache can be dropped.
     pub layout_generation: u64,
     pub generating: bool,
+    compacting: bool,
     pub connecting: bool,
     pub waiting: bool,
     pub tool_running: bool,
@@ -330,6 +331,7 @@ impl UiState {
             input: String::new(),
             blocks: Vec::new(),
             generating: false,
+            compacting: false,
             connecting: false,
             waiting: false,
             tool_running: false,
@@ -1142,6 +1144,7 @@ impl UiState {
             }
             Event::OperationStarted { id, compacting } => {
                 self.turn_id = Some(id);
+                self.compacting = compacting;
                 if compacting {
                     self.generating = true;
                     self.notice = Some("compacting context".into());
@@ -1237,6 +1240,7 @@ impl UiState {
             }
             Event::GenerationStarted => {
                 self.generating = true;
+                self.compacting = false;
                 self.connecting = true;
                 self.waiting = false;
                 self.tool_running = false;
@@ -1493,7 +1497,7 @@ impl UiState {
                     expanded: false,
                     summary: Some(summary),
                 };
-                let index = if self.generating {
+                let index = if self.generating && !self.compacting {
                     self.blocks
                         .iter()
                         .rposition(|block| {
@@ -1533,6 +1537,7 @@ impl UiState {
                     );
                 }
                 self.generating = false;
+                self.compacting = false;
                 self.connecting = false;
                 self.waiting = false;
                 self.tool_running = false;
@@ -1586,6 +1591,7 @@ impl UiState {
                     summary: None,
                 });
                 self.generating = false;
+                self.compacting = false;
                 self.connecting = false;
                 self.waiting = false;
                 self.tool_running = false;
@@ -1604,6 +1610,7 @@ impl UiState {
                 self.approval_id = None;
                 self.finish_reasoning();
                 self.generating = false;
+                self.compacting = false;
                 self.connecting = false;
                 self.waiting = false;
                 self.tool_running = false;
@@ -1723,6 +1730,7 @@ impl UiState {
         self.session = state.title;
         self.turn_id = state.turn_id;
         self.generating = self.turn_id.is_some();
+        self.compacting = state.compacting;
         self.connecting = matches!(state.phase.as_str(), "connecting" | "retrying");
         self.waiting = state.phase == "waiting";
         self.tool_running = state.phase == "tool";
@@ -2315,13 +2323,51 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restores_manual_compaction_marker_placement() {
+        let mut projection = crate::core::state::Projection::new("compact".into());
+        for event in [
+            Event::MessageAccepted(Message::user("work".into())),
+            Event::GenerationStarted,
+            Event::TextDelta("done".into()),
+            Event::GenerationFinished,
+            Event::OperationStarted {
+                id: "compact".into(),
+                compacting: true,
+            },
+        ] {
+            projection.apply(&event);
+        }
+        let mut state = UiState::new();
+        state.apply(Event::Snapshot(Box::new(projection.snapshot())));
+        let event = Event::ContextCompacted {
+            summary: "summary".into(),
+        };
+        let changes = projection.apply(&event);
+        state.apply(Event::Update(std::sync::Arc::new(crate::core::Update {
+            session_id: "compact".into(),
+            seq: projection.snapshot.seq,
+            changes,
+            event,
+        })));
+        assert!(
+            matches!(state.blocks.last().unwrap(), ChatBlock::Message { summary: Some(summary), .. } if summary == "summary")
+        );
+        assert_eq!(
+            state.block_ids.last().unwrap(),
+            &projection.snapshot.blocks.last().unwrap().id
+        );
+    }
+
+    #[test]
     fn manual_compaction_marker_appends_to_the_conversation_end() {
         let mut state = UiState::new();
         state.push_user("build the feature".into());
         state.apply(Event::TextDelta("done".into()));
         state.apply(Event::GenerationFinished);
-        // No active generation: a manual /compact marker lands where the
-        // transcript persists it — after the last assistant answer.
+        state.apply(Event::OperationStarted {
+            id: "compact".into(),
+            compacting: true,
+        });
         state.apply(Event::ContextCompacted {
             summary: "dense summary".into(),
         });

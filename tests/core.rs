@@ -316,6 +316,138 @@ async fn approval_is_shared_and_resolved_once() {
 }
 
 #[tokio::test]
+async fn a_response_cut_off_at_the_context_limit_compacts_and_continues() {
+    let mut config = rope::config::Config::default();
+    config.models[0].max_context_tokens = 8_192;
+    let mut harness = Harness::with_config(config).await;
+    let core = harness.core.clone();
+    let id = core.create(Some("truncated".into())).await.unwrap();
+    let mut subscription = core.subscribe(&id).await.unwrap();
+    core.command(&id, prompt("finish the work")).await.unwrap();
+    let request = harness.next().await;
+    for delta in [
+        ResponseDelta::Text("work so far".into()),
+        ResponseDelta::Usage(rope::provider::Usage {
+            prompt_tokens: 6_000,
+            total_tokens: 8_192,
+        }),
+        ResponseDelta::Truncated("max_output_tokens".into()),
+    ] {
+        request.stream.send(Ok(delta)).unwrap();
+    }
+    drop(request);
+    let summary = harness.next().await;
+    assert!(summary.request.tools.is_empty());
+    summary.finish("work remains to be done");
+    let continuation = harness.next().await;
+    assert!(continuation.request.messages.iter().any(|message| {
+        matches!(message, Message::System { content } if content.contains("work remains to be done"))
+    }));
+    continuation.finish("finished");
+    until(&mut subscription, |event| {
+        matches!(event, Event::GenerationFinished)
+    })
+    .await;
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn mid_turn_compaction_preserves_steering_and_the_saved_boundary() {
+    for cancel in [false, true] {
+        let mut config = rope::config::Config::default();
+        config.models[0].max_context_tokens = 8_192;
+        let mut harness = Harness::with_config(config).await;
+        std::fs::write(harness.project.path().join("note.txt"), "completed work").unwrap();
+        let core = harness.core.clone();
+        let id = core.create(Some("mid-turn".into())).await.unwrap();
+        let mut subscription = core.subscribe(&id).await.unwrap();
+        let turn_id = core
+            .command(&id, prompt("read the note and continue"))
+            .await
+            .unwrap()
+            .turn_id
+            .unwrap();
+        let request = harness.next().await;
+        request
+            .stream
+            .send(Ok(ResponseDelta::Usage(rope::provider::Usage {
+                prompt_tokens: 6_000,
+                total_tokens: 6_500,
+            })))
+            .unwrap();
+        request.tool("read", json!({"path": "note.txt"}));
+
+        let summary = harness.next().await;
+        assert!(
+            summary.request.tools.is_empty(),
+            "compact before asking the model to continue"
+        );
+        assert!(summary.request.messages.iter().any(|message| {
+            matches!(message, Message::Tool { content, .. } if content.contains("completed work"))
+        }));
+        core.command(&id, prompt("also check the tests"))
+            .await
+            .unwrap();
+        summary.finish("the note has been read; keep working");
+
+        let continuation = harness.next().await;
+        assert!(continuation.request.messages.iter().any(|message| {
+            matches!(message, Message::Steer { content, .. } if content == "also check the tests")
+        }));
+        assert!(
+            !continuation
+                .request
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool { .. }))
+        );
+        if cancel {
+            core.command(&id, Action::Cancel { turn_id }).await.unwrap();
+            until(&mut subscription, |event| {
+                matches!(event, Event::GenerationCancelled)
+            })
+            .await;
+            assert!(continuation.stream.is_closed());
+        } else {
+            continuation.finish("finished");
+            until(&mut subscription, |event| {
+                matches!(event, Event::GenerationFinished)
+            })
+            .await;
+        }
+        core.shutdown().await.unwrap();
+
+        let (session, messages) =
+            rope::session::Session::resume_in(harness.storage.path().into(), &id)
+                .await
+                .unwrap();
+        assert_eq!(
+            session.meta.compaction_summary.as_deref(),
+            Some("the note has been read; keep working")
+        );
+        assert_eq!(session.meta.compacted_through, 4);
+        assert!(
+            matches!(&messages[1], Message::User { content, .. } if content == "read the note and continue")
+        );
+        assert!(matches!(&messages[3], Message::Tool { .. }));
+        let remaining = &messages[session.meta.compacted_through..];
+        assert!(
+            matches!(&remaining[0], Message::Steer { content, .. } if content == "also check the tests")
+        );
+        assert_eq!(remaining.len(), 2);
+        if cancel {
+            assert!(
+                matches!(&remaining[1], Message::System { content } if content == "cancelled by user")
+            );
+        } else {
+            assert!(
+                matches!(&remaining[1], Message::Assistant { content, .. } if content == "finished")
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn manual_compaction_stays_responsive_and_can_be_cancelled() {
     let mut harness = Harness::new().await;
     let core = harness.core.clone();
