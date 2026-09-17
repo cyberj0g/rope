@@ -43,11 +43,12 @@ one server in your project directory:
 rope --headless --listen 127.0.0.1:8787
 ```
 
-Open `http://127.0.0.1:8787` for the included minimal browser client. Paste the
-token from the file whose path Rope prints at startup (normally
-`~/.config/rope/server-token`). You can also supply `ROPE_SERVER_TOKEN` or
-`--token-file PATH`. Open the served page over HTTP, rather than opening the
-example HTML file directly.
+Open `http://127.0.0.1:8787` for the included web UI — a mobile-first page
+with the same conversation rendering, tools, plans, Git pane, approvals,
+steering, and image or camera attachments as the TUI. Paste the token from the
+file whose path Rope prints at startup (normally `~/.config/rope/server-token`).
+You can also supply `ROPE_SERVER_TOKEN` or `--token-file PATH`. Open the served
+page over HTTP, rather than opening the example HTML file directly.
 
 Use `rope --listen 127.0.0.1:8787` to attach the TUI to that same core. With a
 listener enabled, exiting the TUI leaves the foreground server running; Ctrl-C
@@ -61,7 +62,9 @@ during a turn queues a steer; disconnecting or switching sessions leaves work
 running. Each session has its own model settings, approvals, shell jobs, and
 browser context. Sessions share the project's files.
 
-The listener defaults to loopback. For access through a reverse proxy, use
+The listener defaults to loopback. Opening the page over the machine's LAN
+address just works — same-origin requests (matching the address the connection
+arrived on) are accepted automatically. For access through a reverse proxy, use
 HTTPS/WSS and add the browser's exact origin with `--allow-origin https://rope.example`.
 All authenticated clients have equal control. See [the protocol documentation](CLIENT_SERVER.md)
 for WebSocket messages, attachments, reconnect behavior, and current limits.

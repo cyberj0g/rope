@@ -20,11 +20,14 @@ snapshot and pushes subsequent changes automatically. Each topic has its own
 sequence number; catalog and project messages replace their previous snapshots.
 
 All clients share control. Use a token from `ROPE_SERVER_TOKEN` or the private
-token file, generated on first network startup. Browser Origins must exactly
-match the default loopback origins or a repeated `--allow-origin` argument.
-Non-browser clients may omit Origin but still need authentication. For remote
-access terminate HTTPS/WSS at a reverse proxy. Tokens belong in the first frame,
-never in the URL. There is no remote process-shutdown command.
+token file, generated on first network startup. A browser Origin is accepted
+when it matches the connection's own local address (same-origin, so LAN and
+loopback access work without configuration), the default loopback origins, or
+a repeated `--allow-origin` argument. Cross-origin requests from any other
+origin are rejected. Non-browser clients may omit Origin but still need
+authentication. For remote access terminate HTTPS/WSS at a reverse proxy and
+allow its origin. Tokens belong in the first frame, never in the URL. There is
+no remote process-shutdown command.
 
 ## Requests and replies
 
@@ -150,5 +153,5 @@ loaded session. Metadata is replaced atomically.
 SIGINT/SIGTERM shuts down the process, interrupts active work, saves its recovery
 state, and stops session tools. A process crash can lose uncommitted live output.
 Sessions run concurrently but share project files; this version adds no worktree
-isolation. Full web UI parity, remote TUI attachment, multiple projects per core,
-user roles, and durable event replay are outside v1.
+isolation. Remote TUI attachment, multiple projects per core, user roles, and
+durable event replay are outside v1.

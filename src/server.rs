@@ -3,7 +3,8 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        DefaultBodyLimit, Path, State, WebSocketUpgrade,
+        connect_info::Connected,
+        ConnectInfo, DefaultBodyLimit, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode},
@@ -103,13 +104,16 @@ impl Server {
             .layer(DefaultBodyLimit::max(crate::session::MAX_ATTACHMENT_BYTES))
             .with_state(app);
         let task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let mut stopping = stopping;
-                    stopping.wait_for(|stop| *stop).await.ok();
-                })
-                .await
-                .context("HTTP server")
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<LocalEndpoint>(),
+            )
+            .with_graceful_shutdown(async move {
+                let mut stopping = stopping;
+                stopping.wait_for(|stop| *stop).await.ok();
+            })
+            .await
+            .context("HTTP server")
         });
         Ok(Self {
             address,
@@ -170,16 +174,41 @@ pub fn load_token(path: Option<PathBuf>) -> Result<(String, Option<PathBuf>)> {
     Ok((token, Some(path)))
 }
 
-fn valid_origin(app: &App, headers: &HeaderMap) -> bool {
+/// The local (server-side) address this connection arrived on. With a
+/// wildcard bind this is the concrete interface address the client dialed —
+/// exactly what a page served from here reports in its Origin header.
+#[derive(Clone, Copy, Default)]
+struct LocalEndpoint(Option<std::net::SocketAddr>);
+
+impl Connected<axum::serve::IncomingStream<'_, TcpListener>> for LocalEndpoint {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
+        Self(stream.io().local_addr().ok())
+    }
+}
+
+/// An Origin is allowed when it is on the explicit list or when it is
+/// same-origin: equal to the address this connection actually arrived on.
+/// Browsers set Origin from the page's real URL and web content cannot
+/// forge it, so a same-origin page is trusted without enumeration;
+/// cross-origin pages (including attacker pages) never match.
+fn origin_allowed(allowed: &[String], origin: &str, local: Option<std::net::SocketAddr>) -> bool {
+    allowed.iter().any(|a| a == origin)
+        || local.is_some_and(|local| origin == format!("http://{local}"))
+}
+
+fn valid_origin(app: &App, headers: &HeaderMap, local: Option<std::net::SocketAddr>) -> bool {
     headers.get("origin").is_none_or(|origin| {
-        origin
-            .to_str()
-            .is_ok_and(|origin| app.origins.iter().any(|allowed| allowed == origin))
+        origin.to_str().is_ok_and(|origin| origin_allowed(&app.origins, origin, local))
     })
 }
 
-async fn upgrade(State(app): State<App>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if !valid_origin(&app, &headers) {
+async fn upgrade(
+    State(app): State<App>,
+    ConnectInfo(local): ConnectInfo<LocalEndpoint>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !valid_origin(&app, &headers, local.0) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Ok(permit) = app.connections.clone().try_acquire_owned() else {
@@ -196,10 +225,11 @@ async fn upgrade(State(app): State<App>, headers: HeaderMap, ws: WebSocketUpgrad
 
 async fn authorize_http(
     State(app): State<App>,
+    ConnectInfo(local): ConnectInfo<LocalEndpoint>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if !valid_origin(&app, request.headers()) {
+    if !valid_origin(&app, request.headers(), local.0) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let origin = request.headers().get("origin").cloned();
@@ -536,4 +566,35 @@ async fn enqueue(output: &mpsc::Sender<String>, value: &Value) -> Result<()> {
         .await??;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_allowed;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn explicit_list_and_same_origin_are_allowed() {
+        let allowed = vec!["https://proxy.example".to_owned()];
+        let lan = addr("192.168.1.50:8787");
+        // An explicit list entry always matches.
+        assert!(origin_allowed(&allowed, "https://proxy.example", None));
+        // A page served from the address the connection arrived on is same-origin.
+        assert!(origin_allowed(&[], "http://192.168.1.50:8787", Some(lan)));
+        assert!(origin_allowed(&[], "http://[::1]:8787", Some(addr("[::1]:8787"))));
+    }
+
+    #[test]
+    fn cross_origin_never_matches_the_local_address() {
+        let lan = addr("192.168.1.50:8787");
+        assert!(!origin_allowed(&[], "https://untrusted.example", Some(lan)));
+        assert!(!origin_allowed(&[], "http://192.168.1.50:9999", Some(lan)));
+        assert!(!origin_allowed(&[], "http://other-host:8787", Some(lan)));
+        // Without a local address only the explicit list counts.
+        assert!(!origin_allowed(&[], "http://192.168.1.50:8787", None));
+    }
 }
