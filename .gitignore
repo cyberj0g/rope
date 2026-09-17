@@ -2,3 +2,4 @@
 /config.toml
 /.rope/
 /browser-runtime/
+tests/web/shots/
