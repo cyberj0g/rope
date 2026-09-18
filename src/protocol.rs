@@ -5,7 +5,7 @@ use crate::{
     session::SessionInfo,
 };
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_COMMAND_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -39,10 +39,20 @@ pub enum Action {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     CreateSession { name: Option<String> },
+    /// Permanently removes a session: its transcript, attachments, and metadata.
+    DeleteSession { session_id: String },
     Subscribe { session_id: String },
     Unsubscribe { session_id: String },
     Command { session_id: String, action: Action },
     GitDiff { path: Option<String> },
+    /// Serves the catalog through this connection's window: at most `offset`
+    /// entries, starting from the first, of the sessions matching `query`
+    /// (which searches every session on the server, not only the loaded ones).
+    /// Every later catalog push reuses the same query and window.
+    CatalogView { query: Option<String>, offset: usize },
+    /// Delivers the full content of a block that was withheld while
+    /// collapsed; the connection keeps receiving its live updates afterwards.
+    RevealBlock { session_id: String, block_id: String },
 }
 
 #[derive(Debug, Deserialize)]

@@ -28,7 +28,7 @@ impl Client {
             chunks: HashMap::new(),
             hello: Value::Null,
         };
-        client.send(json!({"protocol":1,"token":"test-token","client_id":resume.map(|v| &v["client_id"]),"server_id":resume.map(|v| &v["server_id"])})).await;
+        client.send(json!({"protocol":rope::protocol::VERSION,"token":"test-token","client_id":resume.map(|v| &v["client_id"]),"server_id":resume.map(|v| &v["server_id"])})).await;
         client.hello = client.until(|v| v["type"] == "hello").await;
         client
     }
@@ -273,7 +273,7 @@ async fn transport_authentication_origins_and_attachments_are_enforced() {
         .unwrap();
     wrong
         .send(Message::Text(
-            json!({"protocol":1,"token":"wrong"}).to_string().into(),
+            json!({"protocol":rope::protocol::VERSION,"token":"wrong"}).to_string().into(),
         ))
         .await
         .unwrap();
@@ -554,6 +554,268 @@ async fn file_downloads_require_publication_and_encode_filenames() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn catalog_is_paginated_and_filtered_server_side() {
+    let mut harness = Harness::new().await;
+    for i in 1..=25 {
+        harness
+            .core
+            .create(Some(format!("alpha-{i:02}")))
+            .await
+            .unwrap();
+    }
+    let server = start(&harness).await;
+    let mut client = Client::connect(&server, None).await;
+    let catalog = client.until(|v| v["type"] == "catalog").await;
+    assert_eq!(catalog["catalog"]["sessions"].as_array().unwrap().len(), 20);
+    assert_eq!(catalog["catalog"]["total"], 25);
+
+    // A query matching only rows beyond the first page still finds them:
+    // the filter runs over every session on the server.
+    client
+        .send(json!({"request_id":"1","type":"catalog_view","query":"alpha-2","offset":20}))
+        .await;
+    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "1").await;
+    let mut names: Vec<&str> = reply["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["alpha-20", "alpha-21", "alpha-22", "alpha-23", "alpha-24", "alpha-25"]);
+    assert_eq!(reply["result"]["total"], 6);
+
+    // The connection's window now follows the query: a catalog refresh keeps
+    // it filtered.
+    harness.core.create(Some("alpha-26".into())).await.unwrap();
+    let refreshed = client.until(|v| v["type"] == "catalog").await;
+    assert_eq!(refreshed["catalog"]["total"], 7);
+    assert_eq!(refreshed["catalog"]["sessions"].as_array().unwrap().len(), 7);
+
+    // Widen the window; the reply and the next refresh carry the full page.
+    client
+        .send(json!({"request_id":"2","type":"catalog_view","query":null,"offset":27}))
+        .await;
+    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "2").await;
+    assert_eq!(reply["result"]["sessions"].as_array().unwrap().len(), 26);
+    assert_eq!(reply["result"]["total"], 26);
+    // The next catalog refresh serves the widened, unfiltered window.
+    harness.core.create(Some("beta".into())).await.unwrap();
+    let refreshed = client.until(|v| v["type"] == "catalog").await;
+    assert_eq!(refreshed["catalog"]["sessions"].as_array().unwrap().len(), 27);
+    assert_eq!(refreshed["catalog"]["total"], 27);
+
+    client.socket.close(None).await.unwrap();
+    stop(server, &harness).await;
+}
+
+#[tokio::test]
+async fn sessions_can_be_deleted_but_not_while_running() {
+    let mut harness = Harness::new().await;
+    let doomed = harness.core.create(Some("doomed".into())).await.unwrap();
+    let idle = harness.core.create(Some("idle".into())).await.unwrap();
+    let server = start(&harness).await;
+    let mut client = Client::connect(&server, None).await;
+
+    // Deleting the currently subscribed, running session is refused.
+    client.subscribe(&doomed).await;
+    client
+        .send(json!({"request_id":"2","type":"command","session_id":doomed,"action":{"type":"send_message","content":"work"}}))
+        .await;
+    let _reply = client
+        .until(|v| v["type"] == "reply" && v["request_id"] == "2")
+        .await;
+    let request = harness.next().await; // the turn is now running
+    client
+        .until(|v| {
+            v["type"] == "catalog"
+                && v["catalog"]["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["name"] == doomed && s["activity"] == "running")
+        })
+        .await;
+    client
+        .send(json!({"request_id":"3","type":"delete_session","session_id":doomed}))
+        .await;
+    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "3").await;
+    assert_eq!(reply["error"]["code"], "busy");
+
+    // Unknown sessions are refused too.
+    client
+        .send(json!({"request_id":"4","type":"delete_session","session_id":"ghost"}))
+        .await;
+    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "4").await;
+    assert_eq!(reply["error"]["code"], "unknown");
+
+    request.finish("done");
+    client
+        .until(|v| {
+            v["type"] == "event"
+                && v["update"]["session_id"] == doomed
+                && v["update"]["changes"]
+                    .as_array()
+                    .is_some_and(|c| c.iter().any(|c| c["type"] == "state" && c["state"]["phase"] == "idle"))
+        })
+        .await;
+
+    // Once idle, deletion removes the catalog row and the stored session.
+    client
+        .send(json!({"request_id":"5","type":"delete_session","session_id":doomed}))
+        .await;
+    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "5").await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let refreshed = client.until(|v| v["type"] == "catalog").await;
+    assert!(
+        refreshed["catalog"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["name"] != doomed),
+        "deleted session must leave the catalog"
+    );
+    assert!(!harness.storage.path().join(&doomed).exists());
+    assert!(harness.storage.path().join(&idle).exists());
+
+    // The same request id with the same payload is a safe retry.
+    client
+        .send(json!({"request_id":"5","type":"delete_session","session_id":doomed}))
+        .await;
+    let retry = client.until(|v| v["type"] == "reply" && v["request_id"] == "5").await;
+    assert_eq!(retry, reply);
+
+    client.socket.close(None).await.unwrap();
+    stop(server, &harness).await;
+}
+
+#[tokio::test]
+async fn collapsed_thinking_and_tool_content_is_withheld_until_revealed() {
+    let mut harness = Harness::new().await;
+    tokio::fs::write(harness.project.path().join("notes.md"), "secret tool business")
+        .await
+        .unwrap();
+    let id = harness.core.create(Some("redact".into())).await.unwrap();
+    let server = start(&harness).await;
+    let mut watcher = Client::connect(&server, None).await;
+    watcher.subscribe(&id).await;
+
+    watcher
+        .send(json!({"request_id":"2","type":"command","session_id":id,"action":{"type":"send_message","content":"do it"}}))
+        .await;
+    let _reply = watcher
+        .until(|v| v["type"] == "reply" && v["request_id"] == "2")
+        .await;
+
+    let request = harness.next().await;
+    request
+        .stream
+        .send(Ok(ResponseDelta::Reasoning("pondering deeply".into())))
+        .unwrap();
+    request
+        .stream
+        .send(Ok(ResponseDelta::Text("calling a tool".into())))
+        .unwrap();
+    request
+        .stream
+        .send(Ok(ResponseDelta::ToolCall {
+            index: 0,
+            id: Some("call-1".into()),
+            name: Some("read".into()),
+            arguments: r#"{"path":"notes.md"}"#.into(),
+        }))
+        .unwrap();
+    request.stream.send(Ok(ResponseDelta::Completed)).unwrap();
+    drop(request); // the stream ends, the tool runs, and the turn continues
+    let second = harness.next().await;
+    second.stream
+        .send(Ok(ResponseDelta::Text("done reading".into())))
+        .unwrap();
+    drop(second);
+
+    // Collect the watcher's view of the turn until it finishes.
+    let mut tool_block: Value = Value::Null;
+    let mut saw_tool_insert = false;
+    let mut saw_hidden_append = false;
+    let mut saw_visible_append = false;
+    loop {
+        let value = watcher.next().await;
+        if value["type"] != "event" || value["update"]["session_id"] != id {
+            continue;
+        }
+        let changes = value["update"]["changes"].as_array().unwrap();
+        for change in changes {
+            match change["type"].as_str().unwrap() {
+                "insert" | "replace" => {
+                    if change["block"]["kind"] == "tool" {
+                        saw_tool_insert = true;
+                        tool_block = change["block"].clone();
+                    }
+                }
+                "append" => match change["field"].as_str().unwrap() {
+                    "arguments" | "output" => saw_hidden_append = true,
+                    "content" => saw_visible_append = true,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        if changes.iter().any(|c| c["type"] == "state" && c["state"]["phase"] == "idle") {
+            break;
+        }
+    }
+    assert!(saw_tool_insert, "the tool header must arrive even when collapsed");
+    assert!(saw_visible_append, "assistant text must stream while tools stay redacted");
+    assert!(!saw_hidden_append, "collapsed tool content must not be delivered");
+    assert_eq!(tool_block["tool"]["arguments"], "", "redacted tool arguments");
+    assert!(tool_block["tool"]["output"].is_null(), "redacted tool output");
+    assert_eq!(tool_block["tool"]["redacted"], true);
+    assert_eq!(tool_block["tool"]["name"], "read", "the tool name is visible");
+
+    // A late subscriber gets a redacted snapshot, not the withheld content.
+    let mut late = Client::connect(&server, None).await;
+    let snapshot = late.subscribe(&id).await;
+    let text = snapshot.to_string();
+    assert!(!text.contains("pondering deeply"), "thinking content leaked: {text}");
+    assert!(!text.contains("secret tool business"), "tool output leaked: {text}");
+    assert!(text.contains("done reading"), "assistant content must stay visible");
+    let thinking = snapshot["snapshot"]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["kind"] == "thinking")
+        .unwrap();
+    assert_eq!(thinking["content"], "");
+    assert_eq!(thinking["redacted"], true);
+
+    // Reveal: the full content arrives once, and only for that block.
+    let block_id = tool_block["id"].as_str().unwrap().to_owned();
+    watcher
+        .send(json!({"request_id":"3","type":"reveal_block","session_id":id,"block_id":block_id}))
+        .await;
+    let reply = watcher.until(|v| v["type"] == "reply" && v["request_id"] == "3").await;
+    assert!(reply.get("error").is_none(), "{reply}");
+    let full = &reply["result"]["block"];
+    assert_eq!(
+        full["tool"]["arguments"],
+        serde_json::to_string_pretty(&serde_json::json!({"path": "notes.md"})).unwrap()
+    );
+    assert!(full["tool"]["output"].as_str().unwrap().contains("secret tool business"));
+    assert!(full["tool"].get("redacted").is_none());
+
+    // Unknown blocks are refused.
+    watcher
+        .send(json!({"request_id":"4","type":"reveal_block","session_id":id,"block_id":"nope"}))
+        .await;
+    let reply = watcher.until(|v| v["type"] == "reply" && v["request_id"] == "4").await;
+    assert_eq!(reply["error"]["code"], "unknown_block");
+
+    watcher.socket.close(None).await.unwrap();
+    late.socket.close(None).await.unwrap();
+    stop(server, &harness).await;
+}
+
+#[tokio::test]
 async fn headless_binary_needs_no_tty_and_creates_no_implicit_session() {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -624,7 +886,7 @@ async fn headless_binary_needs_no_tty_and_creates_no_implicit_session() {
         .unwrap();
     socket
         .send(Message::Text(
-            json!({"protocol":1,"token":token.trim()})
+            json!({"protocol":rope::protocol::VERSION,"token":token.trim()})
                 .to_string()
                 .into(),
         ))

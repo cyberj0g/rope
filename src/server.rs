@@ -16,7 +16,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -36,6 +36,8 @@ use crate::{
 
 const CHUNK_BYTES: usize = 32 * 1024;
 const REPLY_CACHE: usize = 128;
+/// How many catalog rows a web client loads at once before asking for more.
+const CATALOG_PAGE: usize = 20;
 
 struct ClientHistory {
     highest: u64,
@@ -44,6 +46,189 @@ struct ClientHistory {
 struct ClientRecord {
     seen: Mutex<Instant>,
     history: AsyncMutex<ClientHistory>,
+}
+
+/// A web client's window onto the session catalog: the rows it has loaded
+/// plus the server-side filter applied to *all* sessions, not just these.
+struct CatalogView {
+    query: Option<String>,
+    offset: usize,
+}
+
+impl CatalogView {
+    fn new() -> Self {
+        Self {
+            query: None,
+            offset: CATALOG_PAGE,
+        }
+    }
+
+    /// The rows this view currently shows, newest first.
+    fn page<'a>(&self, sessions: &'a [crate::protocol::CatalogEntry]) -> Vec<&'a crate::protocol::CatalogEntry> {
+        let filtered = filter_sessions(sessions, self.query.as_deref());
+        filtered.into_iter().take(self.offset).collect()
+    }
+
+    /// How many rows match the filter in total (for the "load more" affordance).
+    fn total(&self, sessions: &[crate::protocol::CatalogEntry]) -> usize {
+        filter_sessions(sessions, self.query.as_deref()).len()
+    }
+}
+
+/// The sidebar filter searches every session on the server — name, generated
+/// title, or first user message — case-insensitively, not only the rows the
+/// client has already loaded.
+fn filter_sessions<'a>(
+    sessions: &'a [crate::protocol::CatalogEntry],
+    query: Option<&str>,
+) -> Vec<&'a crate::protocol::CatalogEntry> {
+    let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) else {
+        return sessions.iter().collect();
+    };
+    let needle = query.to_lowercase();
+    sessions
+        .iter()
+        .filter(|entry| {
+            entry.info.name.to_lowercase().contains(&needle)
+                || entry
+                    .info
+                    .title
+                    .as_deref()
+                    .is_some_and(|t| t.to_lowercase().contains(&needle))
+                || entry
+                    .info
+                    .first_message
+                    .as_deref()
+                    .is_some_and(|m| m.to_lowercase().contains(&needle))
+        })
+        .collect()
+}
+
+/// Per-connection content redaction. Collapsed thinking and tool blocks are
+/// delivered without their content — the client keeps the header (tool name,
+/// status, live timer), which is enough to show work in progress. Once a
+/// client reveals a block it receives the full content and its live updates
+/// for the rest of the connection.
+struct Redactor {
+    revealed: HashSet<String>,
+    kinds: HashMap<String, &'static str>,
+}
+
+impl Redactor {
+    fn new() -> Self {
+        Self {
+            revealed: HashSet::new(),
+            kinds: HashMap::new(),
+        }
+    }
+
+    fn revealed(&mut self, block_id: &str) {
+        self.revealed.insert(block_id.to_owned());
+    }
+
+    /// The snapshot a new subscription starts with, redacted.
+    fn snapshot(&mut self, snapshot: &crate::core::state::Snapshot) -> Value {
+        for block in &snapshot.blocks {
+            self.kinds.insert(block.id.clone(), kind_str(block.kind));
+        }
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        for block in value
+            .get_mut("blocks")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
+            if !self.revealed.contains(id) {
+                redact_block(block.as_object_mut().unwrap());
+            }
+        }
+        value
+    }
+
+    /// One sequenced update, with hidden appends suppressed. The event is
+    /// always forwarded (even with no changes) so sequence numbers stay
+    /// contiguous on the client.
+    fn update(&mut self, update: &crate::core::Update) -> Value {
+        let changes = update
+            .changes
+            .iter()
+            .filter_map(|change| {
+                let mut value = serde_json::to_value(change).unwrap();
+                match change {
+                    crate::core::state::Change::Insert { block, .. }
+                    | crate::core::state::Change::Replace { block } => {
+                        let kind = kind_str(block.kind);
+                        self.kinds.insert(block.id.clone(), kind);
+                        if !self.revealed.contains(&block.id)
+                            && let Some(block) = value.get_mut("block")
+                        {
+                            redact_block(block.as_object_mut().unwrap());
+                        }
+                        Some(value)
+                    }
+                    crate::core::state::Change::Append {
+                        block_id, field, ..
+                    } => {
+                        let hidden = match (self.kinds.get(block_id).copied(), field.as_str()) {
+                            (Some("thinking"), "content") => true,
+                            (Some("tool"), "arguments" | "output") => true,
+                            _ => false,
+                        };
+                        if hidden && !self.revealed.contains(block_id) {
+                            None
+                        } else {
+                            Some(value)
+                        }
+                    }
+                    crate::core::state::Change::State { .. }
+                    | crate::core::state::Change::Plan { .. }
+                    | crate::core::state::Change::Project { .. } => Some(value),
+                }
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "session_id": update.session_id,
+            "seq": update.seq,
+            "changes": changes,
+        })
+    }
+}
+
+/// Blanks the withheld fields of one block, flagging it so the client knows
+/// to request the content on first expand. Images and published files are
+/// kept: they render outside the collapsed section.
+fn redact_block(block: &mut serde_json::Map<String, Value>) {
+    let kind = block.get("kind").and_then(Value::as_str);
+    match kind {
+        Some("thinking") => {
+            block.insert("content".to_owned(), Value::String(String::new()));
+            block.insert("redacted".to_owned(), Value::Bool(true));
+        }
+        Some("tool") => {
+            if let Some(tool) = block.get_mut("tool").and_then(Value::as_object_mut) {
+                tool.insert("arguments".to_owned(), Value::String(String::new()));
+                tool.insert("output".to_owned(), Value::Null);
+                tool.insert("diff".to_owned(), Value::Null);
+                tool.insert("redacted".to_owned(), Value::Bool(true));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn kind_str(kind: crate::core::state::BlockKind) -> &'static str {
+    use crate::core::state::BlockKind::*;
+    match kind {
+        User => "user",
+        Steer => "steer",
+        Assistant => "assistant",
+        Status => "status",
+        System => "system",
+        Error => "error",
+        Thinking => "thinking",
+        Tool => "tool",
+    }
 }
 
 #[derive(Clone)]
@@ -475,11 +660,24 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
         "client_id":client_id,"models":app.core.models(),"project_root":app.core.project_root()}),
     )
     .await?;
+    let redactor = Arc::new(Mutex::new(Redactor::new()));
+    let catalog_view = Arc::new(Mutex::new(CatalogView::new()));
     let (catalog, mut catalogs) = app.core.subscribe_catalog();
-    enqueue(&output, &json!({"type":"catalog","catalog":catalog})).await?;
+    let initial_page = {
+        let view = catalog_view.lock().unwrap();
+        let total = view.total(&catalog.sessions);
+        let sessions: Vec<_> = view.page(&catalog.sessions).iter().cloned().collect();
+        (total, sessions)
+    };
+    enqueue(
+        &output,
+        &json!({"type":"catalog","catalog":{"seq":catalog.seq,"sessions":initial_page.1,"total":initial_page.0}}),
+    )
+    .await?;
     let out = output.clone();
     let cancel = failed.clone();
     let core = app.core.clone();
+    let catalog_state = catalog_view.clone();
     tasks.tasks.push(tokio::spawn(async move {
         loop {
             let catalog = match catalogs.recv().await {
@@ -491,9 +689,18 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
                 }
                 Err(_) => break,
             };
-            if enqueue(&out, &json!({"type":"catalog","catalog":catalog}))
-                .await
-                .is_err()
+            let page = {
+                let view = catalog_state.lock().unwrap();
+                let total = view.total(&catalog.sessions);
+                let sessions: Vec<_> = view.page(&catalog.sessions).iter().cloned().collect();
+                (total, sessions)
+            };
+            if enqueue(
+                &out,
+                &json!({"type":"catalog","catalog":{"seq":catalog.seq,"sessions":page.1,"total":page.0}}),
+            )
+            .await
+            .is_err()
             {
                 cancel.send_replace(true);
                 break;
@@ -529,7 +736,12 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
                 let mut history = record.history.lock().await;
                 let number = request.request_id.parse::<u64>().ok().filter(|n| *n > 0);
                 let payload = serde_json::to_string(&request.request)?;
-                let mutation = matches!(request.request, Request::CreateSession { .. } | Request::Command { .. });
+                let mutation = matches!(
+                    request.request,
+                    Request::CreateSession { .. }
+                        | Request::Command { .. }
+                        | Request::DeleteSession { .. }
+                );
                 let reply = if let Some(number) = number {
                     if mutation && number <= history.highest {
                         match history.replies.iter().find(|(id, _, _)| *id == number) {
@@ -539,7 +751,7 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
                         }
                     } else {
                         if mutation { history.highest = number; }
-                        let result = dispatch(&app.core, request.request, &output, &failed, &mut tasks.subscriptions).await;
+                        let result = dispatch(&app.core, request.request, &output, &failed, &mut tasks.subscriptions, &redactor, &catalog_view).await;
                         let reply = match result {
                             Ok(value) => json!({"type":"reply","request_id":request.request_id,"result":value}),
                             Err(error) => {
@@ -584,17 +796,47 @@ async fn dispatch(
     output: &mpsc::Sender<String>,
     failed: &watch::Sender<bool>,
     subscriptions: &mut HashMap<String, JoinHandle<()>>,
+    redactor: &Arc<Mutex<Redactor>>,
+    catalog_view: &Arc<Mutex<CatalogView>>,
 ) -> protocol::Result<Value> {
     let error = |e: anyhow::Error| protocol::Error::new("core", format!("{e:#}"));
     Ok(match request {
         Request::CreateSession { name } => {
             json!({"session_id":core.create(name).await.map_err(error)?})
         }
+        Request::DeleteSession { session_id } => {
+            core.delete(&session_id).await?;
+            // This connection's live subscription to the deleted session is
+            // dead; drop it so no resync is attempted.
+            if let Some(task) = subscriptions.remove(&session_id) {
+                task.abort();
+            }
+            json!({})
+        }
         Request::Command { session_id, action } => {
             serde_json::to_value(core.command(&session_id, action).await?).unwrap()
         }
         Request::GitDiff { path } => {
             json!({"path":path,"content":core.diff(path.as_deref().map(std::path::Path::new)).await.map_err(error)?})
+        }
+        Request::CatalogView { query, offset } => {
+            let mut view = catalog_view.lock().unwrap();
+            view.query = query;
+            view.offset = offset.min(1_000);
+            drop(view);
+            let (snapshot, _) = core.subscribe_catalog();
+            let view = catalog_view.lock().unwrap();
+            let total = view.total(&snapshot.sessions);
+            let sessions: Vec<_> = view.page(&snapshot.sessions).iter().cloned().collect();
+            json!({"sessions":sessions,"total":total})
+        }
+        Request::RevealBlock {
+            session_id,
+            block_id,
+        } => {
+            let block = core.block(&session_id, &block_id).await?;
+            redactor.lock().unwrap().revealed(&block_id);
+            json!({"block":block})
         }
         Request::Unsubscribe { session_id } => {
             if let Some(task) = subscriptions.remove(&session_id) {
@@ -613,21 +855,22 @@ async fn dispatch(
             if let Some(task) = subscriptions.remove(&session_id) {
                 task.abort();
             }
-            enqueue(
-                output,
-                &json!({"type":"snapshot","snapshot":subscription.snapshot}),
-            )
-            .await
-            .map_err(error)?;
+            let snapshot = redactor.lock().unwrap().snapshot(&subscription.snapshot);
+            enqueue(output, &json!({"type":"snapshot","snapshot":snapshot}))
+                .await
+                .map_err(error)?;
             let output = output.clone();
             let failed = failed.clone();
             let id = session_id.clone();
+            let redactor = redactor.clone();
             subscriptions.insert(
                 session_id,
                 tokio::spawn(async move {
                     loop {
                         let message = match subscription.updates.recv().await {
-                            Ok(update) => json!({"type":"event","update":*update}),
+                            Ok(update) => {
+                                json!({"type":"event","update":redactor.lock().unwrap().update(&update)})
+                            }
                             Err(_) => {
                                 if enqueue(
                                     &output,

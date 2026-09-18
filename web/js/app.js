@@ -1,6 +1,6 @@
 import { $, esc, relTime } from "./helpers.js";
 import { LS, S, prefs, draft, events } from "./state.js";
-import { connect } from "./protocol.js";
+import { connect, request, select } from "./protocol.js";
 import { highlight, inline, md } from "./markdown.js";
 import { blockEl, renderChat } from "./chat.js";
 import { imageCache } from "./files.js";
@@ -70,6 +70,7 @@ const debugHandle = {
   get attachments() { return draft.attachments; },
   set attachments(v) { draft.attachments = v; },
   highlight, inline, md, esc, blockEl,
+  request, select,
   renderAll, renderPlates,
   uploadAttachment: (a, session) => uploadAttachment(a, session),
   imgCache: () => [...imageCache.entries()].map(([k, u]) => [k.split("\u0001"), u]),

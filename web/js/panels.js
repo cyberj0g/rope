@@ -82,28 +82,41 @@ $("chipModel").onclick = () => {
     };
     $("modelFilter").oninput = e => draw(e.target.value.trim().toLowerCase());
     draw("");
-    // reasoning
-    const efforts = st ? (S.models.find(m => m.name === st.model)?.reasoning_efforts || []).map(e => e.toLowerCase()) : [];
-    if (efforts.length) {
+    // Reasoning effort leads the sheet: the model list can run to hundreds
+    // of rows, and the effort always applies to the current model.
+    if (st) {
+      const efforts = (S.models.find(m => m.name === st.model)?.reasoning_efforts || []).map(e => e.toLowerCase());
+      const wrap = document.createElement("div");
+      wrap.style.marginBottom = "14px";
       const note = document.createElement("div");
       note.className = "sheet-note";
-      note.style.marginTop = "16px";
       note.textContent = "Reasoning effort";
-      list.after(note);
-      const rwrap = document.createElement("div");
-      for (const opt of [["", "Off"], ...efforts.map(e => [e, e])]) {
-        const row = document.createElement("div");
-        row.className = "srow";
-        const cur = (st?.reasoning_effort || "").toLowerCase() === opt[0];
-        row.innerHTML = `<div class="t"><div class="n" style="text-transform:capitalize">${opt[1]}</div></div>${cur ? '<span class="badge">current</span>' : ""}`;
-        row.onclick = () => {
-          command({ type: "set_reasoning", effort: opt[0] || null, revision: st.settings_revision })
-            .then(closeSheet)
-            .catch(e => toast(e.message, "err"));
-        };
-        rwrap.appendChild(row);
+      wrap.appendChild(note);
+      if (efforts.length) {
+        // A "none" effort is the model's own off-switch; only add the
+        // unset "Off" row when the model has no such option.
+        const options = efforts.includes("none")
+          ? efforts.map(e => [e, e === "none" ? "Off" : e])
+          : [["", "Off"], ...efforts.map(e => [e, e])];
+        for (const [value, label] of options) {
+          const row = document.createElement("div");
+          row.className = "srow";
+          const cur = (st.reasoning_effort || "").toLowerCase() === value;
+          row.innerHTML = `<div class="t"><div class="n" style="text-transform:capitalize">${esc(label)}</div></div>${cur ? '<span class="badge">current</span>' : ""}`;
+          row.onclick = () => {
+            command({ type: "set_reasoning", effort: value || null, revision: st.settings_revision })
+              .then(closeSheet)
+              .catch(e => toast(e.message, "err"));
+          };
+          wrap.appendChild(row);
+        }
+      } else {
+        const none = document.createElement("div");
+        none.className = "sheet-note";
+        none.textContent = "This model has no reasoning effort options.";
+        wrap.appendChild(none);
       }
-      note.after(rwrap);
+      body.prepend(wrap);
     }
   });
 };

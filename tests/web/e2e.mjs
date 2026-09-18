@@ -134,7 +134,7 @@ async function shot(page, name) {
 async function waitFor(page, probe, what, timeout = 30000, arg) {
   const deadline = Date.now() + timeout;
   for (;;) {
-    if (await page.evaluate(probe, arg)) return;
+    if (await page.evaluate(probe, arg)) return true;
     if (Date.now() > deadline) { fail(`timeout waiting for ${what}`); return false; }
     await new Promise(r => setTimeout(r, 200));
   }
@@ -275,9 +275,16 @@ try {
   ok("showcase rendered: " + JSON.stringify(md));
   await shot(page, "03-showcase.png");
 
-  console.log("3. thinking + tool sections");
-  await page.evaluate(() => { const el = document.querySelector("details.sec.thinking"); if (el) el.open = true; });
-  await new Promise(r => setTimeout(r, 150));
+  console.log("3. thinking + tool sections (content revealed on first expand)");
+  const thinkingRendered = await page.evaluate(() => {
+    const el = document.querySelector("details.sec.thinking");
+    if (el) el.open = true;
+    return !!el;
+  });
+  if (!thinkingRendered) fail("thinking section not rendered");
+  // The content arrives via a reveal round-trip on first expand; poll for it.
+  await waitFor(page, () => (document.querySelector("details.sec.thinking")?.textContent || "").includes("showcase"),
+    "thinking content fetched on first expand");
   await shot(page, "04-thinking.png");
   await sendPrompt(page, "Read notes.md and summarize it");
   // #15: a section the user expanded must stay expanded when new blocks arrive.
@@ -288,11 +295,13 @@ try {
   if (thinkingStillOpen !== true) fail("expanded thinking section collapsed when the next turn arrived (#15)");
   ok("expanded sections survive new blocks (#15)");
   await page.evaluate(() => { const el = document.querySelector("details.sec.tool"); if (el) el.open = true; });
-  await new Promise(r => setTimeout(r, 150));
-  const toolOut = await page.evaluate(() => document.querySelector("details.sec.tool")?.textContent || "");
-  if (!toolOut.includes("notes.md")) fail("read tool arguments not visible");
-  if (!toolOut.includes("rope: a rope for coding")) fail("read tool output not visible");
-  ok("read tool section shows args + output");
+  await waitFor(page, () => {
+    const txt = document.querySelector("details.sec.tool")?.textContent || "";
+    return txt.includes("notes.md") && txt.includes("rope: a rope for coding");
+  }, "read tool args + output fetched on first expand");
+  const toolStillOpen = await page.evaluate(() => document.querySelector("details.sec.tool")?.open);
+  if (toolStillOpen !== true) fail("revealed tool section lost its open state");
+  ok("read tool section shows args + output after reveal");
   await shot(page, "05-tool.png");
 
   console.log("4. approval flow");
@@ -309,12 +318,12 @@ try {
   await shot(page, "06-approval.png");
   await page.click('#approval [data-decision="allow_once"]');
   await waitFor(page, idleProbe, "shell turn after approval");
-  const shellOut = await page.evaluate(() => {
-    const tools = [...document.querySelectorAll("details.sec.tool")];
-    tools.forEach(t => (t.open = true));
-    return document.body.textContent;
-  });
-  if (!shellOut.includes("hello from rope")) fail("shell output not visible after approval");
+  const shellOut = await waitFor(page, () => {
+    document.querySelectorAll("details.sec.tool").forEach(t => (t.open = true));
+    return [...document.querySelectorAll("details.sec.tool")].some(t =>
+      (t.querySelector(".toolout")?.textContent || "").includes("hello from rope"));
+  }, "shell tool output revealed on first expand");
+  if (!shellOut) fail("shell output not visible after approval");
   ok("shell approved and output rendered");
   await shot(page, "07-shell.png");
 
@@ -980,13 +989,37 @@ try {
       collapsed: tools.every(t => !t.open),
       img: img ? { complete: img.complete, width: img.naturalWidth, src: img.currentSrc.slice(0, 20) } : null,
       tile: tile ? { name: tile.querySelector(".fname").textContent, size: tile.querySelector(".fsize").textContent } : null,
-      output: tools.map(t => t.querySelector(".toolout")?.textContent || ""),
     };
   });
   if (!fileDom.outside || !fileDom.collapsed) fail("sent files must be visible outside collapsed tools");
   if (!fileDom.img || !fileDom.img.complete || fileDom.img.width < 1) fail("send_file image not rendered inline: " + JSON.stringify(fileDom.img));
   if (!fileDom.tile || fileDom.tile.name !== "notes.md") fail("send_file tile missing or wrong name: " + JSON.stringify(fileDom.tile));
-  if (!fileDom.output.every(o => o.includes("sent "))) fail("send_file tool output missing: " + JSON.stringify(fileDom.output));
+  // Tool output is withheld while collapsed; expand and wait for the reveal.
+  await page.evaluate(() => document.querySelectorAll("details.sec.tool").forEach(t => (t.open = true)));
+  const outputs = await waitFor(page, () => {
+    const outs = [...document.querySelectorAll("details.sec.tool")]
+      .filter(t => t.textContent.includes("send_file"))
+      .map(t => t.querySelector(".toolout")?.textContent || "");
+    return outs.length >= 2 && outs.every(o => o.includes("sent "));
+  }, "send_file tool outputs revealed on first expand");
+  if (!outputs) {
+    const dbg = await mainEval(`(() => {
+      const s = window.__rope.state;
+      const snap = s.sessions.get(s.selected);
+      return {
+        selected: s.selected,
+        tools: snap.blocks.filter(b => b.kind === "tool").map(b => ({
+          id: b.id, redacted: !!b.tool.redacted, out: (b.tool.output || "").slice(0, 40), revealing: !!b._revealing,
+        })),
+        dom: [...document.querySelectorAll("details.sec.tool")].map(t => ({
+          open: t.open, out: t.querySelector(".toolout")?.textContent?.slice(0, 40) || null,
+          body: t.querySelector(".body")?.textContent?.slice(0, 60) || null,
+        })),
+      };
+    })()`);
+    console.log("  [reveal-debug]", JSON.stringify(dbg));
+    fail("send_file tool output missing after reveal");
+  }
   await shot(page, "21-send-file.png");
   expectOneFile401 = true;
   const unauth = await page.evaluate(async () => (await fetch(`/api/sessions/${encodeURIComponent(document.querySelector(".side-item.on").dataset.session)}/files/unknown`)).status);
@@ -1021,6 +1054,125 @@ try {
     "sent files stay visible after reload with tools hidden");
   ok("send_file: files remain visible with tools hidden, including after reload");
 
+  console.log("27. model switching from the model sheet");
+  await page.click("#chipModel");
+  await waitFor(page, () => document.getElementById("sheetWrap").classList.contains("on"), "model sheet");
+  const modelRows = await page.evaluate(() => [...document.querySelectorAll("#modelList .srow .n")].map(e => e.textContent));
+  if (!modelRows.includes("mock-vision") || !modelRows.includes("mock-mini")) fail("model sheet missing models: " + JSON.stringify(modelRows));
+  const currentBadge = await page.evaluate(() =>
+    [...document.querySelectorAll("#modelList .srow")]
+      .find(r => r.querySelector(".n").textContent === "mock-vision")?.textContent.includes("current") === true);
+  if (!currentBadge) fail("current model not badged in the model sheet");
+  await page.evaluate(() => {
+    const row = [...document.querySelectorAll("#modelList .srow")].find(r => r.querySelector(".n").textContent === "mock-mini");
+    if (row) row.click();
+  });
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.model === "mock-mini"`,
+    "session state switched to mock-mini", 10000);
+  const chipAfter = await page.evaluate(() => document.getElementById("chipModelText").textContent);
+  const sheetClosed = await page.evaluate(() => !document.getElementById("sheetWrap").classList.contains("on"));
+  if (chipAfter !== "mock-mini") fail("model chip does not follow the switch: " + chipAfter);
+  if (!sheetClosed) fail("model sheet did not close after switching");
+  await page.click("#chipModel");
+  await waitFor(page, () => document.getElementById("sheetWrap").classList.contains("on"), "model sheet again");
+  await page.evaluate(() => {
+    const row = [...document.querySelectorAll("#modelList .srow")].find(r => r.querySelector(".n").textContent === "mock-vision");
+    if (row) row.click();
+  });
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.model === "mock-vision"`,
+    "switched back to mock-vision", 10000);
+  ok("model switch updates the session state and the chip, and closes the sheet");
+  // Reasoning effort: the section leads the sheet and switches the state.
+  await page.click("#chipModel");
+  await waitFor(page, () => document.getElementById("sheetWrap").classList.contains("on"), "model sheet for reasoning");
+  const effortHead = await page.evaluate(() =>
+    (document.getElementById("sheetBody").firstElementChild?.textContent || "").includes("Reasoning effort"));
+  if (!effortHead) fail("reasoning effort section does not lead the model sheet");
+  await page.evaluate(() => {
+    const row = [...document.querySelectorAll("#sheetBody .srow")].find(r => r.querySelector(".n")?.textContent.trim() === "low");
+    if (row) row.click();
+  });
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.reasoning_effort === "low"`,
+    "reasoning effort switched to low", 10000);
+  const stripLow = await page.evaluate(() => document.getElementById("stripModel").textContent);
+  if (!stripLow.endsWith("· low")) fail("status strip does not show the current reasoning effort: " + stripLow);
+  await page.click("#chipModel");
+  await waitFor(page, () => document.getElementById("sheetWrap").classList.contains("on"), "model sheet back to medium");
+  await page.evaluate(() => {
+    const row = [...document.querySelectorAll("#sheetBody .srow")].find(r => r.querySelector(".n")?.textContent.trim() === "medium");
+    if (row) row.click();
+  });
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.reasoning_effort === "medium"`,
+    "reasoning effort switched back to medium", 10000);
+  ok("reasoning effort is at the top of the model sheet and updates the session state");
+  await shot(page, "22-model.png");
+
+  console.log("28. delete a conversation from the sidebar");
+  await page.click("#tbMenu");
+  await waitFor(page, () => document.getElementById("app").classList.contains("side-open"), "sidebar for delete");
+  const totalBefore = await mainEval("window.__rope.state.catalogTotal");
+  const delTarget = await mainEval(`(() => {
+    const s = window.__rope.state;
+    const row = s.catalog.find(x => x.name !== s.selected && x.activity === "idle");
+    return row ? row.name : null;
+  })()`);
+  if (!delTarget) fail("no idle, unselected session available to delete");
+  else {
+    await page.evaluate(name => document.querySelector(`.side-item[data-session="${name}"] .side-del`)?.click(), delTarget);
+    const confirming = await waitFor(page, n =>
+      document.querySelector(`.side-item[data-session="${n}"]`)?.classList.contains("confirming"), "delete confirmation row", 5000, delTarget);
+    if (!confirming) {
+      const dbg = await page.evaluate(name => ({
+        confirmDelete: null,
+        rows: [...document.querySelectorAll(".side-item")].map(r => r.dataset.session + " :: " + r.className),
+        html: document.getElementById("sideList").innerHTML.slice(0, 600),
+      }), delTarget);
+      dbg.confirmDelete = await mainEval("window.__rope.state.confirmDelete");
+      console.log("  [delete-debug]", JSON.stringify(dbg));
+      fail("confirmation row did not appear for " + delTarget);
+    }
+    await page.evaluate(name => document.querySelector(`.side-item[data-session="${name}"] [data-del="1"]`)?.click(), delTarget);
+    const gone = await waitForMain(`!window.__rope.state.catalog.some(x => x.name === __a)`,
+      "deleted session gone from the catalog", 10000, delTarget);
+    const totalAfter = await mainEval("window.__rope.state.catalogTotal");
+    if (!gone) fail("session still in catalog after delete");
+    if (totalAfter !== totalBefore - 1) fail(`catalog total ${totalBefore} -> ${totalAfter}, want ${totalBefore - 1}`);
+    ok(`deleted ${delTarget} with inline confirmation (total ${totalBefore} -> ${totalAfter})`);
+  }
+  await shot(page, "23-delete.png");
+
+  console.log("29. catalog pagination and server-side filter");
+  for (let i = 0; i < 25; i++) {
+    await mainEval(`window.__rope.request({ type: "create_session", name: "pag-" + __a + "-x" })`, i);
+  }
+  await waitForMain(`window.__rope.state.catalogTotal >= 30 && window.__rope.state.catalog.length <= 20`,
+    "catalog reports a total beyond the loaded window", 15000);
+  const pageState = await mainEval(`({ rows: window.__rope.state.catalog.length, total: window.__rope.state.catalogTotal })`);
+  if (pageState.rows > 20) fail(`first page holds ${pageState.rows} rows, want <= 20`);
+  const moreVisible = await page.evaluate(() => !document.getElementById("sideMore").hidden);
+  if (!moreVisible) fail("Load more is not visible while more rows exist");
+  await page.click("#sideMore");
+  const widened = await waitForMain(`window.__rope.state.catalog.length === Math.min(window.__rope.state.catalogTotal, 40) && window.__rope.state.catalog.length > ${pageState.rows}`,
+    "Load more widened the window to two pages", 15000);
+  if (!widened) fail("Load more did not widen the loaded window");
+  const rows2 = await mainEval("window.__rope.state.catalog.length");
+  // The filter runs server-side over ALL sessions: pag-0-x was created first,
+  // so it sits beyond the first page — a client-only filter would miss it.
+  await page.evaluate(() => {
+    const f = document.getElementById("sideFilter");
+    f.value = "pag-0-x";
+    f.dispatchEvent(new Event("input"));
+  });
+  await waitForMain(`window.__rope.state.catalogTotal === 1 && window.__rope.state.catalog.length === 1 && window.__rope.state.catalog[0].name === "pag-0-x"`,
+    "server-side filter matched a session beyond the loaded window", 15000);
+  await shot(page, "24-filter.png");
+  await page.evaluate(() => {
+    const f = document.getElementById("sideFilter");
+    f.value = "";
+    f.dispatchEvent(new Event("input"));
+  });
+  await waitForMain(`window.__rope.state.catalogTotal >= 30`, "filter reset restored the full catalog", 15000);
+  ok(`pagination: ${pageState.rows}/${pageState.total} loaded, Load more -> ${rows2} rows, filter matched a page-2 row server-side`);
 
   if (pageErrors.length) {
     fail("page errors: " + pageErrors.slice(0, 3).join(" | "));

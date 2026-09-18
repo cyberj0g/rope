@@ -469,6 +469,115 @@ impl Core {
         session::store_attachment(&session.directory, bytes).await
     }
 
+    /// The full, un-redacted view of one transcript block, for connections
+    /// that were only receiving its collapsed form.
+    pub async fn block(&self, id: &str, block_id: &str) -> protocol::Result<state::Block> {
+        let session = self.session(id).await.map_err(core_error)?;
+        let hub = session.hub.lock().unwrap();
+        hub.projection
+            .snapshot
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .cloned()
+            .ok_or_else(|| {
+                protocol::Error::new("unknown_block", format!("unknown block: {block_id}"))
+            })
+    }
+
+    /// Permanently removes a session: transcript, attachments, and metadata.
+    /// A live session must be idle; a session owned by another process is
+    /// refused while its writer lock is held.
+    pub async fn delete(&self, id: &str) -> protocol::Result<()> {
+        if self.inner.closing.load(Ordering::Acquire) {
+            return Err(protocol::Error::new("closed", "core is shutting down"));
+        }
+        let id = session::clean_name(id).map_err(core_error)?;
+        let directory = self.inner.storage_root.join(&id);
+        let unknown = || {
+            protocol::Error::new("unknown", format!("unknown session: {id}"))
+        };
+        let bytes = tokio::fs::read(directory.join("session.json")).await.map_err(|_| unknown())?;
+        let meta: session::SessionMeta = serde_json::from_slice(&bytes).map_err(|_| unknown())?;
+        if meta.project_root.as_ref().is_some_and(|root| root != &self.inner.project_root) {
+            return Err(protocol::Error::new("unknown", format!("unknown session: {id}")));
+        }
+        {
+            let catalog = self.inner.catalog.lock().unwrap();
+            if let Some(entry) = catalog
+                .snapshot
+                .sessions
+                .iter()
+                .find(|entry| entry.info.name == id)
+            {
+                if entry.activity != "idle" {
+                    return Err(protocol::Error::new(
+                        "busy",
+                        "finish or cancel the active operation before deleting the session",
+                    ));
+                }
+            }
+        }
+        let loaded = self.inner.sessions.lock().await.remove(&id);
+        // A loaded session holds its writer lock until it drops; an unloaded
+        // one must be locked here so a concurrent writer cannot resurrect it
+        // between the check and the removal. Both stay held across the
+        // directory deletion.
+        let lock = match &loaded {
+            Some(_) => None,
+            None => Some(
+                session::lock_session(&directory).map_err(|error| {
+                    protocol::Error::new(
+                        "busy",
+                        format!("session is owned by another process: {error:#}"),
+                    )
+                })?,
+            ),
+        };
+        if let Some(loaded) = loaded.as_ref() {
+            if let Some(task) = loaded.task.lock().await.take() {
+                let (reply, result) = oneshot::channel();
+                loaded
+                    .commands
+                    .send(Command::Shutdown(reply))
+                    .await
+                    .map_err(|_| {
+                        protocol::Error::new("closed", "session stopped before shutdown")
+                    })?;
+                let summary = result
+                    .await
+                    .map_err(|_| protocol::Error::new("closed", "session stopped"))?;
+                if let Some(error) = summary.error {
+                    return Err(protocol::Error::new("shutdown", error));
+                }
+                if let Err(error) = task.await {
+                    return Err(protocol::Error::new(
+                        "shutdown",
+                        format!("session stopped: {error:#}"),
+                    ));
+                }
+            }
+            if let Some(pump) = loaded.pump.lock().await.take() {
+                pump.await.ok();
+            }
+        }
+        if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+            return Err(protocol::Error::new(
+                "core",
+                format!("remove session directory: {error:#}"),
+            ));
+        }
+        drop(lock);
+        drop(loaded);
+        let mut catalog = self.inner.catalog.lock().unwrap();
+        let before = catalog.snapshot.sessions.len();
+        catalog.snapshot.sessions.retain(|entry| entry.info.name != id);
+        if catalog.snapshot.sessions.len() != before {
+            catalog.publish();
+        }
+        Ok(())
+    }
+
     pub async fn upload(&self, id: &str, name: &str, bytes: &[u8]) -> Result<serde_json::Value> {
         if image::guess_format(bytes).is_ok() {
             return Ok(serde_json::to_value(self.attach(id, bytes).await?)?);

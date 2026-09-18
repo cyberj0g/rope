@@ -10,7 +10,7 @@ function connect() {
   S.socket = socket;
   events.dispatchEvent(new CustomEvent("phase", { detail: ["connecting", "connecting…"] }));
   socket.onopen = () => {
-    const hello = { protocol: 1, token: S.token };
+    const hello = { protocol: 2, token: S.token };
     if (S.clientId && S.serverId) { hello.client_id = S.clientId; hello.server_id = S.serverId; }
     socket.send(JSON.stringify(hello));
   };
@@ -34,10 +34,30 @@ function request(value, done = () => {}) {
 const commandTo = (id, action, done) => id && request({ type: "command", session_id: id, action }, done);
 const command = (action, done) => commandTo(S.selected, action, done);
 
+// The sidebar filter runs on the server against every session; the client
+// only tracks how many matching rows it has loaded so far.
+export const CATALOG_PAGE = 20;
+let catalogSeq = 0;
+function catalogView(query, offset) {
+  const seq = ++catalogSeq;
+  return request({ type: "catalog_view", query: query || null, offset })
+    .then(res => {
+      if (seq !== catalogSeq) return null; // a newer filter replaced this one
+      S.catalog = res.sessions;
+      S.catalogTotal = res.total;
+      events.dispatchEvent(new Event("catalog"));
+      return res;
+    });
+}
+const deleteSession = id => request({ type: "delete_session", session_id: id });
+const revealBlock = (session, blockId) =>
+  request({ type: "reveal_block", session_id: session, block_id: blockId });
+
 function select(id) {
   if (S.selected === id) return;
   if (S.selected) request({ type: "unsubscribe", session_id: S.selected }, () => {});
   S.selected = id;
+  S.confirmDelete = null;
   LS.set("rope.session", id);
   events.dispatchEvent(new Event("select"));
   if (id) request({ type: "subscribe", session_id: id }, () => {});
@@ -63,6 +83,7 @@ function receive(message) {
       break;
     case "catalog":
       S.catalog = message.catalog.sessions;
+      S.catalogTotal = message.catalog.total ?? message.catalog.sessions.length;
       events.dispatchEvent(new Event("catalog")); break;
     case "project":
       S.project = message.update;
@@ -126,4 +147,4 @@ function receive(message) {
   }
 }
 
-export { connect, request, commandTo, command, select };
+export { connect, request, commandTo, command, select, catalogView, deleteSession, revealBlock };

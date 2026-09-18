@@ -4,6 +4,7 @@ import { md, plain } from "./markdown.js";
 import { renderImages, renderFile } from "./files.js";
 import { openDiffSheet } from "./panels.js";
 import { search, applySearch } from "./search.js";
+import { revealBlock } from "./protocol.js";
 
 function blockKey(b) {
   const t = b.tool;
@@ -11,14 +12,35 @@ function blockKey(b) {
     [b.kind, b.content, b.queued, b.model, b.summary ? 1 : 0,
     JSON.stringify(b.file || null),
     b.images.map(i => (i.path || "") + " " + i.width + "x" + i.height).join(","),
-    t ? [t.name, t.status, t.arguments, t.output || "", t.diff || ""] : "",
+    t ? [t.name, t.status, t.arguments, t.output || "", t.diff || "", t.redacted ? 1 : 0] : "",
+    b.redacted ? "R" : "",
     b.timer.running ? "r" : b.timer.elapsed_ms].join("\u0001");
 }
-function toolMeta(t) {
-  const out = t.output || "";
-  const nl = out.search(/\n/);
-  const counter = nl < 0 ? `${out.length} ch` : `${(out.split("\n").length - 1)} ln`;
-  return t.status + (t.status === "running" || t.status === "streaming" ? ` · ${counter}` : "");
+// Whether the section's content is withheld from the wire and must be
+// requested on first expand.
+function isRedacted(b) {
+  return (b.kind === "thinking" && !!b.redacted) ||
+    (b.kind === "tool" && !!(b.tool && b.tool.redacted));
+}
+
+// First expand of a redacted section: show a loading plate and fetch the
+// full block from the server, which then keeps streaming its live updates.
+async function maybeReveal(session, blockId, section) {
+  const snap = S.sessions.get(session);
+  const b = snap?.blocks.find(x => x.id === blockId);
+  if (!snap || !b || !isRedacted(b) || b._revealing) return;
+  b._revealing = true;
+  const body = section._body;
+  body.innerHTML = `<div class="loading"><span class="spin"></span>loading…</div>`;
+  try {
+    const res = await revealBlock(session, blockId);
+    const i = snap.blocks.findIndex(x => x.id === blockId);
+    if (i >= 0) snap.blocks[i] = res.block;
+    events.dispatchEvent(new Event("render"));
+  } catch (e) {
+    b._revealing = false; // let the next expand retry
+    body.innerHTML = `<div class="loading err">${esc(e.message)}</div>`;
+  }
 }
 
 function sectionEl(kind, label, timer, extraClass) {
@@ -36,6 +58,11 @@ function sectionEl(kind, label, timer, extraClass) {
 function updateTimer(section, timer) {
   const el = section.querySelector(".meta .timer");
   if (el) el.textContent = timer.running ? fmtDur(timer.elapsed_ms) + " …" : fmtDur(timer.elapsed_ms);
+}
+// A collapsed section still shows its work in progress: the header carries
+// the tool name/status or a running timer, which pulses while active.
+function markRunning(section, running) {
+  section.dataset.running = running ? "1" : "0";
 }
 
 function blockEl(session, b) {
@@ -66,7 +93,15 @@ function blockEl(session, b) {
     wrap.className = "msg thinking";
     if (!prefs.showThinking) return wrap;
     const d = sectionEl("thinking", "Thinking", b.timer);
-    d._body.innerHTML = plain(b.content);
+    markRunning(d, b.timer.running);
+    if (b.redacted) {
+      // Content is withheld while collapsed; the running timer in the
+      // header still shows the model is thinking.
+      d._body.innerHTML = "";
+      d.addEventListener("toggle", () => { if (d.open) maybeReveal(session, b.id, d); });
+    } else {
+      d._body.innerHTML = plain(b.content);
+    }
     wrap.appendChild(d);
     wrap._timer = d;
     return wrap;
@@ -78,33 +113,41 @@ function blockEl(session, b) {
     const t = b.tool;
     const d = sectionEl("tool", t.name, b.timer);
     d.dataset.status = t.status;
+    markRunning(d, ["streaming", "pending", "running", "waiting-approval"].includes(t.status));
     const status = document.createElement("span");
     status.className = "status";
     status.textContent = { streaming: "streaming", pending: "pending", "waiting-approval": "approval", running: "running", done: "done", failed: "failed" }[t.status] || t.status;
     d.querySelector(".meta").prepend(status);
-    const args = document.createElement("pre");
-    args.className = "toolarg";
-    args.textContent = prettyArgs(t.arguments);
-    d._body.appendChild(args);
-    if (t.output) {
-      const lbl = document.createElement("div");
-      lbl.className = "lbl";
-      lbl.textContent = "Output";
-      const out = document.createElement("pre");
-      out.className = "toolout plain";
-      out.textContent = t.output;
-      d._body.append(lbl, out);
-    }
-    if (t.diff) {
-      const lbl = document.createElement("div");
-      lbl.className = "lbl";
-      lbl.textContent = "Diff";
-      const out = document.createElement("pre");
-      out.className = "toolout plain";
-      out.style.cssText += ";max-height:180px;cursor:pointer;";
-      out.textContent = t.diff;
-      out.onclick = () => openDiffSheet(`Diff · ${t.name}`, t.diff);
-      d._body.append(lbl, out);
+    if (t.redacted) {
+      // Arguments and output are withheld while collapsed; the header keeps
+      // the tool name and its live status/timer so in-progress work is visible.
+      d._body.innerHTML = "";
+      d.addEventListener("toggle", () => { if (d.open) maybeReveal(session, b.id, d); });
+    } else {
+      const args = document.createElement("pre");
+      args.className = "toolarg";
+      args.textContent = prettyArgs(t.arguments);
+      d._body.appendChild(args);
+      if (t.output) {
+        const lbl = document.createElement("div");
+        lbl.className = "lbl";
+        lbl.textContent = "Output";
+        const out = document.createElement("pre");
+        out.className = "toolout plain";
+        out.textContent = t.output;
+        d._body.append(lbl, out);
+      }
+      if (t.diff) {
+        const lbl = document.createElement("div");
+        lbl.className = "lbl";
+        lbl.textContent = "Diff";
+        const out = document.createElement("pre");
+        out.className = "toolout plain";
+        out.style.cssText += ";max-height:180px;cursor:pointer;";
+        out.textContent = t.diff;
+        out.onclick = () => openDiffSheet(`Diff · ${t.name}`, t.diff);
+        d._body.append(lbl, out);
+      }
     }
     // view_image stays inside the tool details
     renderImages(d._body, session, b.images, false);
