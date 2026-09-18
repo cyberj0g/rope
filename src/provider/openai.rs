@@ -104,6 +104,18 @@ struct ApiModel {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn request_body(&self, request: CompletionRequest) -> Result<Option<serde_json::Value>> {
+        let endpoint = self
+            .endpoints
+            .get(&request.provider)
+            .context("provider is not configured")?;
+        Ok(Some(if endpoint.api == ProviderApi::Responses {
+            super::responses::request_body(request)?
+        } else {
+            serde_json::to_value(WireRequest::from(request))?
+        }))
+    }
+
     async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream> {
         let endpoint = self
             .endpoints
@@ -122,7 +134,11 @@ impl Provider for OpenAiProvider {
             "{}/chat/completions",
             endpoint.base_url.trim_end_matches('/')
         );
-        let mut builder = self.client.post(url).json(&WireRequest::from(request));
+        let mut builder = self.client.post(url).json(
+            &self
+                .request_body(request)?
+                .context("missing request body")?,
+        );
         if !endpoint.api_key.is_empty() {
             builder = builder.bearer_auth(&endpoint.api_key);
         }
@@ -248,7 +264,7 @@ impl From<CompletionRequest> for WireRequest {
 impl From<Message> for WireMessage {
     fn from(message: Message) -> Self {
         match message {
-            Message::System { content } => Self::plain("system", content),
+            Message::System { content, .. } => Self::plain("system", content),
             Message::User { content, images } if images.is_empty() => Self::plain("user", content),
             Message::User { content, images } => Self {
                 role: "user",
@@ -269,6 +285,7 @@ impl From<Message> for WireMessage {
                 reasoning: _,
                 tool_calls,
                 response_items: _,
+                ..
             } => Self {
                 role: "assistant",
                 content: (!content.is_empty()).then_some(WireContent::Text(content)),

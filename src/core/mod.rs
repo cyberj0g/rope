@@ -255,7 +255,10 @@ impl Core {
         let project = self.inner.project.borrow().project.clone();
         let (commands, mut events, task) = runtime::spawn_session(
             self.inner.config.clone(),
-            self.inner.provider.clone(),
+            Arc::new(crate::raw::RecordingProvider {
+                inner: self.inner.provider.clone(),
+                directory: directory.clone(),
+            }),
             tools,
             session,
             messages,
@@ -413,6 +416,31 @@ impl Core {
             snapshot,
             updates: hub.updates.subscribe(),
         })
+    }
+
+    pub async fn raw_request(
+        &self,
+        id: &str,
+        block_id: &str,
+    ) -> protocol::Result<serde_json::Value> {
+        let session = self.session(id).await.map_err(core_error)?;
+        let request_id = {
+            let hub = session.hub.lock().unwrap();
+            hub.projection.snapshot.blocks.iter().find(|block| block.id == block_id)
+                .ok_or_else(|| protocol::Error::new("not_found", "unknown block"))?
+                .raw_request.clone()
+                .ok_or_else(|| protocol::Error::new("not_found", "No recorded model request at this point. Older conversations have no raw data."))?
+        };
+        let request_id = uuid::Uuid::parse_str(&request_id).map_err(|e| core_error(e.into()))?;
+        let bytes = tokio::fs::read(
+            session
+                .directory
+                .join("requests")
+                .join(format!("{request_id}.json")),
+        )
+        .await
+        .map_err(|e| core_error(e.into()))?;
+        serde_json::from_slice(&bytes).map_err(|e| core_error(e.into()))
     }
 
     pub async fn command(&self, id: &str, mut action: Action) -> protocol::Result<protocol::Accepted> {

@@ -150,7 +150,8 @@ pub struct UiState {
     pub approval_id: Option<String>,
     pub settings_revision: u64,
     pub session_catalog: Vec<crate::session::SessionInfo>,
-    block_ids: Vec<String>,
+    pub block_ids: Vec<String>,
+    pub raw_view: Option<std::cell::RefCell<super::raw::RawView>>,
     pub input: String,
     pub blocks: Vec<ChatBlock>,
     /// Content revision per block, parallel to `blocks`. Bumped whenever a
@@ -330,6 +331,7 @@ impl UiState {
             settings_revision: 0,
             session_catalog: Vec::new(),
             block_ids: Vec::new(),
+            raw_view: None,
             input: String::new(),
             blocks: Vec::new(),
             generating: false,
@@ -1125,6 +1127,19 @@ impl UiState {
                     }
                 }
             }
+            Event::RawRequest(_) => {}
+            Event::RawData {
+                session_id,
+                block_id,
+                result,
+            } => {
+                if session_id == self.session_id
+                    && let Some(view) = &mut self.raw_view
+                    && view.borrow().block_id == block_id
+                {
+                    view.borrow_mut().load(result);
+                }
+            }
             Event::Snapshot(snapshot) => self.set_snapshot(*snapshot),
             Event::Catalog(sessions) => {
                 self.session_catalog = sessions;
@@ -1646,6 +1661,9 @@ impl UiState {
     fn set_snapshot(&mut self, snapshot: crate::core::state::Snapshot) {
         use crate::core::state::{BlockKind, ToolStatus as Status};
         let same_session = self.session_id == snapshot.session_id;
+        if !same_session {
+            self.raw_view = None;
+        }
         let expanded = self
             .block_ids
             .iter()
@@ -1876,7 +1894,7 @@ impl UiState {
         self.tool_calls.clear();
         for message in messages {
             match message {
-                Message::System { content } => {
+                Message::System { content, .. } => {
                     let (content, summary) = Self::compaction_marker(content);
                     self.push_block(ChatBlock::Message {
                         label: "System".into(),
@@ -1912,6 +1930,7 @@ impl UiState {
                     reasoning,
                     tool_calls,
                     response_items: _,
+                    ..
                 } => {
                     if !reasoning.is_empty() {
                         self.push_block(ChatBlock::Thinking {

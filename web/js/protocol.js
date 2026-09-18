@@ -18,6 +18,7 @@ function connect() {
   socket.onerror = () => {};
   socket.onclose = () => {
     const uncertain = S.pending.size > 0;
+    for (const done of S.pending.values()) done(null, { code: "disconnected", message: "Disconnected. Close and reopen to retry." });
     S.pending.clear();
     events.dispatchEvent(new CustomEvent("phase", { detail: ["idle", uncertain ? "disconnected — an action may have been accepted" : "disconnected; reconnecting…"] }));
     S.reconnect = setTimeout(connect, 1500);

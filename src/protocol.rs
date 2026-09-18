@@ -53,6 +53,7 @@ pub enum Request {
     /// Delivers the full content of a block that was withheld while
     /// collapsed; the connection keeps receiving its live updates afterwards.
     RevealBlock { session_id: String, block_id: String },
+    RawRequest { session_id: String, block_id: String },
 }
 
 #[derive(Debug, Deserialize)]

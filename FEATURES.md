@@ -121,3 +121,12 @@ External tools receive their function arguments as JSON on stdin and must return
 - per-block memoized chat rendering keyed on content revisions: streaming re-lays-out only the changed block, so long sessions stay responsive instead of re-parsing and re-wrapping the whole transcript on every frame
 - dirty-driven frame loop that skips redraws entirely while idle, and keeps redrawing only while the display ticks on its own (live timers, streaming, toasts, pending image loads)
 - memoized git diff line rendering for the full-screen diff
+
+## Raw request inspector
+
+- `[raw]` on conversation turns in the web UI and TUI opens the recorded provider request: complete system instructions, messages/input, tool definitions, reasoning settings, and other JSON fields, with historical requests retained across tool iterations, compaction, cancellation, and session restarts
+- request bodies are stored separately under each session's `requests/` directory; ordinary snapshots and updates carry only a reference, and the full JSON is read and delivered only when the viewer opens
+- mobile-first full-height web dialog with searchable, expandable JSON tree, expand/collapse all, and Copy JSON; search reveals matches inside collapsed branches, and Escape or the close button returns to the conversation
+- TUI fullscreen tree opened by clicking `[raw]` or pressing `r` on a selected chat section: type to search, Ctrl+U to clear, arrows/Enter to navigate and fold, `+`/`-` to expand/collapse all, PageUp/PageDown or mouse wheel to scroll, and Escape to close
+- encoded image data and opaque reasoning values retain a short prefix and original byte count; readable model input is preserved in full, while uploaded/published file bytes are never fetched by the inspector
+- older turns without recorded requests show an explicit unavailable message; auxiliary session-title generation is excluded

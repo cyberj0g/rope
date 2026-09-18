@@ -2,6 +2,7 @@ import { $, esc, prettyArgs, fmtDur } from "./helpers.js";
 import { S, prefs, events } from "./state.js";
 import { md, plain } from "./markdown.js";
 import { renderImages, renderFile } from "./files.js";
+import { openRaw } from "./raw.js";
 import { openDiffSheet } from "./panels.js";
 import { search, applySearch } from "./search.js";
 import { revealBlock } from "./protocol.js";
@@ -66,6 +67,20 @@ function markRunning(section, running) {
 }
 
 function blockEl(session, b) {
+  const wrap = blockContent(session, b);
+  if (!wrap.childNodes.length) return wrap;
+  const button = document.createElement("button");
+  button.className = "raw-button";
+  button.type = "button";
+  button.textContent = "[raw]";
+  button.setAttribute("aria-label", "View raw model request");
+  button.onclick = e => { e.preventDefault(); e.stopPropagation(); openRaw(session, b.id); };
+  const header = wrap.querySelector(".who, summary, .sys");
+  if (header) header.append(button); else wrap.prepend(button);
+  return wrap;
+}
+
+function blockContent(session, b) {
   const wrap = document.createElement("div");
   if (b.kind === "user" || b.kind === "steer") {
     wrap.className = `msg ${b.kind}`;

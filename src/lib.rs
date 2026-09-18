@@ -8,6 +8,7 @@ pub mod onboarding;
 pub mod project;
 pub mod protocol;
 pub mod provider;
+mod raw;
 pub mod runtime;
 pub mod server;
 pub mod session;

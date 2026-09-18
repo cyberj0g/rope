@@ -195,6 +195,10 @@ const context = await browser.newContext({
 });
 const page = await context.newPage();
 const pageErrors = [];
+let rawRequests = 0;
+page.on("websocket", ws => ws.on("framesent", frame => {
+  try { if (JSON.parse(frame.payload).type === "raw_request") rawRequests++; } catch {}
+}));
 // set by scenario 26 before its intentional anonymous file probe, so
 // the expected 401 resource error Chromium logs is not counted as a failure.
 let expectOneFile401 = false;
@@ -274,6 +278,28 @@ try {
   for (const [k, v] of Object.entries(md)) if (!v) fail(`markdown showcase missing: ${k}`);
   ok("showcase rendered: " + JSON.stringify(md));
   await shot(page, "03-showcase.png");
+
+  console.log("raw request: lazy mobile dialog, search, folding, and dismissal");
+  if (rawRequests !== 0) fail("raw payload requested before opening the viewer");
+  await page.locator(".msg.assistant .raw-button").last().click();
+  await waitFor(page, () => document.querySelector(".raw-tree .raw-branch"), "raw JSON loaded");
+  if (rawRequests !== 1) fail("opening raw should fetch exactly one request");
+  const rawText = await page.locator(".raw-tree").textContent();
+  if (!rawText.includes("Show me everything you can render") || !rawText.includes('"tools"')) fail("raw viewer omitted model input or tool schemas");
+  const dialogSize = await page.locator(".raw-dialog").boundingBox();
+  if (dialogSize.width > 390 || dialogSize.height > 844) fail("raw viewer overflows mobile viewport");
+  await page.locator(".raw-dialog [data-expand]").click();
+  if (await page.locator(".raw-branch:not([open])").count()) fail("Expand all left closed nodes");
+  await page.locator(".raw-dialog [data-collapse]").click();
+  if (await page.locator(".raw-branch[open]").count()) fail("Collapse all left open nodes");
+  await page.locator(".raw-dialog input").fill("everything you can render");
+  if (!await page.locator(".raw-match").count()) fail("search did not reveal a collapsed value");
+  await shot(page, "raw-mobile.png");
+  await page.locator(".raw-dialog input").fill("no-match-raw-sentinel");
+  if (!(await page.locator(".raw-note").textContent()).includes("0 matching")) fail("missing empty search feedback");
+  await page.keyboard.press("Escape");
+  await waitFor(page, () => !document.querySelector(".raw-dialog"), "raw dialog closed");
+  ok("raw JSON is fetched only on demand; mobile search and folding work");
 
   console.log("3. thinking + tool sections (content revealed on first expand)");
   const thinkingRendered = await page.evaluate(() => {
@@ -1069,6 +1095,7 @@ try {
   });
   await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.model === "mock-mini"`,
     "session state switched to mock-mini", 10000);
+  await waitFor(page, () => document.getElementById("chipModelText").textContent === "mock-mini", "model chip rendered after switch", 10000);
   const chipAfter = await page.evaluate(() => document.getElementById("chipModelText").textContent);
   const sheetClosed = await page.evaluate(() => !document.getElementById("sheetWrap").classList.contains("on"));
   if (chipAfter !== "mock-mini") fail("model chip does not follow the switch: " + chipAfter);

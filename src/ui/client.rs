@@ -25,6 +25,7 @@ pub enum Command {
     ResumeSession(String),
     Remember(String),
     GitDiff(Option<std::path::PathBuf>),
+    RawRequest(String),
     Shutdown(oneshot::Sender<SessionSummary>),
 }
 
@@ -101,6 +102,10 @@ pub async fn connect(
                                 events.send(Event::Snapshot(Box::new(subscription.snapshot.clone()))).await?;
                             }
                             Command::Remember(command) => preferences.remember_command(&command)?,
+                            Command::RawRequest(block_id) => {
+                                let result = core.raw_request(&selected, &block_id).await.map_err(|e| e.to_string());
+                                events.send(Event::RawData { session_id: selected.clone(), block_id, result }).await?;
+                            }
                             Command::GitDiff(path) => {
                                 let content = core.diff(path.as_deref()).await?;
                                 events.send(Event::Diff { path, content }).await?;

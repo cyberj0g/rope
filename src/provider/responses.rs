@@ -13,6 +13,10 @@ use crate::{
     tool::ToolDefinition,
 };
 
+pub(super) fn request_body(request: CompletionRequest) -> Result<Value> {
+    Ok(serde_json::to_value(ResponseRequest::from(request))?)
+}
+
 pub async fn stream(
     client: &Client,
     base_url: &str,
@@ -20,7 +24,7 @@ pub async fn stream(
     request: CompletionRequest,
 ) -> Result<ResponseStream> {
     let url = format!("{}/responses", base_url.trim_end_matches('/'));
-    let mut builder = client.post(url).json(&ResponseRequest::from(request));
+    let mut builder = client.post(url).json(&request_body(request)?);
     if !api_key.is_empty() {
         builder = builder.bearer_auth(api_key);
     }
@@ -124,7 +128,7 @@ fn input_items(messages: Vec<Message>, model: &str) -> Vec<Value> {
 
 fn message_items(message: Message, model: &str) -> Vec<Value> {
     match message {
-        Message::System { content } => vec![json!({ "role": "system", "content": content })],
+        Message::System { content, .. } => vec![json!({ "role": "system", "content": content })],
         Message::User { content, images } if images.is_empty() => {
             vec![json!({ "role": "user", "content": content })]
         }

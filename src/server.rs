@@ -327,6 +327,7 @@ async fn web_asset(Path(path): Path<String>) -> Response {
         "styles.css" => include_str!("../web/styles.css"),
         "js/app.js" => include_str!("../web/js/app.js"),
         "js/attachments.js" => include_str!("../web/js/attachments.js"),
+        "js/raw.js" => include_str!("../web/js/raw.js"),
         "js/chat.js" => include_str!("../web/js/chat.js"),
         "js/composer.js" => include_str!("../web/js/composer.js"),
         "js/files.js" => include_str!("../web/js/files.js"),
@@ -829,6 +830,12 @@ async fn dispatch(
             let total = view.total(&snapshot.sessions);
             let sessions: Vec<_> = view.page(&snapshot.sessions).iter().cloned().collect();
             json!({"sessions":sessions,"total":total})
+        }
+        Request::RawRequest {
+            session_id,
+            block_id,
+        } => {
+            json!({"body": core.raw_request(&session_id, &block_id).await?})
         }
         Request::RevealBlock {
             session_id,

@@ -93,15 +93,13 @@ async fn failed_turns_preserve_partial_work_with_a_failure_marker() {
     let (_, messages) = rope::session::Session::resume_in(harness.storage.path().into(), &id)
         .await
         .unwrap();
+    assert!(messages.iter().any(
+        |m| matches!(m, Message::System { content, .. } if content.starts_with("turn failed:"))
+    ));
     assert!(
-        messages.iter().any(
-            |m| matches!(m, Message::System { content } if content.starts_with("turn failed:"))
+        !messages.iter().any(
+            |m| matches!(m, Message::System { content, .. } if content == "cancelled by user")
         )
-    );
-    assert!(
-        !messages
-            .iter()
-            .any(|m| matches!(m, Message::System { content } if content == "cancelled by user"))
     );
 }
 
@@ -341,7 +339,7 @@ async fn a_response_cut_off_at_the_context_limit_compacts_and_continues() {
     summary.finish("work remains to be done");
     let continuation = harness.next().await;
     assert!(continuation.request.messages.iter().any(|message| {
-        matches!(message, Message::System { content } if content.contains("work remains to be done"))
+        matches!(message, Message::System { content, .. } if content.contains("work remains to be done"))
     }));
     continuation.finish("finished");
     until(&mut subscription, |event| {
@@ -437,7 +435,7 @@ async fn mid_turn_compaction_preserves_steering_and_the_saved_boundary() {
         assert_eq!(remaining.len(), 2);
         if cancel {
             assert!(
-                matches!(&remaining[1], Message::System { content } if content == "cancelled by user")
+                matches!(&remaining[1], Message::System { content, .. } if content == "cancelled by user")
             );
         } else {
             assert!(
@@ -653,4 +651,143 @@ async fn cancelling_one_session_does_not_kill_another_sessions_shell_job() {
     assert!(output.starts_with("status: running"), "{output}");
     drop(next);
     core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_requests_are_lazy_historical_and_survive_compaction_and_restart() {
+    use rope::{config::Config, core::Core};
+    use std::sync::Arc;
+    let mut harness = Harness::new().await;
+    let id = harness.core.create(Some("raw".into())).await.unwrap();
+    let mut subscription = harness.core.subscribe(&id).await.unwrap();
+    harness
+        .core
+        .command(&id, prompt("first prompt"))
+        .await
+        .unwrap();
+    harness.next().await.tool("list_files", json!({"path":"."}));
+    harness.next().await.finish("first answer");
+    until(&mut subscription, |e| {
+        matches!(e, Event::GenerationFinished)
+    })
+    .await;
+    let first = harness.core.subscribe(&id).await.unwrap().snapshot;
+    let raw = harness
+        .core
+        .raw_request(&id, &first.blocks[0].id)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw,
+        harness
+            .core
+            .raw_request(&id, &first.blocks[1].id)
+            .await
+            .unwrap()
+    );
+    assert!(raw.to_string().contains("first prompt"));
+    let final_raw = harness
+        .core
+        .raw_request(&id, &first.blocks.last().unwrap().id)
+        .await
+        .unwrap();
+    assert_ne!(raw, final_raw);
+    assert!(final_raw.to_string().contains("function_call_output"));
+    assert!(raw.get("tools").is_some());
+    let snapshot_json = serde_json::to_value(&first).unwrap();
+    assert!(
+        snapshot_json["blocks"][0]
+            .get("raw_request")
+            .unwrap()
+            .is_string()
+    );
+    assert!(snapshot_json["blocks"][0].get("body").is_none());
+    assert!(!snapshot_json.to_string().contains("parameters"));
+    assert!(harness.core.raw_request(&id, "../requests").await.is_err());
+
+    harness.core.command(&id, Action::Compact).await.unwrap();
+    harness.next().await.finish("summary of first prompt");
+    until(&mut subscription, |e| {
+        matches!(e, Event::GenerationFinished)
+    })
+    .await;
+    let compacted = harness.core.subscribe(&id).await.unwrap().snapshot;
+    let summary_raw = harness
+        .core
+        .raw_request(&id, &compacted.blocks.last().unwrap().id)
+        .await
+        .unwrap();
+    assert!(
+        summary_raw
+            .to_string()
+            .contains("Write the continuation summary")
+    );
+
+    let accepted = harness
+        .core
+        .command(&id, prompt("second prompt"))
+        .await
+        .unwrap();
+    let pending = harness.next().await;
+    harness
+        .core
+        .command(
+            &id,
+            Action::Cancel {
+                turn_id: accepted.turn_id.unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    drop(pending);
+    until(&mut subscription, |e| {
+        matches!(e, Event::GenerationCancelled)
+    })
+    .await;
+    let cancelled = harness.core.subscribe(&id).await.unwrap().snapshot;
+    let second = cancelled
+        .blocks
+        .iter()
+        .find(|b| b.content == "second prompt")
+        .unwrap();
+    let second_raw = harness.core.raw_request(&id, &second.id).await.unwrap();
+    assert!(second_raw.to_string().contains("summary of first prompt"));
+    assert!(second_raw.to_string().contains("second prompt"));
+    assert_eq!(
+        raw,
+        harness
+            .core
+            .raw_request(&id, &first.blocks[0].id)
+            .await
+            .unwrap()
+    );
+    harness.core.shutdown().await.unwrap();
+
+    let (sender, _) = tokio::sync::mpsc::unbounded_channel();
+    let reopened = Core::new(
+        Config::default(),
+        harness.project.path().into(),
+        harness.storage.path().into(),
+        Arc::new(support::ControlledProvider(sender)),
+    )
+    .await
+    .unwrap();
+    let restored = reopened.subscribe(&id).await.unwrap().snapshot;
+    for (content, expected) in [
+        ("first prompt", raw),
+        ("context compacted", summary_raw),
+        ("second prompt", second_raw),
+    ] {
+        let block = restored
+            .blocks
+            .iter()
+            .find(|b| b.content == content)
+            .unwrap();
+        assert_eq!(
+            expected,
+            reopened.raw_request(&id, &block.id).await.unwrap(),
+            "{content}"
+        );
+    }
+    reopened.shutdown().await.unwrap();
 }

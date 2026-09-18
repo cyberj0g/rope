@@ -98,6 +98,8 @@ pub struct ToolView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Block {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_request: Option<String>,
     pub id: String,
     pub kind: BlockKind,
     pub content: String,
@@ -185,6 +187,8 @@ pub struct Projection {
     drafts: HashMap<usize, usize>,
     calls: HashMap<String, usize>,
     next_id: u64,
+    raw_request: Option<String>,
+    pending_raw: Vec<usize>,
 }
 
 impl Projection {
@@ -213,12 +217,19 @@ impl Projection {
             drafts: HashMap::new(),
             calls: HashMap::new(),
             next_id: 0,
+            raw_request: None,
+            pending_raw: Vec::new(),
         }
     }
 
     fn block(&mut self, kind: BlockKind, content: String) -> Block {
         self.next_id += 1;
         Block {
+            raw_request: if matches!(kind, BlockKind::User | BlockKind::Steer) {
+                None
+            } else {
+                self.raw_request.clone()
+            },
             id: self.next_id.to_string(),
             kind,
             content,
@@ -237,6 +248,9 @@ impl Projection {
             before: None,
             block: block.clone(),
         });
+        if matches!(block.kind, BlockKind::User | BlockKind::Steer) {
+            self.pending_raw.push(self.snapshot.blocks.len());
+        }
         self.snapshot.blocks.push(block);
         self.snapshot.blocks.len() - 1
     }
@@ -271,6 +285,10 @@ impl Projection {
 
     fn history(&mut self, messages: &[Message], changes: &mut Vec<Change>) {
         for message in messages {
+            if let Message::Assistant { raw_request, .. } = message {
+                self.set_raw_request(raw_request.clone(), changes);
+                self.pending_raw.clear();
+            }
             match message {
                 Message::User { content, images } | Message::Steer { content, images } => {
                     let kind = if matches!(message, Message::Steer { .. }) {
@@ -282,7 +300,16 @@ impl Projection {
                     block.images = images.clone();
                     self.push(block, changes);
                 }
-                Message::System { content } => {
+                Message::System {
+                    content,
+                    raw_request,
+                } => {
+                    if raw_request.is_some() {
+                        self.set_raw_request(raw_request.clone(), changes);
+                    }
+                    if !content.starts_with(COMPACTION_MARKER) {
+                        self.pending_raw.clear();
+                    }
                     let mut block = self.block(BlockKind::System, content.clone());
                     if let Some(summary) = content.strip_prefix(COMPACTION_MARKER) {
                         block.content = "context compacted".into();
@@ -355,10 +382,22 @@ impl Projection {
         }
     }
 
+    fn set_raw_request(&mut self, id: Option<String>, changes: &mut Vec<Change>) {
+        self.raw_request = id.clone();
+        for index in self.pending_raw.clone() {
+            let block = &mut self.snapshot.blocks[index];
+            if !block.queued {
+                block.raw_request = id.clone();
+                self.replace(index, changes);
+            }
+        }
+    }
+
     pub fn apply(&mut self, event: &Event) -> Vec<Change> {
         let mut changes = Vec::new();
         let mut state_changed = true;
         match event {
+            Event::RawRequest(id) => self.set_raw_request(id.clone(), &mut changes),
             Event::History(messages) => self.history(messages, &mut changes),
             Event::MessageAccepted(message) => {
                 self.history(std::slice::from_ref(message), &mut changes);
@@ -440,6 +479,7 @@ impl Projection {
                 self.snapshot.state.generation_ms += duration.as_millis() as u64;
             }
             Event::TextDelta(delta) | Event::ReasoningDelta(delta) => {
+                self.pending_raw.retain(|&i| self.snapshot.blocks[i].queued);
                 let thinking = matches!(event, Event::ReasoningDelta(_));
                 if !thinking {
                     self.pause_reasoning(&mut changes);
@@ -487,6 +527,7 @@ impl Projection {
                 name,
                 arguments,
             } => {
+                self.pending_raw.retain(|&i| self.snapshot.blocks[i].queued);
                 self.pause_reasoning(&mut changes);
                 if let Some(index) = self.assistant
                     && self.snapshot.blocks[index].kind != BlockKind::Status
@@ -662,6 +703,11 @@ impl Projection {
                     block: block.clone(),
                 });
                 self.snapshot.blocks.insert(index, block);
+                for pointer in &mut self.pending_raw {
+                    if *pointer >= index {
+                        *pointer += 1;
+                    }
+                }
                 for pointer in self
                     .assistant
                     .iter_mut()
@@ -676,6 +722,11 @@ impl Projection {
                 self.snapshot.state.notice = None;
             }
             Event::GenerationFinished | Event::GenerationCancelled | Event::Error(_) => {
+                if matches!(event, Event::GenerationFinished) {
+                    self.pending_raw.retain(|&i| self.snapshot.blocks[i].queued);
+                } else {
+                    self.pending_raw.clear();
+                }
                 self.pause_reasoning(&mut changes);
                 self.assistant = None;
                 self.drafts.clear();
@@ -724,6 +775,7 @@ impl Projection {
             | Event::PromptRejected(..)
             | Event::Snapshot(_)
             | Event::Catalog(_)
+            | Event::RawData { .. }
             | Event::Diff { .. } => state_changed = false,
         }
         if state_changed {
@@ -747,6 +799,30 @@ mod tests {
             size: 42,
             mime_type: "text/markdown".into(),
         }
+    }
+
+    #[test]
+    fn resubmitted_steer_links_to_its_own_request() {
+        let mut projection = Projection::new("session".into());
+        projection.apply(&Event::MessageAccepted(Message::user("first".into())));
+        projection.apply(&Event::RawRequest(Some("first-request".into())));
+        projection.apply(&Event::TextDelta("answer".into()));
+        projection.apply(&Event::MessageAccepted(Message::steer(
+            "next".into(),
+            Vec::new(),
+        )));
+        projection.apply(&Event::GenerationFinished);
+        projection.apply(&Event::SteersDelivered(1));
+        projection.apply(&Event::ModelRequestStarted("model".into()));
+        projection.apply(&Event::RawRequest(Some("next-request".into())));
+        assert_eq!(
+            projection.snapshot.blocks[0].raw_request.as_deref(),
+            Some("first-request")
+        );
+        assert_eq!(
+            projection.snapshot.blocks[2].raw_request.as_deref(),
+            Some("next-request")
+        );
     }
 
     #[test]

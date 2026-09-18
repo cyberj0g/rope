@@ -42,6 +42,12 @@ impl ModelRequest {
 
 #[async_trait]
 impl Provider for ControlledProvider {
+    fn request_body(&self, mut request: CompletionRequest) -> Result<Option<serde_json::Value>> {
+        request.provider = "default".into();
+        rope::provider::openai::OpenAiProvider::new(String::new(), String::new())
+            .request_body(request)
+    }
+
     async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream> {
         let (stream, receiver) = mpsc::unbounded_channel();
         self.0.send(ModelRequest { request, stream })?;

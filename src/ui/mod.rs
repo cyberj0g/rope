@@ -1,5 +1,6 @@
 mod client;
 mod history;
+mod raw;
 use crate::protocol::Action;
 use client::Command;
 mod links;
@@ -556,6 +557,21 @@ async fn handle_key(
 ) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
+    }
+    if let Some(view) = &mut state.raw_view {
+        if key.code == KeyCode::Esc {
+            state.raw_view = None;
+        } else {
+            view.borrow_mut().key(key);
+        }
+        return Ok(false);
+    }
+    if key.code == KeyCode::Char('r')
+        && state.selected().is_some()
+        && key.modifiers.is_empty()
+    {
+        open_raw(state, state.selected().unwrap(), commands).await?;
+        return Ok(false);
     }
     if handle_fullscreen_diff_key(key, state, screen.height, &mut renders.diff) {
         return Ok(false);
@@ -1354,6 +1370,20 @@ fn chat_url_at(
         .map(|link| link.url.clone())
 }
 
+async fn open_raw(
+    state: &mut UiState,
+    index: usize,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    if let Some(id) = state.block_ids.get(index).cloned() {
+        state.raw_view = Some(std::cell::RefCell::new(raw::RawView::new(id.clone())));
+        state.text_selection = None;
+        state.selection_anchor = None;
+        commands.send(Command::RawRequest(id)).await?;
+    }
+    Ok(())
+}
+
 async fn handle_mouse(
     mouse: MouseEvent,
     state: &mut UiState,
@@ -1361,6 +1391,10 @@ async fn handle_mouse(
     commands: &mpsc::Sender<Command>,
     renders: &mut RenderState,
 ) -> Result<()> {
+    if let Some(view) = &mut state.raw_view {
+        view.borrow_mut().mouse(mouse);
+        return Ok(());
+    }
     if state.model_picker.is_some() || state.session_picker.is_some() {
         return Ok(());
     }
@@ -1598,6 +1632,17 @@ async fn handle_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            let layout = chat_layout(state, conversation, &mut renders.chat);
+            let row = layout.offset + mouse.row.saturating_sub(conversation.y);
+            let column = mouse.column.saturating_sub(conversation.x + 1);
+            if let Some((index, _, _)) = layout
+                .raw_buttons
+                .iter()
+                .find(|(_, r, c)| *r == row && *c == column)
+            {
+                open_raw(state, *index, commands).await?;
+                return Ok(());
+            }
             if let Some(diff) = chat_diff_hit_test(
                 state,
                 conversation,
@@ -1810,6 +1855,10 @@ fn draw(
     hidden_chat_height: usize,
     renders: &mut RenderState,
 ) -> usize {
+    if let Some(view) = &state.raw_view {
+        view.borrow_mut().draw(frame);
+        return hidden_chat_height;
+    }
     if state.git_fullscreen_diff {
         draw_fullscreen_git(frame, state, &mut renders.diff);
         return hidden_chat_height;
@@ -2588,6 +2637,7 @@ struct ChatLayout {
     headers: Vec<(usize, u16, u16)>,
     sections: Vec<(usize, u16, u16)>,
     diff_buttons: Vec<(usize, u16, u16)>,
+    raw_buttons: Vec<(usize, u16, u16)>,
     search_matches: Vec<SearchMatch>,
     images: Vec<ChatImagePlacement>,
     offset: u16,
@@ -2615,6 +2665,7 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
     let mut lines = Vec::new();
     let mut links: Vec<Vec<LinkRange>> = Vec::new();
     let mut headers = Vec::new();
+    let mut raw_buttons = Vec::new();
     let mut sections = Vec::new();
     let mut diff_buttons = Vec::new();
     let mut images = Vec::new();
@@ -2636,7 +2687,21 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
             .get_mut(index)
             .expect("cache synced with blocks");
         render_block_body(block, index, state, width, area, entry);
-        let (header, diff_span) = block_header(block, entry, selected);
+        let (mut header, diff_span) = block_header(block, entry, selected);
+        if state.block_ids.get(index).is_some()
+            && let Some(line) = header.last_mut()
+        {
+            let start = line.width() as u16 + 1;
+            let base = row + header.len().saturating_sub(1) as u16;
+            raw_buttons.extend(
+                (start..start + 5).map(|column| (index, base + column / width, column % width)),
+            );
+            header
+                .last_mut()
+                .unwrap()
+                .spans
+                .push(Span::styled(" [raw]", Style::default().fg(Color::DarkGray)));
+        }
         let header = wrap_chat_lines(header, width).0;
         let header_row = row;
         let header_height = u16::try_from(header.len()).unwrap_or(u16::MAX).max(1);
@@ -2753,6 +2818,7 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
         headers,
         sections,
         diff_buttons,
+        raw_buttons,
         search_matches,
         images,
         offset,

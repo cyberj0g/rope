@@ -155,3 +155,21 @@ state, and stops session tools. A process crash can lose uncommitted live output
 Sessions run concurrently but share project files; this version adds no worktree
 isolation. Remote TUI attachment, multiple projects per core, user roles, and
 durable event replay are outside v1.
+
+## Raw model requests
+
+A block may contain an optional `raw_request` ID. This is a reference only;
+request bodies are never included in snapshots, updates, or `reveal_block`.
+Fetch the recorded request associated with a block on demand:
+
+```json
+{"request_id":"raw-1","type":"raw_request","session_id":"demo","block_id":"3"}
+```
+
+The normal reply's `result.body` contains the provider's JSON request, including
+system instructions, input/messages, tool definitions, and model settings.
+Binary data URLs and opaque reasoning are shortened with their original encoded
+byte counts. Published/uploaded file contents are not fetched. The request is
+scoped to the session and its block; unknown blocks or older turns without a
+recorded request return `not_found`. Records persist in `requests/<uuid>.json`
+inside the session directory and are removed when the session is deleted.

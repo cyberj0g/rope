@@ -176,7 +176,7 @@ pub(super) async fn run<P: Provider + ?Sized>(
                             let parent = internal_tx.clone(); let operation_id = id.clone();
                             let (worker_events, worker_internal, forward) = worker_channels(&id, &internal_tx);
                             compacting = Some((id, tokio::spawn(async move {
-                                let result = summarize(provider, &config, &context, &worker_events, &worker_internal).await
+                                let result = summarize(provider, &config, &context, &worker_events, &worker_internal, None).await
                                     .map_err(|error| format!("compact: {error:#}"));
                                 drop(worker_events); drop(worker_internal); forward.await.ok();
                                 parent.send(InternalEvent::Scoped { id: operation_id, event: Box::new(InternalEvent::Compacted(result)) }).await.ok();
@@ -228,8 +228,8 @@ pub(super) async fn run<P: Provider + ?Sized>(
                     InternalEvent::Compacted(result) => {
                         compacting = None;
                         let result = match result {
-                            Ok(summary) => {
-                                let marker = Message::system(format!("{COMPACTION_MARKER}\n{summary}"));
+                            Ok((summary, raw_request)) => {
+                                let marker = Message::system(format!("{COMPACTION_MARKER}\n{summary}")).with_raw_request(raw_request);
                                 let saved = async {
                                     session.append(std::slice::from_ref(&marker)).await?;
                                     session.meta.compaction_summary = Some(summary.clone());
@@ -259,7 +259,7 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         }
                         let mut persisted = Vec::new();
                         if let Some(compaction) = compaction {
-                            let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
+                            let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary)).with_raw_request(compaction.raw_request);
                             session.meta.compaction_summary = Some(compaction.summary);
                             session.meta.compacted_through = compaction.through
                                 + usize::from(compaction.through > messages.len());

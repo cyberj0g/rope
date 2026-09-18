@@ -212,6 +212,12 @@ pub enum Event {
     PlanChanged(Option<ExecutionPlan>),
     GenerationStarted,
     ModelRequestStarted(String),
+    RawRequest(Option<String>),
+    RawData {
+        session_id: String,
+        block_id: String,
+        result: Result<serde_json::Value, String>,
+    },
     ResponseHeadersReceived,
     ResponseStarted,
     ModelResponseFinished {
@@ -264,7 +270,7 @@ enum InternalEvent {
         event: Box<InternalEvent>,
     },
     Visible(Event),
-    Compacted(Result<String, String>),
+    Compacted(Result<(String, Option<String>), String>),
     Finished(TurnResult),
     Failed(String),
     Usage(Usage),
@@ -289,6 +295,7 @@ struct TurnResult {
 /// with it and the next turn would start as if nothing had happened.
 #[derive(Clone, Default)]
 struct TurnProgress {
+    raw_request: Option<String>,
     /// the full turn transcript, including work removed from model context
     messages: Vec<Message>,
     /// Compaction the turn applied (turn-start or mid-turn), if any.
@@ -306,6 +313,7 @@ struct ActiveTurn {
 
 #[derive(Clone)]
 struct Compaction {
+    raw_request: Option<String>,
     summary: String,
     through: usize,
 }
@@ -340,6 +348,7 @@ async fn persist_interrupted_turn(
     let TurnProgress {
         messages: mut tail,
         compaction,
+        raw_request,
     } = progress.lock().unwrap().clone();
     let compacted = compaction.is_some();
     let tool_error = if marker == CANCELLED_BY_USER {
@@ -350,7 +359,8 @@ async fn persist_interrupted_turn(
     close_open_tool_calls(&mut tail, &tool_error);
     messages.truncate(turn_from);
     if let Some(compaction) = compaction {
-        let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary));
+        let marker = Message::system(format!("{COMPACTION_MARKER}\n{}", compaction.summary))
+            .with_raw_request(compaction.raw_request);
         session.meta.compaction_summary = Some(compaction.summary);
         // the marker precedes the turn, shifting boundaries inside it
         session.meta.compacted_through =
@@ -367,7 +377,7 @@ async fn persist_interrupted_turn(
             .drain(..)
             .map(UserPrompt::steer_message),
     );
-    messages.push(Message::system(marker.into()));
+    messages.push(Message::system(marker.into()).with_raw_request(raw_request));
     if compacted {
         session.meta.context_tokens = estimate_tokens(&request_context(messages, &session.meta));
     }
@@ -422,6 +432,7 @@ async fn spawn_turn<P: Provider + ?Sized>(
     let progress: TurnProgressHandle = Arc::new(Mutex::new(TurnProgress {
         messages: vec![first.clone()],
         compaction: None,
+        raw_request: None,
     }));
     messages.push(first);
     let request_messages = request_context(messages, &session.meta);
@@ -571,7 +582,7 @@ fn request_context(messages: &[Message], meta: &SessionMeta) -> Vec<Message> {
     };
     eject_consumed_web_results(&mut context);
     compact_plan_history(&mut context);
-    strip_tool_diffs(&mut context);
+    strip_display_metadata(&mut context);
     context
 }
 
@@ -631,18 +642,22 @@ fn compact_plan_history(messages: &mut [Message]) -> usize {
     compacted
 }
 
-fn strip_tool_diffs(messages: &mut [Message]) -> usize {
+fn strip_display_metadata(messages: &mut [Message]) -> usize {
     messages
         .iter_mut()
         .filter_map(|message| match message {
             Message::Tool { diff, .. } => diff.take(),
+            Message::Assistant { raw_request, .. } | Message::System { raw_request, .. } => {
+                *raw_request = None;
+                None
+            }
             _ => None,
         })
         .count()
 }
 
 fn is_compaction_marker(message: &Message) -> bool {
-    matches!(message, Message::System { content } if content.starts_with(COMPACTION_MARKER))
+    matches!(message, Message::System { content, .. } if content.starts_with(COMPACTION_MARKER))
 }
 
 fn eject_consumed_web_results(messages: &mut [Message]) -> usize {
@@ -737,12 +752,21 @@ async fn turn<P: Provider + ?Sized>(
     let max_tokens = config.active_model().max_context_tokens;
     if estimated as f64 >= max_tokens as f64 * config.compaction_threshold as f64 {
         let user = messages.pop().context("missing user message")?;
-        let summary = summarize(provider.clone(), config, &messages, events, internal).await?;
+        let (summary, raw_request) = summarize(
+            provider.clone(),
+            config,
+            &messages,
+            events,
+            internal,
+            Some(progress),
+        )
+        .await?;
         messages = vec![
             Message::system(format!("Conversation summary for continuation:\n{summary}")),
             user,
         ];
         compaction = Some(Compaction {
+            raw_request,
             summary,
             through: visible_through,
         });
@@ -799,7 +823,8 @@ async fn summarize<P: Provider + ?Sized>(
     messages: &[Message],
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
-) -> Result<String> {
+    progress: Option<&TurnProgressHandle>,
+) -> Result<(String, Option<String>)> {
     events.send(Event::CompactionStarted).await.ok();
     events
         .send(Event::ModelRequestStarted(config.model_id().to_owned()))
@@ -840,6 +865,7 @@ async fn summarize<P: Provider + ?Sized>(
             .min(max_context / 4)
             .max(SUMMARY_MIN_OUTPUT_TOKENS)
     };
+    strip_display_metadata(&mut request_messages);
     let mut input_tokens = estimate_tokens(&request_messages);
     while input_tokens + output_budget(input_tokens) > max_context
         && drop_oldest_message(&mut request_messages)
@@ -878,7 +904,8 @@ async fn summarize<P: Provider + ?Sized>(
         stream: true,
         tools: Vec::new(),
     };
-    let (summary, end) = summarize_stream(&provider, request, events, internal).await?;
+    let (summary, end, raw_request) =
+        summarize_stream(&provider, request, events, internal, progress).await?;
     // The summary must be real output text. A reasoning block is the
     // model's chain of thought, not a dense continuation summary, and
     // persisting it is exactly the "thinking leak" that corrupts the
@@ -897,7 +924,7 @@ async fn summarize<P: Provider + ?Sized>(
         };
         bail!("compaction produced no summary text: {why}");
     }
-    Ok(summary)
+    Ok((summary, raw_request))
 }
 
 /// How a compaction response ended.
@@ -917,8 +944,10 @@ async fn summarize_stream<P: Provider + ?Sized>(
     request: CompletionRequest,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
-) -> Result<(String, SummaryEnd)> {
-    let mut stream = stream_with_retry(provider, request, events).await?;
+    progress: Option<&TurnProgressHandle>,
+) -> Result<(String, SummaryEnd, Option<String>)> {
+    let (mut stream, raw_request) =
+        stream_with_retry(provider, request, events, true, progress).await?;
     let mut summary = String::new();
     let mut end = None;
     let mut started = false;
@@ -940,7 +969,7 @@ async fn summarize_stream<P: Provider + ?Sized>(
             | ResponseDelta::OutputItem(_) => {}
         }
     }
-    Ok((summary, end.unwrap_or(SummaryEnd::Ended)))
+    Ok((summary, end.unwrap_or(SummaryEnd::Ended), raw_request))
 }
 
 /// The compaction's output budget: one eighth of the conversation it
@@ -1023,7 +1052,7 @@ async fn generate_session_title<P: Provider + ?Sized>(
         tools: Vec::new(),
     };
     let result: Result<(String, String)> = async {
-        let mut stream = stream_with_retry(&provider, request, events).await?;
+        let (mut stream, _) = stream_with_retry(&provider, request, events, false, None).await?;
         let mut reasoning = String::new();
         let mut text = String::new();
         let mut started = false;
@@ -1264,7 +1293,7 @@ async fn agent<P: Provider + ?Sized>(
             .await
             .ok();
         let mut request_messages = messages.clone();
-        strip_tool_diffs(&mut request_messages);
+        strip_display_metadata(&mut request_messages);
         apply_plan_context(&mut request_messages, current_plan.as_ref());
         if let Some(prompt) = &project_prompt {
             request_messages.insert(0, Message::system(prompt.clone()));
@@ -1279,7 +1308,8 @@ async fn agent<P: Provider + ?Sized>(
             stream: true,
             tools: tools.definitions(config.active_model().vision),
         };
-        let stream = stream_with_retry(&provider, request, events).await?;
+        let (stream, raw_request) =
+            stream_with_retry(&provider, request, events, true, Some(progress)).await?;
         let (reasoning, text, mut calls, usage, response_items, truncated) =
             collect(stream, events, internal).await?;
         // The tool call cap applies between assistant messages, not per turn.
@@ -1290,7 +1320,8 @@ async fn agent<P: Provider + ?Sized>(
             reasoning,
             calls.clone(),
             response_items,
-        );
+        )
+        .with_raw_request(raw_request);
         messages.push(response.clone());
         progress.lock().unwrap().messages.push(response);
         let mut used = usage.map_or_else(
@@ -1543,11 +1574,23 @@ async fn compact_mid_turn<P: Provider + ?Sized>(
         }
         through
     };
-    let summary = summarize(provider, config, &messages[..boundary], events, internal).await?;
+    let (summary, raw_request) = summarize(
+        provider,
+        config,
+        &messages[..boundary],
+        events,
+        internal,
+        Some(progress),
+    )
+    .await?;
     messages.splice(0..boundary, [Message::system(format!(
         "Conversation summary for continuation:\n{summary}\n\nContinue the unfinished work from this summary."
     ))]);
-    let compaction = Compaction { summary, through };
+    let compaction = Compaction {
+        summary,
+        through,
+        raw_request,
+    };
     progress.lock().unwrap().compaction = Some(compaction.clone());
     events
         .send(Event::ContextCompacted {
@@ -1565,7 +1608,7 @@ fn available_context_tokens(
     current_plan: Option<&ExecutionPlan>,
 ) -> u64 {
     let mut context = messages.to_vec();
-    strip_tool_diffs(&mut context);
+    strip_display_metadata(&mut context);
     apply_plan_context(&mut context, current_plan);
     if let Some(prompt) = project_prompt {
         context.insert(0, Message::system(prompt.into()));
@@ -1698,13 +1741,29 @@ async fn stream_with_retry<P: Provider + ?Sized>(
     provider: &Arc<P>,
     request: CompletionRequest,
     events: &mpsc::Sender<Event>,
-) -> Result<crate::provider::ResponseStream> {
+    record: bool,
+    progress: Option<&TurnProgressHandle>,
+) -> Result<(crate::provider::ResponseStream, Option<String>)> {
+    let raw_request = if record {
+        provider.record_request(&request).await?
+    } else {
+        None
+    };
+    if let Some(progress) = progress {
+        progress.lock().unwrap().raw_request = raw_request.clone();
+    }
+    if raw_request.is_some() {
+        events
+            .send(Event::RawRequest(raw_request.clone()))
+            .await
+            .ok();
+    }
     let mut attempt = 0;
     loop {
         match provider.stream(request.clone()).await {
             Ok(stream) => {
                 events.send(Event::ResponseHeadersReceived).await.ok();
-                return Ok(stream);
+                return Ok((stream, raw_request));
             }
             Err(error) if is_retryable(&error) => {
                 let seconds = retry_delay(attempt);
@@ -3035,7 +3094,7 @@ mod tests {
         )];
         let mut context = transcript.clone();
 
-        assert_eq!(strip_tool_diffs(&mut context), 1);
+        assert_eq!(strip_display_metadata(&mut context), 1);
         assert!(matches!(
             &transcript[0],
             Message::Tool { diff: Some(diff), .. } if diff.starts_with("large diff")
@@ -3102,7 +3161,7 @@ mod tests {
         assert_eq!(
             messages
                 .iter()
-                .filter(|message| matches!(message, Message::System { content } if content.starts_with(PLAN_CONTEXT_PREFIX)))
+                .filter(|message| matches!(message, Message::System { content, .. } if content.starts_with(PLAN_CONTEXT_PREFIX)))
                 .count(),
             1
         );
@@ -3121,7 +3180,7 @@ mod tests {
 
         apply_plan_context(&mut messages, Some(&current));
 
-        let Message::System { content } = &messages[0] else {
+        let Message::System { content, .. } = &messages[0] else {
             panic!("expected the plan system message first");
         };
         assert!(content.starts_with(PLAN_CONTEXT_PREFIX));
@@ -3416,6 +3475,7 @@ mod tests {
             &[Message::user("old turn".into())],
             &event_tx,
             &internal_tx,
+            None,
         )
         .await
         .unwrap_err();
@@ -3459,11 +3519,12 @@ mod tests {
             &[Message::user("old turn".into())],
             &event_tx,
             &internal_tx,
+            None,
         )
         .await
         .unwrap();
 
-        assert_eq!(summary, "dense summary");
+        assert_eq!(summary.0, "dense summary");
         // Reasoning would only spend the shared output budget.
         assert_eq!(
             provider.requests()[0].reasoning_effort,
@@ -3487,6 +3548,7 @@ mod tests {
             &[Message::user("old turn".into())],
             &event_tx,
             &internal_tx,
+            None,
         )
         .await
         .unwrap_err();
@@ -3520,6 +3582,7 @@ mod tests {
             &[Message::user("old turn".into())],
             &event_tx,
             &internal_tx,
+            None,
         )
         .await
         .unwrap_err();
@@ -3547,6 +3610,7 @@ mod tests {
             &messages,
             &event_tx,
             &internal_tx,
+            None,
         )
         .await
         .unwrap();
@@ -3586,6 +3650,7 @@ mod tests {
             &messages,
             &event_tx,
             &internal_tx,
+            None,
         )
         .await
         .unwrap();
@@ -3633,6 +3698,7 @@ mod tests {
             &messages,
             &event_tx,
             &internal_tx,
+            None,
         )
         .await
         .unwrap();
@@ -3676,6 +3742,7 @@ mod tests {
             &[Message::user("x".repeat(12_000))],
             &events,
             &internal,
+            None,
         )
         .await
         .unwrap_err();
@@ -3884,7 +3951,7 @@ mod tests {
         assert_eq!(context.len(), 3);
         assert!(matches!(
             &context[0],
-            Message::System { content }
+            Message::System { content, .. }
                 if content == "Conversation summary for continuation:\ndense summary"
         ));
         assert_eq!(context[1], Message::user("continue".into()));
@@ -4224,7 +4291,7 @@ mod tests {
         assert!(saved_messages.last().is_some_and(|message| {
             matches!(
                 message,
-                Message::System { content }
+                Message::System { content, .. }
                     if content.starts_with("Context compacted\ndense summary")
             )
         }));
@@ -4473,7 +4540,7 @@ mod tests {
         );
         assert!(matches!(&messages[3], Message::Steer { content, .. } if content == "keep going"));
         assert!(
-            matches!(&messages[4], Message::System { content } if content == CANCELLED_BY_USER)
+            matches!(&messages[4], Message::System { content, .. } if content == CANCELLED_BY_USER)
         );
         assert!(matches!(&messages[5], Message::User { content, .. } if content == "continue"));
         assert!(
@@ -4492,7 +4559,9 @@ mod tests {
             .expect("the cancelled turn's tool result left the next context");
         let seen_marker = next
             .iter()
-            .position(|m| matches!(m, Message::System { content } if content == CANCELLED_BY_USER))
+            .position(
+                |m| matches!(m, Message::System { content, .. } if content == CANCELLED_BY_USER),
+            )
             .expect("the cancellation marker left the next context");
         let seen_continue = next
             .iter()
@@ -4597,7 +4666,7 @@ mod tests {
             if call_id == "call_2" && content == CANCELLED_TOOL_OUTPUT)
         );
         assert!(
-            matches!(&messages[4], Message::System { content } if content == CANCELLED_BY_USER)
+            matches!(&messages[4], Message::System { content, .. } if content == CANCELLED_BY_USER)
         );
 
         tokio::fs::remove_dir_all(&root).await.unwrap();

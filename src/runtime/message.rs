@@ -68,6 +68,8 @@ pub fn guess_mime_type(path: &std::path::Path) -> String {
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
     System {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_request: Option<String>,
         content: String,
     },
     User {
@@ -83,6 +85,8 @@ pub enum Message {
         images: Vec<ImageContent>,
     },
     Assistant {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_request: Option<String>,
         content: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         model: String,
@@ -114,7 +118,10 @@ pub struct ToolCall {
 
 impl Message {
     pub fn system(content: String) -> Self {
-        Self::System { content }
+        Self::System {
+            content,
+            raw_request: None,
+        }
     }
     #[cfg(test)]
     pub fn user(content: String) -> Self {
@@ -137,6 +144,7 @@ impl Message {
         tool_calls: Vec<ToolCall>,
     ) -> Self {
         Self::Assistant {
+            raw_request: None,
             content,
             model,
             reasoning,
@@ -152,6 +160,7 @@ impl Message {
         response_items: Vec<Value>,
     ) -> Self {
         Self::Assistant {
+            raw_request: None,
             content,
             model,
             reasoning,
@@ -159,6 +168,16 @@ impl Message {
             response_items,
         }
     }
+    pub fn with_raw_request(mut self, id: Option<String>) -> Self {
+        match &mut self {
+            Self::System { raw_request, .. } | Self::Assistant { raw_request, .. } => {
+                *raw_request = id
+            }
+            _ => unreachable!(),
+        }
+        self
+    }
+
     pub fn tool(
         call_id: String,
         content: String,
@@ -206,7 +225,7 @@ impl Message {
     #[cfg(test)]
     pub fn content(&self) -> &str {
         match self {
-            Self::System { content }
+            Self::System { content, .. }
             | Self::User { content, .. }
             | Self::Steer { content, .. }
             | Self::Assistant { content, .. }

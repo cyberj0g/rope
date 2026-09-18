@@ -41,4 +41,12 @@ pub struct Usage {
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
     async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream>;
+
+    fn request_body(&self, _request: CompletionRequest) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    async fn record_request(&self, _request: &CompletionRequest) -> Result<Option<String>> {
+        Ok(None)
+    }
 }

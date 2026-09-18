@@ -52,7 +52,7 @@ impl ScriptedProvider {
     /// turns are detected from the request so they never consume a script.
     fn next(&self, request: &CompletionRequest) -> Vec<ResponseDelta> {
         use rope::runtime::Message;
-        if let Some(Message::System { content }) = request.messages.first() {
+        if let Some(Message::System { content, .. }) = request.messages.first() {
             if content.contains("2-3 word title") {
                 eprintln!("[script] title request (no consume)");
                 return text_only("Scripted e2e session");
@@ -170,6 +170,12 @@ fn catchall() -> Vec<ResponseDelta> {
 
 #[async_trait]
 impl Provider for ScriptedProvider {
+    fn request_body(&self, mut request: CompletionRequest) -> Result<Option<serde_json::Value>> {
+        request.provider = "default".into();
+        rope::provider::openai::OpenAiProvider::new(String::new(), String::new())
+            .request_body(request)
+    }
+
     async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream> {
         let deltas = self.next(&request);
         Ok(Box::pin(stream::unfold(
