@@ -26,7 +26,7 @@ use crate::{
     session::{Session, SessionMeta},
     tool::{Approval, ExecutionPlan, ToolDefinition, ToolRegistry},
 };
-pub use message::{ImageContent, Message, ToolCall};
+pub use message::{FileContent, ImageContent, MAX_FILE_BYTES, Message, ToolCall, guess_mime_type};
 
 pub const CANCELLED_BY_USER: &str = "cancelled by user";
 /// Tool result recorded for a call still in flight when the user stopped
@@ -189,6 +189,10 @@ pub enum Event {
     ToolImage {
         call_id: String,
         image: ImageContent,
+    },
+    ToolFile {
+        call_id: String,
+        file: FileContent,
     },
     History(Vec<Message>),
     SessionChanged(String),
@@ -1429,9 +1433,9 @@ async fn agent<P: Provider + ?Sized>(
             } else {
                 bail_tool_denied(&call.name)
             };
-            let (mut output, mut image, diff, success) = match result {
-                Ok(result) => (result.output, result.image, result.diff, true),
-                Err(error) => (format!("Error: {error:#}"), None, None, false),
+            let (mut output, mut image, file, diff, success) = match result {
+                Ok(result) => (result.output, result.image, result.file, result.diff, true),
+                Err(error) => (format!("Error: {error:#}"), None, None, None, false),
             };
             // The pre-run reservation covered the text, not the image. An
             // image that would crowd the result past its budget is
@@ -1467,6 +1471,15 @@ async fn agent<P: Provider + ?Sized>(
                     .await
                     .ok();
             }
+            if let Some(file) = &file {
+                events
+                    .send(Event::ToolFile {
+                        call_id: call.id.clone(),
+                        file: file.clone(),
+                    })
+                    .await
+                    .ok();
+            }
             events
                 .send(Event::ToolResult {
                     call_id: call.id.clone(),
@@ -1486,7 +1499,13 @@ async fn agent<P: Provider + ?Sized>(
                 current_plan = Some(plan.clone());
                 internal.send(InternalEvent::PlanUpdated(plan)).await?;
             }
-            let message = Message::tool(call.id, output, image, diff);
+            let message = Message::Tool {
+                call_id: call.id,
+                content: output,
+                image,
+                file,
+                diff,
+            };
             used = used.saturating_add(estimate_tokens(std::slice::from_ref(&message)));
             messages.push(message.clone());
             progress.lock().unwrap().messages.push(message);
@@ -1858,6 +1877,7 @@ mod tests {
             Ok(ToolResult {
                 output: args["value"].as_str().unwrap().to_owned(),
                 image: None,
+                file: None,
                 diff: None,
             })
         }
@@ -1896,6 +1916,7 @@ mod tests {
             Ok(ToolResult {
                 output,
                 image: None,
+                file: None,
                 diff: None,
             })
         }
@@ -3766,6 +3787,7 @@ mod tests {
                         width: 3072,
                         height: 1024, // 1445 tokens
                     }),
+                    file: None,
                     diff: None,
                 })
             }

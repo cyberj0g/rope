@@ -6,7 +6,8 @@ use std::{
 use crate::{
     project::ProjectState,
     runtime::{
-        CANCELLED_BY_USER, COMPACTION_MARKER, Event, ImageContent, Message, ToolCall, UserPrompt,
+        CANCELLED_BY_USER, COMPACTION_MARKER, Event, FileContent, ImageContent, Message, ToolCall,
+        UserPrompt,
     },
     tool::ExecutionPlan,
 };
@@ -134,6 +135,7 @@ pub enum ChatBlock {
         name: String,
         arguments: String,
         output: Option<String>,
+        file: Option<FileContent>,
         diff: Option<String>,
         status: ToolStatus,
         expanded: bool,
@@ -1199,6 +1201,21 @@ impl UiState {
                 self.project.git_diff = content;
                 self.diff_generation = self.diff_generation.wrapping_add(1);
             }
+            Event::ToolFile { call_id, file } => {
+                let changed = if let Some(block) = self.tool_calls.get(&call_id).copied()
+                    && let ChatBlock::Tool {
+                        file: block_file, ..
+                    } = &mut self.blocks[block]
+                {
+                    *block_file = Some(file);
+                    Some(block)
+                } else {
+                    None
+                };
+                if let Some(block) = changed {
+                    self.bump_render(block);
+                }
+            }
             Event::Ready
             | Event::Barrier(_)
             | Event::RefreshProject
@@ -1355,6 +1372,7 @@ impl UiState {
                             name: String::new(),
                             arguments: String::new(),
                             output: None,
+                            file: None,
                             diff: None,
                             status: ToolStatus::Streaming,
                             expanded: self.tools_expanded,
@@ -1677,6 +1695,7 @@ impl UiState {
                         name: tool.name.clone(),
                         arguments: tool.arguments.clone(),
                         output: tool.output.clone(),
+                        file: block.file.clone(),
                         diff: tool.diff.clone(),
                         status: match tool.status {
                             Status::Streaming => ToolStatus::Streaming,
@@ -1928,6 +1947,7 @@ impl UiState {
                             arguments: serde_json::to_string_pretty(&call.arguments)
                                 .unwrap_or_default(),
                             output: None,
+                            file: None,
                             diff: None,
                             status: ToolStatus::Pending,
                             expanded: self.tools_expanded,
@@ -1940,12 +1960,14 @@ impl UiState {
                 Message::Tool {
                     call_id,
                     content,
+                    file,
                     diff,
                     ..
                 } => {
                     if let Some(block) = self.tool_calls.get(&call_id).copied()
                         && let ChatBlock::Tool {
                             output,
+                            file: block_file,
                             diff: block_diff,
                             status,
                             counter,
@@ -1959,6 +1981,7 @@ impl UiState {
                         };
                         counter.push(&content);
                         *output = Some(content);
+                        *block_file = file;
                         *block_diff = diff;
                     }
                 }

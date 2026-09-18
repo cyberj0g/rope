@@ -109,7 +109,7 @@ function startServer(port) {
       const url = /e2e server on (http:\/\/\S+)/.exec(buffer)?.[1];
       if (!url) return reject(new Error("e2e server address missing:\n" + buffer));
       child.stdout.off("data", onData);
-      resolve({ child, url: url.replace(/\/$/, "") });
+      resolve({ child, url: url.replace(/\/$/, ""), project: /project: (\S+)/.exec(buffer)?.[1] });
     };
     child.stdout.on("data", onData);
     child.stderr.on("data", d => process.env.ROPE_E2E_DEBUG && process.stderr.write(d));
@@ -195,6 +195,9 @@ const context = await browser.newContext({
 });
 const page = await context.newPage();
 const pageErrors = [];
+// set by scenario 26 before its intentional anonymous file probe, so
+// the expected 401 resource error Chromium logs is not counted as a failure.
+let expectOneFile401 = false;
 context.on("response", r => {
   if (r.status() >= 400) console.error("  [http]", r.status(), r.request().method(), r.url().slice(0, 120));
 });
@@ -202,6 +205,10 @@ page.on("pageerror", e => { pageErrors.push(String(e)); console.error("  [pageer
 page.on("console", m => {
   if (m.type() === "error") {
     const t = m.text();
+    if (expectOneFile401 && t.includes("401")) {
+      expectOneFile401 = false;
+      return;
+    }
     pageErrors.push(t);
     console.error("  [console-error]", t.slice(0, 400));
   }
@@ -953,6 +960,66 @@ try {
   screenshots.push(path.join(shotsDir, "20-narrow.png"));
   ok("narrow viewport: header/strip fit, palette stays in view and scrolls");
   await small.close();
+
+  console.log("26. send_file: inline image + downloadable file tile");
+  await sendPrompt(page, "rope-e2e-send-file");
+  await waitFor(page, () => {
+    const tools = [...document.querySelectorAll("details.sec.tool")].filter(t => t.textContent.includes("send_file"));
+    if (tools.length < 2) return false;
+    const img = tools[0].parentElement.querySelector(".imgrid img");
+    return !!img && img.complete && img.naturalWidth >= 1 && !!tools[1].parentElement.querySelector(".filetile");
+  }, "both send_file blocks rendered (image inline, tile present)");
+  const fileDom = await page.evaluate(() => {
+    const tools = [...document.querySelectorAll("details.sec.tool")].filter(t => t.textContent.includes("send_file"));
+    const [imgTool, tileTool] = tools;
+    const img = imgTool.parentElement.querySelector(".imgrid img");
+    const tile = tileTool.parentElement.querySelector(".filetile");
+    return {
+      outside: [img, tile].every(el => el && !el.closest("details") && el.checkVisibility()),
+      collapsed: tools.every(t => !t.open),
+      img: img ? { complete: img.complete, width: img.naturalWidth, src: img.currentSrc.slice(0, 20) } : null,
+      tile: tile ? { name: tile.querySelector(".fname").textContent, size: tile.querySelector(".fsize").textContent } : null,
+      output: tools.map(t => t.querySelector(".toolout")?.textContent || ""),
+    };
+  });
+  if (!fileDom.outside || !fileDom.collapsed) fail("sent files must be visible outside collapsed tools");
+  if (!fileDom.img || !fileDom.img.complete || fileDom.img.width < 1) fail("send_file image not rendered inline: " + JSON.stringify(fileDom.img));
+  if (!fileDom.tile || fileDom.tile.name !== "notes.md") fail("send_file tile missing or wrong name: " + JSON.stringify(fileDom.tile));
+  if (!fileDom.output.every(o => o.includes("sent "))) fail("send_file tool output missing: " + JSON.stringify(fileDom.output));
+  await shot(page, "21-send-file.png");
+  expectOneFile401 = true;
+  const unauth = await page.evaluate(async () => (await fetch(`/api/sessions/${encodeURIComponent(document.querySelector(".side-item.on").dataset.session)}/files/unknown`)).status);
+  if (unauth !== 401) fail("unauthenticated file request not rejected (got " + unauth + ")");
+  const [download] = await Promise.all([
+    page.waitForEvent("download", { timeout: 10000 }),
+    page.click(".filetile"),
+  ]);
+  if (!download.suggestedFilename().endsWith("notes.md")) fail("download suggested filename: " + download.suggestedFilename());
+  const downloaded = fs.readFileSync(await download.path(), "utf8");
+  if (!downloaded.includes("rope: a rope for coding")) fail("downloaded file content mismatch: " + downloaded.slice(0, 60));
+  ok("send_file: image inline, tile downloads the exact file, endpoint rejects anonymous fetches");
+  fs.writeFileSync(path.join(server.project, "report.png"), makePng(3, 2));
+  await waitFor(page, idleProbe, "first send_file turn finished");
+  await sendPrompt(page, "rope-e2e-send-file");
+  await waitFor(page, () => {
+    const tools = [...document.querySelectorAll("details.sec.tool")].filter(t => t.textContent.includes("send_file"));
+    if (tools.length < 4) return false;
+    const images = tools.map(t => t.parentElement.querySelector(".imgrid img")).filter(Boolean);
+    return images.length === 2 && images[0].naturalWidth === 1 && images[1].naturalWidth === 3 && images[1].naturalHeight === 2;
+  }, "resending a changed image fetches the new version");
+  ok("send_file: repeated source path gets a separate image cache entry");
+  await page.fill("#input", "/tools off");
+  await page.keyboard.press("Enter");
+  await waitFor(page, () => !document.querySelector("details.sec.tool") &&
+    [...document.querySelectorAll(".msg.tool > .imgrid img, .msg.tool > .filetile")].filter(el => el.checkVisibility()).length === 4,
+    "sent files stay visible when tools are hidden");
+  await page.reload();
+  await waitFor(page, idleProbe, "file conversation restored");
+  await waitFor(page, () => !document.querySelector("details.sec.tool") &&
+    [...document.querySelectorAll(".msg.tool > .imgrid img, .msg.tool > .filetile")].filter(el => el.checkVisibility()).length === 4,
+    "sent files stay visible after reload with tools hidden");
+  ok("send_file: files remain visible with tools hidden, including after reload");
+
 
   if (pageErrors.length) {
     fail("page errors: " + pageErrors.slice(0, 3).join(" | "));

@@ -21,7 +21,7 @@ use crate::{
     project::ProjectState,
     protocol::{self, Action, CatalogEntry, CatalogSnapshot},
     provider::Provider,
-    runtime::{self, Command, Event, ImageContent},
+    runtime::{self, Command, Event, FileContent, ImageContent},
     session::{self, Session, SessionMeta},
     tool,
 };
@@ -283,6 +283,7 @@ impl Core {
                     continue;
                 }
                 if matches!(event, Event::Ready) {
+                    crate::logging::write("INFO", &pump_id, "session ready");
                     if let Some(ready) = ready.take() {
                         ready.send(()).ok();
                     }
@@ -318,6 +319,7 @@ impl Core {
                 let state = {
                     let mut hub = pump_hub.lock().unwrap();
                     let changes = hub.projection.apply(&event);
+                    crate::logging::event(&event, &hub.projection.snapshot);
                     let state = hub.projection.snapshot.state.clone();
                     let seq = hub.projection.snapshot.seq;
                     hub.updates
@@ -413,13 +415,13 @@ impl Core {
         })
     }
 
-    pub async fn command(&self, id: &str, action: Action) -> protocol::Result<protocol::Accepted> {
+    pub async fn command(&self, id: &str, mut action: Action) -> protocol::Result<protocol::Accepted> {
         let session = self.session(id).await.map_err(core_error)?;
         let mut images = Vec::new();
         if let Action::SendMessage {
             content,
             attachments,
-        } = &action
+        } = &mut action
         {
             if content.len() > protocol::MAX_COMMAND_BYTES || attachments.len() > 8 {
                 return Err(protocol::Error::new(
@@ -428,6 +430,12 @@ impl Core {
                 ));
             }
             for id in attachments {
+                if id.starts_with("uploads/") {
+                    let file = session::load_file_upload(&session.directory, id).await.map_err(core_error)?;
+                    content.push_str("\n\n");
+                    content.push_str(&file.prompt);
+                    continue;
+                }
                 images.push(
                     session::load_attachment(&session.directory, id)
                         .await
@@ -461,9 +469,29 @@ impl Core {
         session::store_attachment(&session.directory, bytes).await
     }
 
+    pub async fn upload(&self, id: &str, name: &str, bytes: &[u8]) -> Result<serde_json::Value> {
+        if image::guess_format(bytes).is_ok() {
+            return Ok(serde_json::to_value(self.attach(id, bytes).await?)?);
+        }
+        let session = self.session(id).await?;
+        Ok(serde_json::to_value(session::store_file_upload(&session.directory, name, bytes.to_vec()).await?)?)
+    }
+
     pub async fn attachment(&self, id: &str, attachment: &str) -> Result<ImageContent> {
         let session = self.session(id).await?;
         session::load_attachment(&session.directory, attachment).await
+    }
+
+    pub async fn published_file(&self, id: &str, block_id: &str) -> Result<FileContent> {
+        let session = self.session(id).await?;
+        let hub = session.hub.lock().unwrap();
+        hub.projection
+            .snapshot
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.file.clone())
+            .context("unknown published file")
     }
 
     pub async fn diff(&self, path: Option<&Path>) -> Result<String> {

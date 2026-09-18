@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::stream;
 use rope::{
     config::{Config, ModelConfig, ToolPolicies},
@@ -24,12 +25,16 @@ use std::{
 const DELTA_DELAY: Duration = Duration::from_millis(30);
 
 struct ScriptedProvider {
+    root: std::path::PathBuf,
     scripts: Mutex<VecDeque<Vec<ResponseDelta>>>,
 }
 
 impl ScriptedProvider {
-    fn new(scripts: Vec<Vec<ResponseDelta>>) -> Self {
-        Self { scripts: Mutex::new(scripts.into()) }
+    fn new(root: std::path::PathBuf, scripts: Vec<Vec<ResponseDelta>>) -> Self {
+        Self {
+            scripts: Mutex::new(scripts.into()),
+            root,
+        }
     }
 
     fn script(&self) -> Vec<ResponseDelta> {
@@ -53,13 +58,61 @@ impl ScriptedProvider {
                 return text_only("Scripted e2e session");
             }
         }
+        // send_file regression: a marked prompt starts the turn, and the two
+        // tool results that follow each get a scripted reply — none of it
+        // consumes the script queue.
+        if let Some(Message::Tool {
+            file: Some(file), ..
+        }) = request.messages.last()
+        {
+            if file.path.ends_with("report.png") {
+                eprintln!("[script] image sent; asking for the report");
+                let path = self.root.join("notes.md").display().to_string();
+                return vec![
+                    ResponseDelta::ToolCall {
+                        index: 0,
+                        id: Some("call-send-report".into()),
+                        name: Some("send_file".into()),
+                        arguments: serde_json::json!({ "path": path }).to_string(),
+                    },
+                    ResponseDelta::Completed,
+                ];
+            }
+            if file.path.ends_with("notes.md") {
+                eprintln!("[script] report sent; wrapping up");
+                return text_only(
+                    "Both files are in your chat now — the picture inline, the report as a file tile.",
+                );
+            }
+        }
+        let send_file_turn = matches!(
+            request.messages.iter().rev().find(|m| matches!(m, Message::User { .. } | Message::Steer { .. })),
+            Some(Message::User { content, .. } | Message::Steer { content, .. })
+                if content.contains("rope-e2e-send-file")
+        );
+        if send_file_turn {
+            eprintln!("[script] send_file turn start");
+            let path = self.root.join("report.png").display().to_string();
+            return vec![
+                ResponseDelta::Text("Here you go.".into()),
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call-send-image".into()),
+                    name: Some("send_file".into()),
+                    arguments: serde_json::json!({ "path": path }).to_string(),
+                },
+                ResponseDelta::Completed,
+            ];
+        }
         let has_image = matches!(
             request.messages.iter().rev().find(|m| matches!(m, Message::User { .. } | Message::Steer { .. })),
             Some(Message::User { images, .. } | Message::Steer { images, .. }) if !images.is_empty()
         );
         if has_image {
             eprintln!("[script] image turn (no consume)");
-            return text_only("I can see the image you attached — it came through end to end, and I'd frame the logo with a little more padding.");
+            return text_only(
+                "I can see the image you attached — it came through end to end, and I'd frame the logo with a little more padding.",
+            );
         }
         let rest = self.scripts.lock().unwrap().len();
         let script = self.script();
@@ -73,7 +126,10 @@ impl ScriptedProvider {
 }
 
 fn text_only(text: &str) -> Vec<ResponseDelta> {
-    vec![ResponseDelta::Text(text.to_owned()), ResponseDelta::Completed]
+    vec![
+        ResponseDelta::Text(text.to_owned()),
+        ResponseDelta::Completed,
+    ]
 }
 
 fn streamed(text: &str) -> Vec<ResponseDelta> {
@@ -104,7 +160,10 @@ fn catchall() -> Vec<ResponseDelta> {
          reading the tail end of this, then the window held as intended and the scenario can \
          move on with confidence that the running turn behaved the way the driver expected.",
     );
-    deltas.push(ResponseDelta::Usage(Usage { prompt_tokens: 1102, total_tokens: 1188 }));
+    deltas.push(ResponseDelta::Usage(Usage {
+        prompt_tokens: 1102,
+        total_tokens: 1188,
+    }));
     deltas.push(ResponseDelta::Completed);
     deltas
 }
@@ -113,11 +172,14 @@ fn catchall() -> Vec<ResponseDelta> {
 impl Provider for ScriptedProvider {
     async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream> {
         let deltas = self.next(&request);
-        Ok(Box::pin(stream::unfold(std::collections::VecDeque::from(deltas), |mut queue| async move {
-            let delta = queue.pop_front()?;
-            tokio::time::sleep(DELTA_DELAY).await;
-            Some((Ok(delta), queue))
-        })))
+        Ok(Box::pin(stream::unfold(
+            std::collections::VecDeque::from(deltas),
+            |mut queue| async move {
+                let delta = queue.pop_front()?;
+                tokio::time::sleep(DELTA_DELAY).await;
+                Some((Ok(delta), queue))
+            },
+        )))
     }
 }
 
@@ -222,22 +284,40 @@ fn build_project(root: &std::path::Path) -> Result<()> {
         root.join("notes.md"),
         "# Notes\n\n- rope: a rope for coding\n- make it mobile\n- keep it small\n",
     )?;
+    // A small PNG for the send_file inline-image regression.
+    std::fs::write(
+        root.join("report.png"),
+        STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .context("decode e2e png")?,
+    )?;
     std::fs::create_dir(root.join("src"))?;
-    std::fs::write(root.join("src/tool.rs"), "pub fn tool() -> &'static str {\n    \"rope\"\n}\n")?;
+    std::fs::write(
+        root.join("src/tool.rs"),
+        "pub fn tool() -> &'static str {\n    \"rope\"\n}\n",
+    )?;
     git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.email", "e2e@rope.local"]);
     git(root, &["config", "user.name", "Rope E2E"]);
     git(root, &["add", "-A"]);
     git(root, &["commit", "-q", "-m", "initial"]);
     // Leave the tree dirty so the Git pane has something to show.
-    std::fs::write(root.join("notes.md"), "# Notes\n\n- rope: a rope for coding\n- make it mobile\n- keep it small\n- ship the web UI\n")?;
-    std::fs::write(root.join("web.md"), "New untracked file for the e2e scenario.\n")?;
+    std::fs::write(
+        root.join("notes.md"),
+        "# Notes\n\n- rope: a rope for coding\n- make it mobile\n- keep it small\n- ship the web UI\n",
+    )?;
+    std::fs::write(
+        root.join("web.md"),
+        "New untracked file for the e2e scenario.\n",
+    )?;
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let port: u16 = std::env::var("ROPE_E2E_PORT").unwrap_or_else(|_| "8791".into()).parse()?;
+    let port: u16 = std::env::var("ROPE_E2E_PORT")
+        .unwrap_or_else(|_| "8791".into())
+        .parse()?;
     let token = std::env::var("ROPE_E2E_TOKEN").unwrap_or_else(|_| "e2e-token".into());
     let project = tempfile::tempdir().context("temp project")?;
     build_project(project.path())?;
@@ -280,6 +360,7 @@ async fn main() -> Result<()> {
         search_files: Approval::Allow,
         list_files: Approval::Allow,
         org_outline: Approval::Allow,
+        send_file: Approval::Allow,
         web_browser: Approval::Ask,
         web_search: Approval::Ask,
         external: Approval::Ask,
@@ -289,7 +370,10 @@ async fn main() -> Result<()> {
         config,
         project.path().into(),
         storage.path().into(),
-        Arc::new(ScriptedProvider::new(scripts())),
+        Arc::new(ScriptedProvider::new(
+            project.path().to_path_buf(),
+            scripts(),
+        )),
     )
     .await?;
 

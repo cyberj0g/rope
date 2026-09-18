@@ -14,9 +14,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{config::Config, runtime::ImageContent};
+use crate::{
+    config::Config,
+    runtime::{FileContent, ImageContent},
+};
 use builtin::{
-    EditTool, ListFilesTool, ReadTool, SearchFilesTool, UpdatePlanTool, ViewImageTool, WriteTool,
+    EditTool, ListFilesTool, ReadTool, SearchFilesTool, SendFileTool, UpdatePlanTool,
+    ViewImageTool, WriteTool,
 };
 use external::ExternalTool;
 use headless::HeadlessBrowser;
@@ -71,6 +75,8 @@ pub struct ToolResult {
     pub output: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
 }
@@ -202,6 +208,7 @@ pub async fn discover_at(config: &Config, root: &std::path::Path) -> Result<Tool
     );
     registry.insert(OrgOutlineTool(cwd.clone()), config.tools.org_outline);
     registry.insert(ViewImageTool(cwd.clone()), config.tools.read);
+    registry.insert(SendFileTool(cwd.clone()), config.tools.send_file);
     add_web_tools(
         &mut registry,
         config,

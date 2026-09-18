@@ -289,17 +289,232 @@ async fn transport_authentication_origins_and_attachments_are_enforced() {
     stop(server, &harness).await;
 }
 
+#[tokio::test]
+async fn arbitrary_uploads_reach_the_model_and_stay_session_scoped() {
+    use rope::{protocol::Action, runtime::FileContent};
+
+    let mut harness = Harness::new().await;
+    let id = harness.core.create(Some("files".into())).await.unwrap();
+    let other = harness.core.create(Some("other".into())).await.unwrap();
+    let server = start(&harness).await;
+    let http = reqwest::Client::new();
+    let url = format!("http://{}/api/sessions/{id}/attachments", server.address);
+    let name = "notes résumé & + #.txt";
+    let response = http.post(&url).query(&[("filename", name)])
+        .bearer_auth("test-token").body("contents of the upload").send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let file: FileContent = response.json().await.unwrap();
+    assert_eq!(file.name, name);
+    assert!(file.path.starts_with("uploads/"));
+    let action = Action::SendMessage { content: "Read this file".into(), attachments: vec![file.path.clone()] };
+    assert!(harness.core.command(&other, action.clone()).await.is_err());
+    harness.core.command(&id, action).await.unwrap();
+    let request = harness.next().await;
+    let message = request.request.messages.iter().find(|message| message.content().starts_with("Read this file")).unwrap();
+    assert!(message.images().is_empty());
+    let uploaded: FileContent = serde_json::from_str(message.content().split_once("Attached file: ").unwrap().1).unwrap();
+    assert_eq!(std::path::Path::new(&uploaded.path).file_name().unwrap(), name);
+    #[cfg(unix)]
+    assert!(uploaded.path.starts_with("/tmp/rope-upload-"));
+    assert_eq!(std::fs::read(&uploaded.path).unwrap(), b"contents of the upload");
+    assert!(!message.content().contains("contents of the upload"));
+    request.finish("received");
+
+    for name in ["../escape.txt", "..", "C:\\escape.txt"] {
+        assert_eq!(http.post(&url).query(&[("filename", name)]).bearer_auth("test-token")
+            .body("bad filename").send().await.unwrap().status(), 400);
+    }
+    let mut image = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 3).write_to(&mut image, image::ImageFormat::Png).unwrap();
+    let image: Value = http.post(&url).query(&[("filename", "picture.bin")])
+        .bearer_auth("test-token").body(image.into_inner()).send().await.unwrap().json().await.unwrap();
+    assert!(image["path"].as_str().unwrap().starts_with("attachments/"));
+    assert_eq!(image["width"], 2);
+    assert_eq!(image["height"], 3);
+
+    stop(server, &harness).await;
+    std::fs::remove_dir_all(std::path::Path::new(&uploaded.path).parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn archive_previews_are_added_without_model_tool_calls() {
+    use rope::protocol::Action;
+    let mut harness = Harness::new().await;
+    let id = harness.core.create(Some("archive".into())).await.unwrap();
+    let mut archive = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(5);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive.append_data(&mut header, "notes.txt", &b"hello"[..]).unwrap();
+    let upload = harness.core.upload(&id, "documents.tar", &archive.into_inner().unwrap()).await.unwrap();
+    harness.core.command(&id, Action::SendMessage {
+        content: "Inspect archive".into(), attachments: vec![upload["path"].as_str().unwrap().into()],
+    }).await.unwrap();
+    let request = harness.next().await;
+    let content = request.request.messages.iter().find(|m| m.content().starts_with("Inspect archive")).unwrap().content();
+    assert!(content.contains("Automatic file preview (archive listing):"));
+    assert!(content.contains("notes.txt") || content.contains("preview unavailable: start tar"), "{content}");
+    assert!(!request.request.tools.iter().any(|tool| tool.function.name == "process_file"));
+    let file: rope::runtime::FileContent = serde_json::from_str(content.split_once("Attached file: ").unwrap().1.lines().next().unwrap()).unwrap();
+    request.finish("received listing");
+    harness.core.shutdown().await.unwrap();
+    std::fs::remove_dir_all(std::path::Path::new(&file.path).parent().unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn file_downloads_require_publication_and_encode_filenames() {
+    use rope::{
+        config::Config,
+        runtime::{Event, MAX_FILE_BYTES},
+        tool::Approval,
+    };
+    use support::{prompt, until};
+
+    let mut config = Config::default();
+    config.tools.read = Approval::Deny;
+    config.tools.shell = Approval::Deny;
+    let mut harness = Harness::with_config(config).await;
+    let id = harness.core.create(Some("files".into())).await.unwrap();
+    let other = harness.core.create(Some("other".into())).await.unwrap();
+    let mut subscription = harness.core.subscribe(&id).await.unwrap();
+    let server = start(&harness).await;
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", server.address);
+    let mut names = vec!["report final; résumé.txt"];
+    #[cfg(unix)]
+    names.push("report\n\r\"final.txt");
+    for name in names {
+        let path = harness.project.path().join(name);
+        tokio::fs::write(&path, b"published content").await.unwrap();
+        // knowing an unpublished path must not grant read access
+        assert_eq!(
+            http.get(format!("{base}/api/files"))
+                .query(&[("path", path.to_str().unwrap())])
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        harness
+            .core
+            .command(&id, prompt("send the file"))
+            .await
+            .unwrap();
+        harness
+            .next()
+            .await
+            .tool("send_file", json!({"path": path}));
+        until(&mut subscription, |event| {
+            matches!(event, Event::ToolFile { .. })
+        })
+        .await;
+        harness.next().await.finish("sent");
+        until(&mut subscription, |event| {
+            matches!(event, Event::GenerationFinished)
+        })
+        .await;
+        let snapshot = harness.core.subscribe(&id).await.unwrap().snapshot;
+        let block = snapshot
+            .blocks
+            .iter()
+            .rev()
+            .find(|block| block.file.is_some())
+            .unwrap();
+        let endpoint = format!("{base}/api/sessions/{id}/files/{}", block.id);
+        assert_eq!(http.get(&endpoint).send().await.unwrap().status(), 401);
+        assert_eq!(
+            http.get(format!("{base}/api/sessions/{other}/files/{}", block.id))
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(
+            http.get(format!(
+                "{base}/api/sessions/{id}/files/{}",
+                snapshot.blocks[0].id
+            ))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+            404
+        );
+        let response = http
+            .get(&endpoint)
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let header = response.headers()["content-disposition"].to_str().unwrap();
+        let encoded = header
+            .strip_prefix("attachment; filename=download; filename*=UTF-8''")
+            .unwrap();
+        let decoded = url::form_urlencoded::parse(format!("name={encoded}").as_bytes())
+            .into_owned()
+            .next()
+            .unwrap()
+            .1;
+        assert_eq!(decoded, name);
+        assert_eq!(response.bytes().await.unwrap(), &b"published content"[..]);
+        let source = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        source.set_len(MAX_FILE_BYTES + 1).await.unwrap();
+        assert_eq!(
+            http.get(&endpoint)
+                .bearer_auth("test-token")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            413
+        );
+        drop(source);
+    }
+    stop(server, &harness).await;
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn headless_binary_needs_no_tty_and_creates_no_implicit_session() {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider_address = provider.local_addr().unwrap();
+    let provider_task = tokio::spawn(async move {
+        axum::serve(
+            provider,
+            axum::Router::new().route(
+                "/responses",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        "headless test provider error",
+                    )
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("config");
     let data = root.path().join("data");
     std::fs::create_dir_all(config.join("rope")).unwrap();
+    let mut settings = rope::config::Config::default();
+    settings.base_url = format!("http://{provider_address}");
     std::fs::write(
         config.join("rope/config.toml"),
-        toml::to_string(&rope::config::Config::default()).unwrap(),
+        toml::to_string(&settings).unwrap(),
     )
     .unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_rope"))
@@ -315,23 +530,60 @@ async fn headless_binary_needs_no_tty_and_creates_no_implicit_session() {
         .spawn()
         .unwrap();
     let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let mut logs = String::new();
     let address = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let line = lines.next_line().await.unwrap().unwrap();
-            if let Some(url) = line.strip_prefix("Rope listening on ") {
+            logs.push_str(&line);
+            logs.push('\n');
+            if let Some((_, url)) = line.split_once("Rope listening on ") {
                 break url.to_owned();
             }
         }
     })
     .await
     .unwrap();
-    assert_eq!(reqwest::get(address).await.unwrap().status(), 200);
+    assert_eq!(reqwest::get(&address).await.unwrap().status(), 200);
     assert_eq!(
         std::fs::read_dir(data.join("harness/sessions"))
             .unwrap()
             .count(),
         0
     );
+    let token = std::fs::read_to_string(config.join("rope/server-token")).unwrap();
+    let (mut socket, _) = connect_async(format!("{}/ws", address.replace("http://", "ws://")))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"protocol":1,"token":token.trim()})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"request_id":"1","type":"create_session","name":"log-test"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket.send(Message::Text(json!({"request_id":"2","type":"command","session_id":"log-test","action":{"type":"send_message","content":"private prompt must stay out of logs"}}).to_string().into())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let line = lines.next_line().await.unwrap().unwrap();
+            logs.push_str(&line);
+            logs.push('\n');
+            if line.contains("ERROR [log-test]") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    socket.close(None).await.unwrap();
     unsafe {
         libc::kill(child.id().unwrap() as i32, libc::SIGTERM);
     }
@@ -342,4 +594,38 @@ async fn headless_binary_needs_no_tty_and_creates_no_implicit_session() {
             .unwrap()
             .success()
     );
+    while let Some(line) = lines.next_line().await.unwrap() {
+        logs.push_str(&line);
+        logs.push('\n');
+    }
+    for expected in [
+        "INFO [server] project:",
+        "headless mode ready",
+        "WebSocket connected",
+        "client authenticated:",
+        "INFO [log-test] session ready",
+        "INFO [log-test] turn started:",
+        "INFO [log-test] requesting model",
+        "headless test provider error",
+        "WebSocket disconnected",
+        "shutting down; stopping active sessions",
+        "shutdown complete",
+    ] {
+        assert!(logs.contains(expected), "missing {expected}: {logs}");
+    }
+    assert!(!logs.contains(token.trim()));
+    assert!(!logs.contains("private prompt must stay out of logs"));
+    let first = logs.lines().next().unwrap();
+    chrono::DateTime::parse_from_rfc3339(first.split_whitespace().next().unwrap()).unwrap();
+    use tokio::io::AsyncReadExt;
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .await
+        .unwrap();
+    assert!(stdout.is_empty());
+    provider_task.abort();
 }

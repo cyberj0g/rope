@@ -3,7 +3,7 @@ use clap::Parser;
 use rope::{
     config::{Args, Config},
     core::Core,
-    onboarding,
+    logging, onboarding,
     provider::openai::OpenAiProvider,
     server::Server,
     session, ui,
@@ -13,6 +13,7 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    logging::init(args.headless);
     if !Config::global_exists()? {
         if args.headless {
             anyhow::bail!(
@@ -23,7 +24,11 @@ async fn main() -> Result<()> {
     }
     let config = Config::load()?;
     for notice in config.notices() {
-        eprintln!("warning: {notice}");
+        if args.headless {
+            logging::write("WARN", "server", notice);
+        } else {
+            eprintln!("warning: {notice}");
+        }
     }
     let core = Core::new(
         config.clone(),
@@ -32,10 +37,20 @@ async fn main() -> Result<()> {
         Arc::new(OpenAiProvider::from_config(&config)),
     )
     .await?;
+    logging::write(
+        "INFO",
+        "server",
+        format_args!("project: {}", core.project_root().display()),
+    );
     let result = run(&args, config, core.clone()).await;
+    if let Err(error) = &result {
+        logging::write("ERROR", "server", format_args!("{error:#}"));
+    }
+    logging::write("INFO", "server", "shutting down; stopping active sessions");
     let stopped = core.shutdown().await;
     result?;
     stopped?;
+    logging::write("INFO", "server", "shutdown complete");
     Ok(())
 }
 
@@ -46,9 +61,25 @@ async fn run(args: &Args, config: Config, core: Core) -> Result<()> {
             .listen
             .unwrap_or_else(|| "127.0.0.1:8787".parse().unwrap());
         let server = Server::start(core.clone(), address, token, args.allow_origin.clone()).await?;
-        eprintln!("Rope listening on http://{}", server.address);
+        if args.headless {
+            logging::write(
+                "INFO",
+                "server",
+                format_args!("Rope listening on http://{}", server.address),
+            );
+        } else {
+            eprintln!("Rope listening on http://{}", server.address);
+        }
         if let Some(path) = path {
-            eprintln!("server token: {}", path.display());
+            if args.headless {
+                logging::write(
+                    "INFO",
+                    "server",
+                    format_args!("server token file: {}", path.display()),
+                );
+            } else {
+                eprintln!("server token: {}", path.display());
+            }
         }
         Some(server)
     } else {
@@ -57,6 +88,7 @@ async fn run(args: &Args, config: Config, core: Core) -> Result<()> {
     let mut summary = None;
     let result: Result<()> = async {
         if args.headless {
+            logging::write("INFO", "server", "headless mode ready; connect a browser or WebSocket client; Ctrl-C to stop");
             if args.session.is_some() || args.request.is_some() {
                 let id = core.open(args.session.clone()).await?;
                 if let Some(content) = &args.request {

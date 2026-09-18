@@ -20,18 +20,19 @@
 - stale saved model selections fall back to the config's model with a startup warning instead of failing to start
 - built-in defaults for popular OpenAI-compatible model families, including Qwen3.8
 - searchable recent-first model picker shared by `/model`, Alt+M, and the clickable model status
-- current local date included in every agent turn alongside global and project instructions
+- current local date, time, and working directory included in every agent turn alongside global and project instructions
 - automatic global and project `AGENTS.md` instructions
 
 ## Sessions
 
 - one shared core with an in-process TUI client, optional authenticated WebSocket clients via `--listen`, and terminal-free `--headless` server mode
+- headless mode writes timestamped activity logs to stderr: project and listener startup, client connections, session readiness, model requests and response timing, tool execution, approval waits, retries, compaction, turn completion/cancellation, errors, and graceful shutdown; session activity is labeled by session ID, without streaming text or tool argument/output dumps
 - one project directory per server, a live shared session catalog, concurrent turns in separate sessions, and multiple viewers/controllers of the same session
 - shared message acceptance and steering, first-wins approvals, turn-scoped cancellation, and revision-checked model/reasoning settings persisted per session
 - switching sessions or disconnecting leaves work running; late clients receive snapshots containing partial text, reasoning, tool arguments/output, queued steers, approval waits, timers, usage, and plans
 - sequenced session updates, bounded subscriptions with snapshot recovery on lag, and mutation reply deduplication across reconnects within a server lifetime
 - per-session shell jobs and browser contexts, project-bound session metadata, atomic metadata replacement, and exclusive session writer locks
-- loopback-default listener, server token authentication, explicit browser Origin allowlist, authenticated image upload/download, and a mobile-first web client served at `/` — conversation rendering, tools, thinking, plans, Git, approvals, steering with queued-steer badges, in-chat search that survives editing and clears on close, a session sidebar, image/camera attachments whose plates spin only during the transfer, distinct Send/Steer and Cancel composer controls (Esc cancels even from the focused composer), tool results that render their published images and diffs, and a Git pane whose rows open per-file diffs
+- loopback-default listener, server token authentication, explicit browser Origin allowlist, authenticated image upload/download, and a mobile-first web client served at `/` — conversation rendering, tools, thinking, plans, Git, approvals, steering with queued-steer badges, in-chat search that survives editing and clears on close, a session sidebar, image/camera attachments whose plates spin only during the transfer, distinct Send/Steer and Cancel composer controls (Esc cancels even from the focused composer), tool results that render their published images, diffs, and `send_file` files (inline image or a file tile that downloads the file on click), and a Git pane whose rows open per-file diffs
 - cancellable manual compaction and graceful process shutdown that preserves interrupted work and stops session tools
 - automatic sessions under `~/.local/share/harness/sessions`
 - persisted 2-3 word model-generated titles for automatically named sessions, created after the first completed response
@@ -70,6 +71,7 @@
 - eager Patchright extraction plus Chrome/Chromium diagnostics during first-run setup, including `ROPE_BROWSER` override guidance
 - automatic post-consumption `web_browser` result ejection from model context while retaining the full visible and persisted transcript
 - multimodal `view_image` tool advertised only by vision-enabled model profiles
+- `send_file` tool that sends a local file into the chat: images render inline in the web UI like `view_image` results, other files appear as a clickable file tile that downloads the file, and the TUI renders the path as a link that opens the file in its default application; the model sees the path, size, and an explicit delivery confirmation that no further delivery action is needed for that file in the tool output — the file reference never enters the model context or provider requests — and the web client fetches files through authenticated session-scoped URLs that resolve only published chat files (a shared 100 MiB limit checked before sending and while downloading, safely encoded download filenames, extension-guessed content type); each send has its own image cache entry so resending a changed file displays the new version; delivered images, file tiles, and TUI links appear below the tool section and stay visible when its details are collapsed or hidden
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
 - executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`
 - local external tools override global tools with the same filename
@@ -106,7 +108,7 @@ External tools receive their function arguments as JSON on stdin and must return
 - asynchronously refreshed Git pane that updates after every tool call as well as at turn end, cancel, and failure, with git runs serialized and coalesced so at most one refresh is in flight; mouse-resizable split, clickable files that open the file's diff in the full-screen view, independently scrollable status view, and viewport indicators; plus a bounded full-screen `/diff` view whose title names the file when a single-file diff is shown
 - auto-opening plan pane below Git status with live progress, `/plan` visibility control, independent scrolling, and a mouse-resizable horizontal split
 - drag-to-copy selection in the conversation and in the composer (the composer copies the underlying text, expanding collapsed paste/image plates and dropping image sentinels), with a non-blocking clipboard toast
-- clickable links in every pane: clicking a URL opens it in the default browser — markdown links and raw URLs in conversation messages, thinking, tool arguments, and tool output, plus URLs in the Git pane, plan pane, and the full-screen diff view — rendered underlined in a distinct color so they stand out, with a toast on open and a notice when the browser cannot be started
+- clickable links in every pane: clicking a URL opens it in the default browser — markdown links and raw URLs in conversation messages, thinking, tool arguments, and tool output, plus URLs in the Git pane, plan pane, and the full-screen diff view — and `send_file` tool results render the file's path as a link that opens the file in its default application; links are rendered underlined in a distinct color so they stand out, with a toast on open and a notice when the opener cannot be started
 - recent-first filtered slash-command palette with keyboard navigation and command hotkeys
 - non-blocking clipboard and `/image` image attachments with an elapsed processing plate
 - inline, vertically sliced Sixel, iTerm2, and Kitty image rendering that follows chat scrolling when supported by the terminal, with text fallback

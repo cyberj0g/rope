@@ -3,8 +3,8 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
+        ConnectInfo, DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
         connect_info::Connected,
-        ConnectInfo, DefaultBodyLimit, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode},
@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    io::AsyncReadExt,
     net::TcpListener,
     sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch},
     task::JoinHandle,
@@ -30,6 +31,7 @@ use tokio::{
 use crate::{
     core::Core,
     protocol::{self, ClientRequest, Hello, Request},
+    runtime::MAX_FILE_BYTES,
 };
 
 const CHUNK_BYTES: usize = 32 * 1024;
@@ -91,6 +93,7 @@ impl Server {
         let attachments = Router::new()
             .route("/api/sessions/{session}/attachments", post(upload))
             .route("/api/sessions/{session}/attachments/{*id}", get(download))
+            .route("/api/sessions/{session}/files/{block}", get(download_file))
             .layer(middleware::from_fn_with_state(app.clone(), authorize_http));
         let router = Router::new()
             .route("/ws", get(upgrade))
@@ -101,7 +104,7 @@ impl Server {
                 }),
             )
             .merge(attachments)
-            .layer(DefaultBodyLimit::max(crate::session::MAX_ATTACHMENT_BYTES))
+            .layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize))
             .with_state(app);
         let task = tokio::spawn(async move {
             axum::serve(
@@ -198,7 +201,9 @@ fn origin_allowed(allowed: &[String], origin: &str, local: Option<std::net::Sock
 
 fn valid_origin(app: &App, headers: &HeaderMap, local: Option<std::net::SocketAddr>) -> bool {
     headers.get("origin").is_none_or(|origin| {
-        origin.to_str().is_ok_and(|origin| origin_allowed(&app.origins, origin, local))
+        origin
+            .to_str()
+            .is_ok_and(|origin| origin_allowed(&app.origins, origin, local))
     })
 }
 
@@ -218,7 +223,11 @@ async fn upgrade(
         .max_frame_size(protocol::MAX_COMMAND_BYTES)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            connection(socket, app).await.ok();
+            crate::logging::write("INFO", "server", "WebSocket connected");
+            if let Err(error) = connection(socket, app).await {
+                crate::logging::write("WARN", "server", format_args!("WebSocket error: {error:#}"));
+            }
+            crate::logging::write("INFO", "server", "WebSocket disconnected");
         })
         .into_response()
 }
@@ -266,9 +275,18 @@ async fn authorize_http(
     response
 }
 
-async fn upload(State(app): State<App>, Path(session): Path<String>, bytes: Bytes) -> Response {
-    match app.core.attach(&session, &bytes).await {
-        Ok(image) => axum::Json(image).into_response(),
+#[derive(serde::Deserialize)]
+struct UploadQuery {
+    filename: Option<String>,
+}
+
+async fn upload(State(app): State<App>, Path(session): Path<String>, Query(query): Query<UploadQuery>, bytes: Bytes) -> Response {
+    let result = match query.filename {
+        Some(name) => app.core.upload(&session, &name, &bytes).await,
+        None => app.core.attach(&session, &bytes).await.and_then(|image| Ok(serde_json::to_value(image)?)),
+    };
+    match result {
+        Ok(attachment) => axum::Json(attachment).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
@@ -291,6 +309,62 @@ async fn download(State(app): State<App>, Path((session, id)): Path<(String, Str
     }
 }
 
+async fn download_file(
+    State(app): State<App>,
+    Path((session, block)): Path<(String, String)>,
+) -> Response {
+    let file = match app.core.published_file(&session, &block).await {
+        Ok(file) => file,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let metadata = match tokio::fs::metadata(&file.path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    if metadata.len() > MAX_FILE_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let source = match tokio::fs::File::open(&file.path).await {
+        Ok(source) => source,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mut bytes = Vec::new();
+    if source
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let mut headers = HeaderMap::new();
+    let Ok(content_type) = HeaderValue::from_str(&file.mime_type) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    headers.insert("content-type", content_type);
+    headers.insert("cache-control", "private, no-store".parse().unwrap());
+    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
+    if !file.mime_type.starts_with("image/") {
+        // percent-encode UTF-8 bytes so filenames cannot alter the header
+        let filename: String = file
+            .name
+            .bytes()
+            .map(|byte| format!("%{byte:02X}"))
+            .collect();
+        headers.insert(
+            "content-disposition",
+            HeaderValue::from_str(&format!(
+                "attachment; filename=download; filename*=UTF-8''{filename}"
+            ))
+            .unwrap(),
+        );
+    }
+    (headers, bytes).into_response()
+}
+
 async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
     let first = tokio::time::timeout(Duration::from_secs(10), socket.recv())
         .await?
@@ -300,6 +374,11 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
     };
     let hello: Hello = serde_json::from_str(&text)?;
     if hello.protocol != protocol::VERSION || hello.token != *app.token {
+        crate::logging::write(
+            "WARN",
+            "server",
+            "WebSocket rejected: invalid token or protocol version",
+        );
         socket.send(Message::Text(json!({"type":"error","code":"unauthorized","message":"invalid token or protocol version"}).to_string().into())).await?;
         socket.close().await?;
         return Ok(());
@@ -334,6 +413,11 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
         }
     };
     *record.seen.lock().unwrap() = Instant::now();
+    crate::logging::write(
+        "INFO",
+        "server",
+        format_args!("client authenticated: {client_id}"),
+    );
     let (mut writer, mut reader) = socket.split();
     let (output, mut messages) = mpsc::channel::<String>(32);
     let (failed, mut failure) = watch::channel(false);
@@ -432,7 +516,10 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
                         let result = dispatch(&app.core, request.request, &output, &failed, &mut tasks.subscriptions).await;
                         let reply = match result {
                             Ok(value) => json!({"type":"reply","request_id":request.request_id,"result":value}),
-                            Err(error) => error_reply(&request.request_id, &error.code, &error.message),
+                            Err(error) => {
+                                crate::logging::write("WARN", "server", format_args!("client {client_id} request {} failed ({}): {}", request.request_id, error.code, error.message));
+                                error_reply(&request.request_id, &error.code, &error.message)
+                            },
                         };
                         if mutation {
                             history.replies.push_back((number, payload, reply.clone()));
@@ -585,7 +672,11 @@ mod tests {
         assert!(origin_allowed(&allowed, "https://proxy.example", None));
         // A page served from the address the connection arrived on is same-origin.
         assert!(origin_allowed(&[], "http://192.168.1.50:8787", Some(lan)));
-        assert!(origin_allowed(&[], "http://[::1]:8787", Some(addr("[::1]:8787"))));
+        assert!(origin_allowed(
+            &[],
+            "http://[::1]:8787",
+            Some(addr("[::1]:8787"))
+        ));
     }
 
     #[test]

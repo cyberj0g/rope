@@ -7,8 +7,8 @@ use std::{
 use crate::{
     project::ProjectState,
     runtime::{
-        ApprovalDecision, CANCELLED_BY_USER, COMPACTION_MARKER, Event, ImageContent, Message,
-        ReasoningEffort, ToolCall,
+        ApprovalDecision, CANCELLED_BY_USER, COMPACTION_MARKER, Event, FileContent, ImageContent,
+        Message, ReasoningEffort, ToolCall,
     },
     tool::ExecutionPlan,
 };
@@ -103,6 +103,8 @@ pub struct Block {
     pub content: String,
     pub model: String,
     pub images: Vec<ImageContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileContent>,
     pub summary: Option<String>,
     pub tool: Option<ToolView>,
     pub timer: Timer,
@@ -222,6 +224,7 @@ impl Projection {
             content,
             model: String::new(),
             images: Vec::new(),
+            file: None,
             summary: None,
             tool: None,
             timer: Timer::default(),
@@ -326,12 +329,16 @@ impl Projection {
                     call_id,
                     content,
                     image,
+                    file,
                     diff,
                 } => {
                     if let Some(&index) = self.calls.get(call_id) {
                         let block = &mut self.snapshot.blocks[index];
                         if let Some(image) = image {
                             block.images.push(image.clone());
+                        }
+                        if file.is_some() {
+                            block.file = file.clone();
                         }
                         let tool = block.tool.as_mut().unwrap();
                         tool.output = Some(content.clone());
@@ -616,6 +623,13 @@ impl Projection {
                 }
                 state_changed = false;
             }
+            Event::ToolFile { call_id, file } => {
+                if let Some(&index) = self.calls.get(call_id) {
+                    self.snapshot.blocks[index].file = Some(file.clone());
+                    self.replace(index, &mut changes);
+                }
+                state_changed = false;
+            }
             Event::SteersDelivered(count) => self.delivered(*count, &mut changes),
             Event::Retrying { seconds } => {
                 self.snapshot.state.phase = "retrying".into();
@@ -719,5 +733,78 @@ impl Projection {
         }
         self.snapshot.seq += 1;
         changes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str) -> FileContent {
+        FileContent {
+            path: path.into(),
+            name: "notes.md".into(),
+            size: 42,
+            mime_type: "text/markdown".into(),
+        }
+    }
+
+    #[test]
+    fn tool_file_event_lands_on_the_active_tool_block() {
+        let mut projection = Projection::new("s1".into());
+        projection.apply(&Event::ToolCallDelta {
+            index: 0,
+            name: Some("send_file".into()),
+            arguments: r#"{"path":"notes.md"}"#.into(),
+        });
+        projection.apply(&Event::ToolCallFinished {
+            index: 0,
+            call: ToolCall {
+                id: "c1".into(),
+                name: "send_file".into(),
+                arguments: serde_json::json!({ "path": "notes.md" }),
+            },
+        });
+        let changes = projection.apply(&Event::ToolFile {
+            call_id: "c1".into(),
+            file: file("/tmp/notes.md"),
+        });
+        let snapshot = projection.snapshot();
+        let block = snapshot.blocks.last().unwrap();
+        assert_eq!(
+            block.file.as_ref().map(|f| f.path.as_str()),
+            Some("/tmp/notes.md")
+        );
+        assert!(
+            matches!(changes.last(), Some(Change::Replace { block }) if block.file.is_some()),
+            "ToolFile must replace the block so late clients see the file"
+        );
+    }
+
+    #[test]
+    fn history_tool_results_restore_their_file() {
+        let mut projection = Projection::new("s1".into());
+        projection.apply(&Event::History(vec![
+            Message::assistant_response(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "send_file".into(),
+                    arguments: serde_json::json!({ "path": "notes.md" }),
+                }],
+                Vec::new(),
+            ),
+            Message::tool_file(
+                "c1".into(),
+                "sent /tmp/notes.md (42 bytes)".into(),
+                file("/tmp/notes.md"),
+                None,
+            ),
+        ]));
+        let snapshot = projection.snapshot();
+        let block = snapshot.blocks.last().unwrap();
+        assert_eq!(block.file.as_ref().map(|f| f.size), Some(42));
     }
 }

@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::{
     config::Startup,
-    runtime::{ImageContent, Message, ReasoningEffort},
+    runtime::{FileContent, ImageContent, Message, ReasoningEffort},
     tool::ExecutionPlan,
 };
 
@@ -363,6 +363,27 @@ async fn hydrate_images(directory: &Path, message: &mut Message) -> Result<()> {
 }
 
 pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
+
+pub async fn store_file_upload(directory: &Path, name: &str, bytes: Vec<u8>) -> Result<FileContent> {
+    let prepared = crate::attachment::prepare_file(name.to_owned(), bytes).await?;
+    let uploads = directory.join("uploads");
+    tokio::fs::create_dir_all(&uploads).await?;
+    let id = format!("uploads/{}.json", uuid::Uuid::new_v4());
+    tokio::fs::write(directory.join(&id), serde_json::to_vec(&prepared)?).await?;
+    Ok(FileContent { path: id, ..prepared.file })
+}
+
+pub async fn load_file_upload(directory: &Path, id: &str) -> Result<crate::attachment::PreparedFile> {
+    let name = id.strip_prefix("uploads/").and_then(|s| s.strip_suffix(".json"))
+        .context("invalid file attachment ID")?;
+    uuid::Uuid::parse_str(name).context("invalid file attachment ID")?;
+    let prepared: crate::attachment::PreparedFile = serde_json::from_slice(&tokio::fs::read(directory.join(id)).await?)?;
+    let metadata = tokio::fs::metadata(&prepared.file.path).await.context("uploaded file is no longer available")?;
+    if !metadata.is_file() || metadata.len() > crate::runtime::MAX_FILE_BYTES {
+        bail!("invalid uploaded file");
+    }
+    Ok(prepared)
+}
 
 pub struct SessionLock(std::fs::File);
 

@@ -20,6 +20,7 @@ use tokio::{
 };
 
 use super::{ExecutionPlan, PlanStatus, Tool, ToolResult};
+use crate::runtime::{FileContent, MAX_FILE_BYTES, guess_mime_type};
 
 #[cfg(windows)]
 use windows_sys::Win32::{
@@ -55,6 +56,7 @@ pub struct ListFilesTool {
     ripgrep: bool,
 }
 pub struct ViewImageTool(pub PathBuf);
+pub struct SendFileTool(pub PathBuf);
 pub struct UpdatePlanTool;
 
 impl SearchFilesTool {
@@ -150,6 +152,7 @@ impl Tool for ReadTool {
         Ok(ToolResult {
             output,
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -190,6 +193,7 @@ impl Tool for WriteTool {
         Ok(ToolResult {
             output: format!("wrote {}", target.display()),
             image: None,
+            file: None,
             diff,
         })
     }
@@ -234,6 +238,7 @@ impl Tool for EditTool {
         Ok(ToolResult {
             output: format!("edited {}", target.display()),
             image: None,
+            file: None,
             diff,
         })
     }
@@ -1051,6 +1056,7 @@ impl Tool for ShellTool {
         Ok(ToolResult {
             output: snapshot.envelope(),
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -1112,6 +1118,7 @@ impl Tool for ShellPollTool {
         Ok(ToolResult {
             output: snapshot.envelope(),
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -1164,6 +1171,7 @@ impl Tool for ShellCancelTool {
         Ok(ToolResult {
             output: snapshot.envelope(),
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -1242,6 +1250,7 @@ impl Tool for SearchFilesTool {
                     return Ok(ToolResult {
                         output: String::from_utf8_lossy(&output.stdout).into_owned(),
                         image: None,
+                        file: None,
                         diff: None,
                     });
                 }
@@ -1258,6 +1267,7 @@ impl Tool for SearchFilesTool {
         Ok(ToolResult {
             output,
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -1309,6 +1319,7 @@ impl Tool for ListFilesTool {
                     return Ok(ToolResult {
                         output: paths.join("\n"),
                         image: None,
+                        file: None,
                         diff: None,
                     });
                 }
@@ -1323,6 +1334,7 @@ impl Tool for ListFilesTool {
         Ok(ToolResult {
             output,
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -1444,6 +1456,59 @@ impl Tool for ViewImageTool {
                 width,
                 height,
             }),
+            file: None,
+            diff: None,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for SendFileTool {
+    fn name(&self) -> &str {
+        "send_file"
+    }
+    fn description(&self) -> &str {
+        "Send a file from this machine into the chat for the user. Images are rendered inline in the conversation; other files appear as a file tile the user can download or open. The file is referenced by path — its contents are not read into the conversation."
+    }
+    fn schema(&self) -> Value {
+        object(json!({ "path": { "type": "string" } }), &["path"])
+    }
+    async fn run(&self, args: Value) -> Result<ToolResult> {
+        #[derive(Deserialize)]
+        struct Args {
+            path: String,
+        }
+        let args: Args = serde_json::from_value(args)?;
+        let target = path(&self.0, &args.path);
+        let metadata = tokio::fs::metadata(&target)
+            .await
+            .with_context(|| format!("stat file {}", target.display()))?;
+        if !metadata.is_file() {
+            bail!("{} is not a regular file", target.display());
+        }
+        if metadata.len() > MAX_FILE_BYTES {
+            bail!("file exceeds the 100 MiB download limit");
+        }
+        tokio::fs::File::open(&target)
+            .await
+            .with_context(|| format!("open file {}", target.display()))?;
+        let name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.display().to_string());
+        Ok(ToolResult {
+            output: format!(
+                "sent {} ({} bytes)\nFile delivered to the user and displayed in chat. No further delivery action is needed for this file.",
+                target.display(),
+                metadata.len()
+            ),
+            image: None,
+            file: Some(FileContent {
+                path: target.to_string_lossy().into_owned(),
+                name,
+                size: metadata.len(),
+                mime_type: guess_mime_type(&target),
+            }),
             diff: None,
         })
     }
@@ -1519,6 +1584,7 @@ impl Tool for UpdatePlanTool {
         Ok(ToolResult {
             output: serde_json::to_string_pretty(&plan)?,
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -2378,5 +2444,68 @@ mod tests {
             normalize_path_separator(r"nested\match.rs", '\\'),
             "nested/match.rs"
         );
+    }
+
+    #[tokio::test]
+    async fn send_file_publishes_a_file_reference() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-send-file-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("notes.md"), "hello file")
+            .await
+            .unwrap();
+        // 1x1 PNG
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+            .unwrap();
+        tokio::fs::write(root.join("pic.png"), &png).await.unwrap();
+        let tool = SendFileTool(root.clone());
+
+        let md = tool.run(json!({ "path": "notes.md" })).await.unwrap();
+        let file = md.file.unwrap();
+        assert_eq!(file.name, "notes.md");
+        assert_eq!(file.size, "hello file".len() as u64);
+        assert_eq!(file.mime_type, "text/markdown");
+        assert!(file.path.ends_with("notes.md"));
+        assert!(md.output.starts_with("sent ") && md.output.contains("10 bytes"));
+        assert!(md.output.contains(
+            "File delivered to the user and displayed in chat. No further delivery action is needed for this file."
+        ));
+        assert!(md.image.is_none());
+
+        let pic = tool.run(json!({ "path": "pic.png" })).await.unwrap();
+        let pic_file = pic.file.as_ref().unwrap();
+        assert_eq!(pic_file.mime_type, "image/png");
+        assert_eq!(pic_file.name, "pic.png");
+
+        let large = tokio::fs::File::create(root.join("large.bin"))
+            .await
+            .unwrap();
+        large.set_len(MAX_FILE_BYTES).await.unwrap();
+        assert!(tool.run(json!({ "path": "large.bin" })).await.is_ok());
+        large.set_len(MAX_FILE_BYTES + 1).await.unwrap();
+        let oversized = tool.run(json!({ "path": "large.bin" })).await.unwrap_err();
+        assert!(oversized.to_string().contains("100 MiB download limit"));
+        drop(large);
+
+        let missing = tool.run(json!({ "path": "nope.txt" })).await;
+        assert!(missing.is_err());
+
+        let directory = tool.run(json!({ "path": "." })).await;
+        assert!(directory.is_err());
+        assert!(
+            directory
+                .unwrap_err()
+                .to_string()
+                .contains("not a regular file")
+        );
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

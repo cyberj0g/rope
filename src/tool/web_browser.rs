@@ -77,6 +77,7 @@ impl Tool for WebBrowserTool {
                 "links": extracted.links,
             }))?,
             image: None,
+            file: None,
             diff: None,
         })
     }

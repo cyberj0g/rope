@@ -129,6 +129,7 @@ impl Tool for WebSearchTool {
                                 "results": results,
                             }))?,
                             image: None,
+                            file: None,
                             diff: None,
                         });
                     }

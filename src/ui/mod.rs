@@ -49,7 +49,7 @@ use crate::{
     tool::PlanStatus,
 };
 use history::PromptHistory;
-use links::{LinkRange, merge_line_links, open_in_browser, openable_url, url_at, wrap_links};
+use links::{LinkRange, file_url, merge_line_links, open_link, openable_url, url_at, wrap_links};
 use state::{ChatBlock, MessageKind, TextPoint, TextSelection, ToolStatus, UiState};
 
 #[derive(Clone, Copy)]
@@ -279,6 +279,12 @@ const COMMANDS: &[SlashCommand] = &[
         name: "/image",
         title: "Attach image file",
         hotkey: "Ctrl+V",
+        argument: true,
+    },
+    SlashCommand {
+        name: "/file",
+        title: "Attach file",
+        hotkey: "—",
         argument: true,
     },
     SlashCommand {
@@ -1081,6 +1087,19 @@ async fn dispatch(
             }
             true
         }
+        "/file" if !argument.is_empty() => {
+            let path = Path::new(argument.trim()).to_owned();
+            let id = state.begin_image_load("Processing file");
+            let input_loads = input_loads.clone();
+            tokio::spawn(async move {
+                input_loads.send(InputLoad {
+                    id,
+                    action: "attach file",
+                    result: file_from_path(&path).await,
+                }).ok();
+            });
+            true
+        }
         "/image" if !argument.is_empty() => {
             if !model_supports_vision(config, state) {
                 state.set_error("the current model does not support image input");
@@ -1239,6 +1258,21 @@ fn image_from_path(path: &Path) -> Result<ImageContent> {
     encode_image(decoded.width(), decoded.height(), decoded.as_raw())
 }
 
+async fn file_from_path(path: &Path) -> Result<LoadedInput> {
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_file() || metadata.len() > crate::runtime::MAX_FILE_BYTES {
+        bail!("attach a regular file of at most 100 MiB");
+    }
+    let bytes = tokio::fs::read(path).await?;
+    if image::guess_format(&bytes).is_ok() {
+        let path = path.to_owned();
+        return tokio::task::spawn_blocking(move || image_from_path(&path).map(LoadedInput::Image)).await?;
+    }
+    let name = path.file_name().and_then(|name| name.to_str()).context("file name is not UTF-8")?;
+    let prepared = crate::attachment::prepare_file(name.to_owned(), bytes).await?;
+    Ok(LoadedInput::Text(prepared.prompt))
+}
+
 fn encode_image(width: u32, height: u32, rgba: &[u8]) -> Result<ImageContent> {
     if width == 0 || height == 0 {
         bail!("image has no pixels");
@@ -1296,9 +1330,9 @@ fn apply_input_load(load: InputLoad, config: &Config, state: &mut UiState) {
     }
 }
 
-/// Open a clicked link in the default browser, surfacing failures.
+/// Open a clicked link (web URL or local file), surfacing failures.
 fn open_url(state: &mut UiState, url: String) {
-    match open_in_browser(&url) {
+    match open_link(&url) {
         Ok(()) => state.show_toast(format!("opening {url}")),
         Err(error) => state.notice = Some(format!("could not open {url}: {error}")),
     }
@@ -2632,6 +2666,38 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
             headers.push((index, header_row, header_height));
             sections.push((index, section_start, section_end));
         }
+        if let ChatBlock::Tool {
+            file: Some(file), ..
+        } = block
+        {
+            let prefix = " file ";
+            let start = prefix.chars().count();
+            let raw = vec![
+                Line::default(),
+                Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(Color::Cyan)),
+                    Span::raw(file.path.clone()),
+                ]),
+                Line::default(),
+            ];
+            let raw_links = vec![
+                Vec::new(),
+                vec![LinkRange {
+                    start: start as u16,
+                    end: (start + file.path.chars().count()) as u16,
+                    url: file_url(&file.path),
+                }],
+                Vec::new(),
+            ];
+            let (mut file_lines, starts) = wrap_chat_lines(raw, width);
+            let file_links = wrap_links(&raw_links, &starts, width as usize, file_lines.len());
+            for (line, links) in file_lines.iter_mut().zip(&file_links) {
+                style_line_links(line, links);
+            }
+            row = row.saturating_add(file_lines.len() as u16);
+            lines.extend(file_lines);
+            links.extend(file_links);
+        }
         if let Some((start, end)) = diff_span {
             diff_buttons.extend(
                 (start..end).map(|column| (index, header_row + column / width, column % width)),
@@ -2654,9 +2720,12 @@ fn chat_layout(state: &UiState, area: Rect, cache: &mut ChatRenderCache) -> Chat
         lines.extend(notice.iter().cloned());
         links.extend(notice.iter().map(|_| Vec::new()));
     }
-    // The last section reaches the bottom of the chat, matching how the
-    // trailing blank rows belong to the final block.
-    if let Some(section) = sections.last_mut() {
+    // trailing blank rows belong to the last section unless a sent file follows it
+    if !matches!(
+        state.blocks.last(),
+        Some(ChatBlock::Tool { file: Some(_), .. })
+    ) && let Some(section) = sections.last_mut()
+    {
         section.2 = row;
     }
     let content_height = row;
@@ -4066,6 +4135,24 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn file_input_copies_non_images_and_preserves_image_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notes with spaces.txt");
+        std::fs::write(&path, "original content").unwrap();
+        let LoadedInput::Text(text) = file_from_path(&path).await.unwrap() else { panic!("expected a file path") };
+        let file: crate::runtime::FileContent = serde_json::from_str(text.strip_prefix("Attached file: ").unwrap()).unwrap();
+        assert_ne!(Path::new(&file.path), path);
+        assert_eq!(file.name, "notes with spaces.txt");
+        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "original content");
+        std::fs::remove_dir_all(Path::new(&file.path).parent().unwrap()).unwrap();
+
+        let image_path = directory.path().join("image.png");
+        image::DynamicImage::new_rgb8(2, 3).save(&image_path).unwrap();
+        let LoadedInput::Image(image) = file_from_path(&image_path).await.unwrap() else { panic!("expected image input") };
+        assert_eq!((image.width, image.height), (2, 3));
+    }
+
     #[test]
     fn turn_end_bell_writes_the_bell_character() {
         let mut out = Vec::new();
@@ -4543,6 +4630,91 @@ mod tests {
         assert_eq!(text[output + 1].trim(), "first line");
         assert_eq!(text[output + 2].trim(), "second line");
         assert_eq!(text[output + 3].trim(), "third line");
+    }
+
+    #[test]
+    fn tool_file_path_renders_as_a_clickable_file_link() {
+        let mut renders = RenderState::new();
+        let mut state = UiState::new();
+        state.apply(Event::History(vec![
+            crate::runtime::Message::assistant(
+                String::new(),
+                "model".into(),
+                String::new(),
+                vec![crate::runtime::ToolCall {
+                    id: "send-1".into(),
+                    name: "send_file".into(),
+                    arguments: serde_json::json!({ "path": "notes.md" }),
+                }],
+            ),
+            crate::runtime::Message::tool_file(
+                "send-1".into(),
+                "sent /tmp/notes.md (42 bytes)".into(),
+                crate::runtime::FileContent {
+                    path: "/tmp/notes.md".into(),
+                    name: "notes.md".into(),
+                    size: 42,
+                    mime_type: "text/markdown".into(),
+                },
+                None,
+            ),
+        ]));
+
+        let area = Rect::new(0, 3, 80, 20);
+        for expanded in [false, true, false] {
+            if let ChatBlock::Tool {
+                expanded: current, ..
+            } = &mut state.blocks[0]
+            {
+                *current = expanded;
+            }
+            let layout = chat_layout(&state, area, &mut renders.chat);
+            assert_eq!(
+                layout
+                    .lines
+                    .iter()
+                    .any(|line| line.to_string().trim() == "output"),
+                expanded
+            );
+            assert_eq!(
+                layout
+                    .links
+                    .iter()
+                    .flatten()
+                    .filter(|link| link.url.starts_with("file://"))
+                    .count(),
+                1
+            );
+            let (row, link) = layout
+                .links
+                .iter()
+                .enumerate()
+                .find_map(|(row, links)| {
+                    links
+                        .iter()
+                        .find(|link| link.url.starts_with("file://"))
+                        .map(|link| (row, link))
+                })
+                .expect("the sent file path is a clickable link");
+            let text = line_text(&layout.lines[row]);
+            assert_eq!(
+                &text[link.start as usize..link.end as usize],
+                "/tmp/notes.md"
+            );
+            assert_eq!(
+                chat_section_hit_test(&state, area, area.y + row as u16, &mut renders.chat),
+                None
+            );
+            // the same lookup a click performs resolves the link under a point
+            let point = TextPoint {
+                row: row as u16,
+                column: link.start + 2,
+            };
+            assert_eq!(
+                chat_url_at(&state, area, point, &mut renders.chat).as_deref(),
+                Some(link.url.as_str())
+            );
+        }
     }
 
     #[tokio::test]

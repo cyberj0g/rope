@@ -183,6 +183,7 @@ impl Tool for OrgOutlineTool {
         Ok(ToolResult {
             output: render(&target.to_string_lossy(), &outline),
             image: None,
+            file: None,
             diff: None,
         })
     }
@@ -225,6 +226,7 @@ fn tool_error(code: &str, message: &str) -> ToolResult {
     ToolResult {
         output: json!({ "error": code, "message": message }).to_string(),
         image: None,
+        file: None,
         diff: None,
     }
 }

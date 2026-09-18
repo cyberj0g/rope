@@ -289,7 +289,7 @@ impl From<Message> for WireMessage {
                 call_id,
                 content,
                 image,
-                diff: _,
+                ..
             } => Self {
                 role: "tool",
                 content: Some(match image {

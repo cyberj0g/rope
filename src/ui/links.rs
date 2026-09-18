@@ -144,6 +144,13 @@ pub fn wrap_links(
     wrapped
 }
 
+/// The `file://` URL for a local path, for use as a clickable link target.
+pub fn file_url(path: &str) -> String {
+    url::Url::from_file_path(path)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| format!("file://{path}"))
+}
+
 /// Open `url` in the default browser (or mail client for `mailto:` links).
 pub fn open_in_browser(url: &str) -> io::Result<()> {
     #[cfg(target_os = "macos")]
@@ -163,6 +170,38 @@ pub fn open_in_browser(url: &str) -> io::Result<()> {
         Command::new("xdg-open").arg(url).spawn()?;
     }
     Ok(())
+}
+
+/// Open a local file in its default application (`open` on macOS,
+/// `xdg-open` on Linux, Explorer on Windows).
+pub fn open_file(path: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(path).spawn()?;
+    }
+    #[cfg(windows)]
+    {
+        Command::new("explorer").arg(path).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(path).spawn()?;
+    }
+    Ok(())
+}
+
+/// Open a clicked link target: `file://` URLs open the local file in its
+/// default application, everything else goes to the browser.
+pub fn open_link(target: &str) -> io::Result<()> {
+    if let Some(path) = target
+        .strip_prefix("file://")
+        .and_then(|rest| url::Url::parse(&format!("file://{rest}")).ok())
+        .and_then(|url| url.to_file_path().ok())
+    {
+        open_file(path.to_string_lossy().as_ref())
+    } else {
+        open_in_browser(target)
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +325,21 @@ mod tests {
                 url: "https://x.com/".into()
             }]
         );
+    }
+
+    #[test]
+    fn file_urls_round_trip_to_their_path() {
+        let path = std::path::PathBuf::from("/tmp/rope files/report final.md");
+        let url = file_url(path.to_str().unwrap());
+        assert!(url.starts_with("file://"));
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.to_file_path(), Ok(path));
+    }
+
+    #[test]
+    fn file_url_falls_back_to_a_plain_file_scheme() {
+        // Relative paths cannot be encoded as file URLs; the fallback keeps
+        // the target openable by anything that understands file://.
+        assert_eq!(file_url("relative/x.png"), "file://relative/x.png");
     }
 }

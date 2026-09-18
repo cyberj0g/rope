@@ -18,6 +18,52 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// A file a tool published to the chat for the user: images render inline,
+/// everything else appears as a downloadable file tile. The reference names
+/// the file on disk — its bytes never enter the model context.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FileContent {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub mime_type: String,
+}
+
+/// A small extension-based content type for files served to the client.
+pub fn guess_mime_type(path: &std::path::Path) -> String {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "txt" | "log" => "text/plain",
+        "md" | "markdown" | "org" | "rst" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "csv" | "tsv" => "text/csv",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    };
+    mime.to_owned()
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
@@ -52,6 +98,8 @@ pub enum Message {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<ImageContent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<FileContent>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
     },
@@ -121,6 +169,24 @@ impl Message {
             call_id,
             content,
             image,
+            file: None,
+            diff,
+        }
+    }
+
+    /// A tool result that published a file to the chat. The file never
+    /// enters the model context; only the text content does.
+    pub fn tool_file(
+        call_id: String,
+        content: String,
+        file: FileContent,
+        diff: Option<String>,
+    ) -> Self {
+        Self::Tool {
+            call_id,
+            content,
+            image: None,
+            file: Some(file),
             diff,
         }
     }
@@ -173,5 +239,29 @@ mod tests {
 
         assert!(encoded.starts_with(r#"{"role":"steer""#));
         assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), steer);
+    }
+
+    #[test]
+    fn tool_files_round_trip_and_default_in_old_messages() {
+        let file = FileContent {
+            path: "/tmp/report.png".into(),
+            name: "report.png".into(),
+            size: 12,
+            mime_type: "image/png".into(),
+        };
+        let message = Message::tool_file(
+            "call_1".into(),
+            "sent /tmp/report.png (12 bytes)".into(),
+            file.clone(),
+            None,
+        );
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains(r#""file""#));
+        assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), message);
+
+        // A message written before send_file existed has no `file` field.
+        let legacy = r#"{"role":"tool","call_id":"c","content":"old","image":null,"diff":null}"#;
+        let legacy: Message = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(legacy, Message::Tool { file: None, .. }));
     }
 }

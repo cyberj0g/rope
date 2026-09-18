@@ -198,6 +198,14 @@ mark.srch { background: #7a5b00; color: #fff; border-radius: 2px; }
 mark.srch.cur { background: var(--amber); color: #1a1a1a; }
 .imgrid { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
 .imgrid img { max-width: 220px; max-height: 220px; border-radius: 8px; display: block; cursor: zoom-in; }
+.msg.tool > .imgrid, .msg.tool > .filetile { margin-top: 14px; }
+.filetile { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-2); cursor: pointer; max-width: 340px; }
+.filetile:hover { border-color: var(--accent-dim); }
+.filetile .ficon { width: 22px; height: 22px; color: var(--accent); flex: none; }
+.filetile .fmeta { min-width: 0; }
+.filetile .fname { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.filetile .fsize { font-size: 12px; color: var(--muted); }
+.filetile .fdown { width: 17px; height: 17px; color: var(--muted); flex: none; margin-left: auto; }
 pre.plain { font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; margin: 0; }
 
 /* collapsible sections: thinking / tools */
@@ -252,6 +260,7 @@ details.sec .body { padding: 4px 12px 11px; border-top: 1px solid var(--border);
 #plates:empty { display: none; }
 .plate { position: relative; width: 66px; height: 66px; border-radius: 10px; overflow: hidden; background: var(--panel-2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; }
 .plate img { width: 100%; height: 100%; object-fit: cover; }
+.plate .filename { padding: 6px; font-size: 11px; overflow-wrap: anywhere; text-align: center; }
 .plate .spin { position: absolute; }
 .plate .err { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(64,20,18,.92); color: var(--red); font-size: 10px; text-align: center; padding: 4px; }
 .plate .rm {
@@ -447,7 +456,7 @@ details.sec .body { padding: 4px 12px 11px; border-top: 1px solid var(--border);
           <div id="palette"></div>
           <div id="plates"></div>
           <div id="compRow">
-            <button class="cbtn" id="attachBtn" aria-label="Attach image"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m5 17 4.5-4 3.5 3 2.5-2 3.5 3"/></svg></button>
+            <button class="cbtn" id="attachBtn" aria-label="Attach file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m5 17 4.5-4 3.5 3 2.5-2 3.5 3"/></svg></button>
             <button class="cbtn" id="cameraBtn" aria-label="Take photo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.4"/></svg></button>
             <textarea id="input" rows="1" placeholder="Message Rope…" spellcheck="false" autocomplete="off"></textarea>
             <button class="cbtn" id="sendBtn" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button>
@@ -468,7 +477,7 @@ details.sec .body { padding: 4px 12px 11px; border-top: 1px solid var(--border);
   </div>
 </div>
 
-<input type="file" id="filePick" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+<input type="file" id="filePick" multiple hidden>
 <input type="file" id="camPick" accept="image/*" capture="environment" hidden>
 
 <!-- camera overlay -->
@@ -837,6 +846,7 @@ function blockKey(b) {
   const t = b.tool;
   return (prefs.showThinking ? "T" : "") + (prefs.showTools ? "L" : "") +
     [b.kind, b.content, b.queued, b.model, b.summary ? 1 : 0,
+    JSON.stringify(b.file || null),
     b.images.map(i => (i.path || "") + " " + i.width + "x" + i.height).join(","),
     t ? [t.name, t.status, t.arguments, t.output || "", t.diff || ""] : "",
     b.timer.running ? "r" : b.timer.elapsed_ms].join("\u0001");
@@ -878,6 +888,74 @@ function renderImages(container, session, images, prepend = true) {
       el.onclick = () => { $("viewerImg").src = url; $("viewer").classList.add("on"); };
     });
   }
+}
+const fileCache = new Map();
+async function fileUrl(endpoint) {
+  const key = endpoint;
+  if (fileCache.has(key)) return fileCache.get(key);
+  try {
+    const res = await fetch(endpoint, { headers: { Authorization: `Bearer ${S.token}` } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const url = URL.createObjectURL(await res.blob());
+    fileCache.set(key, url);
+    return url;
+  } catch (e) {
+    console.error("file fetch failed", endpoint, e);
+    return null;
+  }
+}
+function fmtSize(n) {
+  if (n < 1024) return n + " B";
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + " " + units[i];
+}
+async function downloadFile(endpoint, file) {
+  try {
+    const res = await fetch(endpoint, { headers: { Authorization: `Bearer ${S.token}` } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (e) {
+    console.error("file download failed", file.path, e);
+    toast("download failed: " + file.name, "err");
+  }
+}
+// A file a tool sent to the chat: images render inline like attachments,
+// everything else is a tile that downloads the file on click.
+function renderFile(container, session, block) {
+  const file = block.file;
+  if (!file) return;
+  const endpoint = `/api/sessions/${encodeURIComponent(session)}/files/${encodeURIComponent(block.id)}`;
+  if (file.mime_type.startsWith("image/")) {
+    const grid = document.createElement("div");
+    grid.className = "imgrid";
+    container.appendChild(grid);
+    const el = document.createElement("img");
+    el.alt = file.name;
+    el.src = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+    grid.appendChild(el);
+    fileUrl(endpoint).then(url => {
+      if (!url || !el.isConnected) return;
+      el.src = url;
+      el.onclick = () => { $("viewerImg").src = url; $("viewer").classList.add("on"); };
+    });
+    return;
+  }
+  const tile = document.createElement("div");
+  tile.className = "filetile";
+  tile.innerHTML = `<svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg><div class="fmeta"><div class="fname"></div><div class="fsize"></div></div><svg class="fdown" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>`;
+  tile.querySelector(".fname").textContent = file.name;
+  tile.querySelector(".fsize").textContent = fmtSize(file.size);
+  tile.onclick = () => downloadFile(endpoint, file);
+  container.appendChild(tile);
 }
 function sectionEl(kind, label, timer, extraClass) {
   const d = document.createElement("details");
@@ -936,6 +1014,7 @@ function blockEl(session, b) {
   }
   if (b.kind === "tool") {
     wrap.className = "msg tool";
+    renderFile(wrap, session, b);
     if (!prefs.showTools) return wrap;
     const t = b.tool;
     const d = sectionEl("tool", t.name, b.timer);
@@ -968,9 +1047,9 @@ function blockEl(session, b) {
       out.onclick = () => openDiffSheet(`Diff · ${t.name}`, t.diff);
       d._body.append(lbl, out);
     }
-    // Some tools (e.g. view_image) publish images alongside the text output.
+    // view_image stays inside the tool details
     renderImages(d._body, session, b.images, false);
-    wrap.appendChild(d);
+    wrap.prepend(d);
     wrap._timer = d;
     return wrap;
   }
@@ -1514,13 +1593,25 @@ $("camPick").onchange = e => { if (e.target.files[0]) addFile(e.target.files[0])
 // access), so keep a plain counter instead.
 let attSeq = 0;
 function addFile(file) {
-  if (!/image\/(png|jpeg|jpg|gif|webp)/.test(file.type)) { toast("Unsupported image type", "err"); return; }
-  if (file.size > 16 * 1024 * 1024) { toast("Image exceeds 16 MiB", "err"); return; }
-  if (attachments.length >= 8) { toast("At most 8 images per message", "err"); return; }
+  const image = /^image\/(png|jpeg|gif|webp)$/.test(file.type);
+  const limit = image ? 16 : 100;
+  if (file.size > limit * 1024 * 1024) { toast(`File exceeds ${limit} MiB`, "err"); return; }
+  if (attachments.length >= 8) { toast("At most 8 attachments per message", "err"); return; }
   attachments.push({ id: `att-${++attSeq}`, file, path: null, pathSession: null, status: "idle", preview: null });
   renderPlates();
 }
 function addFiles(files) { files.forEach(addFile); }
+input.addEventListener("paste", e => {
+  if (e.clipboardData?.files.length) {
+    e.preventDefault();
+    addFiles([...e.clipboardData.files]);
+  }
+});
+$("composer").addEventListener("dragover", e => { e.preventDefault(); });
+$("composer").addEventListener("drop", e => {
+  e.preventDefault();
+  addFiles([...e.dataTransfer.files]);
+});
 function clearAttachments() {
   for (const a of attachments) { const u = a.preview; if (u) URL.revokeObjectURL(u); }
   attachments = [];
@@ -1536,8 +1627,10 @@ function renderPlates() {
   for (const a of attachments) {
     const plate = document.createElement("div");
     plate.className = "plate";
-    if (!a.preview) a.preview = URL.createObjectURL(a.file);
-    plate.innerHTML = `<img src="${a.preview}" alt="">${a.status === "uploading" ? '<div class="spin"></div>' : ""}${a.status === "error" ? `<div class="err">failed — retry on send</div>` : ""}<button class="rm" aria-label="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>`;
+    const isImage = /^image\/(png|jpeg|gif|webp)$/.test(a.file.type);
+    if (isImage && !a.preview) a.preview = URL.createObjectURL(a.file);
+    plate.title = a.file.name;
+    plate.innerHTML = `${isImage ? `<img src="${a.preview}" alt="">` : `<span class="filename">${esc(a.file.name)}</span>`}${a.status === "uploading" ? '<div class="spin"></div>' : ""}${a.status === "error" ? `<div class="err">failed — retry on send</div>` : ""}<button class="rm" aria-label="Remove"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>`;
     plate.querySelector(".rm").onclick = () => {
       attachments = attachments.filter(x => x.id !== a.id);
       renderPlates();
@@ -1550,7 +1643,7 @@ async function uploadAttachment(a, session) {
   a.status = "uploading";
   renderPlates();
   try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(session)}/attachments`, {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(session)}/attachments?filename=${encodeURIComponent(a.file.name)}`, {
       method: "POST", headers: { Authorization: `Bearer ${S.token}` }, body: a.file,
     });
     if (!res.ok) throw new Error(await res.text());
