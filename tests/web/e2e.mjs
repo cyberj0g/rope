@@ -738,7 +738,8 @@ try {
   const narrowPng = path.join(shotsDir, "test-image-narrow.png");
   fs.writeFileSync(widePng, makePng(200, 140));
   fs.writeFileSync(narrowPng, makePng(90, 60));
-  await page.route("**/api/sessions/**/attachments", route => {
+  const uploadRoute = /\/api\/sessions\/[^/]+\/attachments(?:\?.*)?$/;
+  await page.route(uploadRoute, route => {
     if (route.request().method() === "POST") setTimeout(() => route.continue(), 2500);
     else route.continue();
   });
@@ -788,7 +789,7 @@ try {
     R.attachments = [];
     R.renderPlates();
   })()`);
-  await page.unroute("**/api/sessions/**/attachments");
+  await page.unroute(uploadRoute);
   await page.fill("#input", "");
 
   console.log("21. ISSUES regression: sessions keep their own images (#3)");

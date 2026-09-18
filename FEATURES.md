@@ -25,6 +25,7 @@
 
 ## Sessions
 
+- browser UI sources in `web/`, with separate HTML, CSS, and native JavaScript modules embedded in the executable without a frontend build step
 - one shared core with an in-process TUI client, optional authenticated WebSocket clients via `--listen`, and terminal-free `--headless` server mode
 - headless mode writes timestamped activity logs to stderr: project and listener startup, client connections, session readiness, model requests and response timing, tool execution, approval waits, retries, compaction, turn completion/cancellation, errors, and graceful shutdown; session activity is labeled by session ID, without streaming text or tool argument/output dumps
 - one project directory per server, a live shared session catalog, concurrent turns in separate sessions, and multiple viewers/controllers of the same session

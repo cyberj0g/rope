@@ -100,9 +100,10 @@ impl Server {
             .route(
                 "/",
                 get(|| async {
-                    axum::response::Html(include_str!("../examples/browser-client.html"))
+                    axum::response::Html(include_str!("../web/index.html"))
                 }),
             )
+            .route("/assets/{*path}", get(web_asset))
             .merge(attachments)
             .layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize))
             .with_state(app);
@@ -134,6 +135,31 @@ impl Drop for Server {
     fn drop(&mut self) {
         self.stop.send_replace(true);
     }
+}
+
+async fn web_asset(Path(path): Path<String>) -> Response {
+    let body = match path.as_str() {
+        "styles.css" => include_str!("../web/styles.css"),
+        "js/app.js" => include_str!("../web/js/app.js"),
+        "js/attachments.js" => include_str!("../web/js/attachments.js"),
+        "js/chat.js" => include_str!("../web/js/chat.js"),
+        "js/composer.js" => include_str!("../web/js/composer.js"),
+        "js/files.js" => include_str!("../web/js/files.js"),
+        "js/helpers.js" => include_str!("../web/js/helpers.js"),
+        "js/markdown.js" => include_str!("../web/js/markdown.js"),
+        "js/panels.js" => include_str!("../web/js/panels.js"),
+        "js/protocol.js" => include_str!("../web/js/protocol.js"),
+        "js/search.js" => include_str!("../web/js/search.js"),
+        "js/state.js" => include_str!("../web/js/state.js"),
+        "js/status.js" => include_str!("../web/js/status.js"),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let content_type = if path.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else {
+        "text/javascript; charset=utf-8"
+    };
+    ([(axum::http::header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
 pub fn load_token(path: Option<PathBuf>) -> Result<(String, Option<PathBuf>)> {

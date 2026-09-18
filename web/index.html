@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%230f1115'/%3E%3Cpath d='M7 12h10M8 8h8M9.5 16h5' stroke='%234f8cff' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E">
+<title>Rope</title>
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+
+<!-- ================= auth ================= -->
+<div id="auth">
+  <div class="auth-card">
+    <div class="auth-logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 12h8"/><path d="M9 8h6"/><path d="M10 16h4"/></svg>Rope</div>
+    <p>Connect to your Rope server. The token is stored only in this browser.</p>
+    <input id="authToken" class="field" type="password" placeholder="Server token" autocomplete="off" spellcheck="false">
+    <button id="authGo" class="btn">Connect</button>
+    <div id="authError" class="auth-error"></div>
+  </div>
+</div>
+
+<!-- ================= app ================= -->
+<div id="app">
+  <div id="frame">
+    <aside id="sidebar">
+      <div class="side-head">
+        <span class="side-brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 12h8"/><path d="M9 8h6"/><path d="M10 16h4"/></svg>Rope</span>
+      </div>
+      <button class="side-new" id="newChat"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New chat</button>
+      <div class="side-search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="sideFilter" placeholder="Filter conversations" autocomplete="off">
+      </div>
+      <div id="sideList"></div>
+      <div class="side-foot" id="sideFoot"></div>
+    </aside>
+    <div id="sideBackdrop"></div>
+
+    <div id="main" style="flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;position:relative;">
+      <div id="topbar">
+        <button class="iconbtn" id="tbMenu" aria-label="Conversations"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+        <div id="tbTitle">
+          <span id="tbName">Rope</span>
+          <span id="tbPhase" class="idle"><span class="dot"></span><span id="tbPhaseText">connecting…</span></span>
+        </div>
+        <button class="chip" id="chipPlan" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6h11M9 12h11M9 18h11"/><path d="m4 5 1 1 2-2M4 11l1 1 2-2M4 17l1 1 2-2"/></svg><b id="chipPlanText">Plan</b></button>
+        <button class="chip" id="chipGit" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M15.6 9.5 8.5 16"/></svg><b id="chipGitText">Git</b></button>
+        <button class="chip" id="chipModel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg><b id="chipModelText">model</b></button>
+        <button class="iconbtn" id="tbSearch" aria-label="Search chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
+      </div>
+
+      <div id="searchbar">
+        <input id="searchInput" placeholder="Search this conversation" autocomplete="off">
+        <span id="searchCount">0/0</span>
+        <button class="iconbtn" id="searchPrev" aria-label="Previous match"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="m6 14 6-6 6 6"/></svg></button>
+        <button class="iconbtn" id="searchNext" aria-label="Next match"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="m6 10 6 6 6-6"/></svg></button>
+        <button class="iconbtn" id="searchClose" aria-label="Close search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </div>
+
+      <div id="chatWrap" style="position:relative;flex:1;min-height:0;display:flex;flex-direction:column;">
+        <div id="chat"><div id="chatInner"></div></div>
+        <button id="jump" aria-label="Scroll to bottom"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="m6 10 6 6 6-6"/></svg></button>
+      </div>
+
+      <div id="composer">
+        <div id="compInner">
+          <div id="approval">
+            <div class="head"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 10v4"/><circle cx="12" cy="17.2" r=".4" fill="currentColor"/></svg><span id="apprTitle">Approval required</span></div>
+            <pre id="apprArgs"></pre>
+            <div class="row">
+              <button class="ok" data-decision="allow_once">Allow once</button>
+              <button class="ok" data-decision="allow_session">Allow for session</button>
+              <button class="bad" data-decision="deny">Deny</button>
+            </div>
+          </div>
+          <div id="palette"></div>
+          <div id="plates"></div>
+          <div id="compRow">
+            <button class="cbtn" id="attachBtn" aria-label="Attach file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m5 17 4.5-4 3.5 3 2.5-2 3.5 3"/></svg></button>
+            <button class="cbtn" id="cameraBtn" aria-label="Take photo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.4"/></svg></button>
+            <textarea id="input" rows="1" placeholder="Message Rope…" spellcheck="false" autocomplete="off"></textarea>
+            <button class="cbtn" id="sendBtn" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button>
+            <button class="cbtn" id="cancelBtn" aria-label="Cancel turn" hidden><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
+          </div>
+          <div id="compHint"><span class="l" id="hintLeft"></span><span id="hintRight"></span></div>
+          <div id="strip">
+            <span class="seg" id="stripModel"></span>
+            <span class="seg" id="stripTokens"></span>
+            <span class="seg" id="stripCtx"><span id="ctxBar"><span id="ctxFill"></span></span><span id="ctxText"></span></span>
+            <span class="sp"></span>
+            <span class="seg" id="stripSpeed"></span>
+            <span class="seg" id="stripCost"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<input type="file" id="filePick" multiple hidden>
+<input type="file" id="camPick" accept="image/*" capture="environment" hidden>
+
+<!-- camera overlay -->
+<div id="camera">
+  <video id="camVideo" playsinline muted></video>
+  <div id="camBar">
+    <button id="camCancel" aria-label="Cancel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+    <button class="snap" id="camSnap" aria-label="Capture"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="7"/></svg></button>
+  </div>
+</div>
+
+<!-- image viewer -->
+<div id="viewer"><button class="x" id="viewerX" aria-label="Close"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button><img id="viewerImg" alt=""></div>
+
+<!-- sheet -->
+<div id="sheetWrap">
+  <div id="sheetBackdrop"></div>
+  <div id="sheet">
+    <div id="sheetHead"><h2 id="sheetTitle"></h2><button class="iconbtn" id="sheetX" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+    <div id="sheetBody"></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script type="module" src="/assets/js/app.js"></script>
+</body>
+</html>

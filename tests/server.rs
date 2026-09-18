@@ -112,6 +112,53 @@ async fn stop(mut server: Server, harness: &Harness) {
 }
 
 #[tokio::test]
+async fn web_page_and_module_imports_are_served_without_authentication() {
+    let harness = Harness::new().await;
+    let server = start(&harness).await;
+    let client = reqwest::Client::new();
+    let base = reqwest::Url::parse(&format!("http://{}/", server.address)).unwrap();
+    let response = client.get(base.clone()).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "text/html; charset=utf-8");
+    let html = response.text().await.unwrap();
+    assert!(html.contains("type=\"module\""));
+    let assets = regex::Regex::new(r#"(?:src|href)="(/assets/[^"]+)""#).unwrap();
+    let imports = regex::Regex::new(r#"from "(\./[^"]+)""#).unwrap();
+    let mut pending: Vec<_> = assets
+        .captures_iter(&html)
+        .map(|c| base.join(&c[1]).unwrap())
+        .collect();
+    assert_eq!(pending.len(), 2);
+    let mut visited = std::collections::HashSet::new();
+    while let Some(url) = pending.pop() {
+        if !visited.insert(url.clone()) {
+            continue;
+        }
+        let response = client.get(url.clone()).send().await.unwrap();
+        assert_eq!(response.status(), 200, "{url}");
+        let is_css = url.path().ends_with(".css");
+        let content_type = if is_css {
+            "text/css; charset=utf-8"
+        } else {
+            "text/javascript; charset=utf-8"
+        };
+        assert_eq!(response.headers()["content-type"], content_type, "{url}");
+        let body = response.text().await.unwrap();
+        assert!(!body.trim().is_empty(), "{url}");
+        if !is_css {
+            pending.extend(imports.captures_iter(&body).map(|c| url.join(&c[1]).unwrap()));
+        }
+    }
+    let response = client
+        .get(base.join("assets/missing.js").unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    stop(server, &harness).await;
+}
+
+#[tokio::test]
 async fn websocket_clients_share_streams_and_late_clients_receive_chunked_snapshots() {
     let mut harness = Harness::new().await;
     let id = harness.core.create(Some("web".into())).await.unwrap();
@@ -291,7 +338,10 @@ async fn transport_authentication_origins_and_attachments_are_enforced() {
 
 #[tokio::test]
 async fn arbitrary_uploads_reach_the_model_and_stay_session_scoped() {
-    use rope::{protocol::Action, runtime::FileContent};
+    use rope::{
+        protocol::Action,
+        runtime::{FileContent, Message},
+    };
 
     let mut harness = Harness::new().await;
     let id = harness.core.create(Some("files".into())).await.unwrap();
@@ -310,14 +360,24 @@ async fn arbitrary_uploads_reach_the_model_and_stay_session_scoped() {
     assert!(harness.core.command(&other, action.clone()).await.is_err());
     harness.core.command(&id, action).await.unwrap();
     let request = harness.next().await;
-    let message = request.request.messages.iter().find(|message| message.content().starts_with("Read this file")).unwrap();
-    assert!(message.images().is_empty());
-    let uploaded: FileContent = serde_json::from_str(message.content().split_once("Attached file: ").unwrap().1).unwrap();
+    let (content, images) = request
+        .request
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::User { content, images } if content.starts_with("Read this file") => {
+                Some((content, images))
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(images.is_empty());
+    let uploaded: FileContent = serde_json::from_str(content.split_once("Attached file: ").unwrap().1).unwrap();
     assert_eq!(std::path::Path::new(&uploaded.path).file_name().unwrap(), name);
     #[cfg(unix)]
     assert!(uploaded.path.starts_with("/tmp/rope-upload-"));
     assert_eq!(std::fs::read(&uploaded.path).unwrap(), b"contents of the upload");
-    assert!(!message.content().contains("contents of the upload"));
+    assert!(!content.contains("contents of the upload"));
     request.finish("received");
 
     for name in ["../escape.txt", "..", "C:\\escape.txt"] {
@@ -338,7 +398,7 @@ async fn arbitrary_uploads_reach_the_model_and_stay_session_scoped() {
 
 #[tokio::test]
 async fn archive_previews_are_added_without_model_tool_calls() {
-    use rope::protocol::Action;
+    use rope::{protocol::Action, runtime::Message};
     let mut harness = Harness::new().await;
     let id = harness.core.create(Some("archive".into())).await.unwrap();
     let mut archive = tar::Builder::new(Vec::new());
@@ -352,7 +412,15 @@ async fn archive_previews_are_added_without_model_tool_calls() {
         content: "Inspect archive".into(), attachments: vec![upload["path"].as_str().unwrap().into()],
     }).await.unwrap();
     let request = harness.next().await;
-    let content = request.request.messages.iter().find(|m| m.content().starts_with("Inspect archive")).unwrap().content();
+    let content = request
+        .request
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::User { content, .. } if content.starts_with("Inspect archive") => Some(content),
+            _ => None,
+        })
+        .unwrap();
     assert!(content.contains("Automatic file preview (archive listing):"));
     assert!(content.contains("notes.txt") || content.contains("preview unavailable: start tar"), "{content}");
     assert!(!request.request.tools.iter().any(|tool| tool.function.name == "process_file"));

@@ -48,7 +48,13 @@ with the same conversation rendering, tools, plans, Git pane, approvals,
 steering, and image or camera attachments as the TUI. Paste the token from the
 file whose path Rope prints at startup (normally `~/.config/rope/server-token`).
 You can also supply `ROPE_SERVER_TOKEN` or `--token-file PATH`. Open the served
-page over HTTP, rather than opening the example HTML file directly.
+page over HTTP, rather than opening `web/index.html` directly.
+
+The web UI lives in `web/`: `index.html` contains the markup, `styles.css` the
+styles, and `js/` native JavaScript modules for the connection, chat, composer,
+attachments, and panels. Rope embeds these files at compile time and serves
+them at `/` and `/assets/`; rebuild Rope after editing them. No frontend build
+step or runtime asset directory is needed.
 
 Use `rope --listen 127.0.0.1:8787` to attach the TUI to that same core. With a
 listener enabled, exiting the TUI leaves the foreground server running; Ctrl-C
