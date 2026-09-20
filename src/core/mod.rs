@@ -314,7 +314,7 @@ impl Core {
                         | Event::OperationStarted { .. }
                         | Event::ApprovalRequested { .. }
                         | Event::ApprovalResolved { .. }
-                        | Event::GenerationFinished
+                        | Event::GenerationFinished { .. }
                         | Event::GenerationCancelled
                         | Event::Error(_)
                         | Event::MessageAccepted(_)

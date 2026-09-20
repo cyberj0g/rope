@@ -171,6 +171,7 @@ input, textarea { font: inherit; color: inherit; }
 .msg.steer .bubble { background: #3a3116; border-color: #57481f; border-radius: 13px 13px 4px 13px; max-width: 88%; }
 .who { display: flex; align-items: baseline; gap: 8px; margin: 0 2px 4px; font-size: 12.5px; font-weight: 700; }
 .who .mdl { font-weight: 500; color: var(--accent); font-size: 11.5px; }
+.who .dur { color: var(--faint); }
 .who.status { color: var(--faint); }
 .badge-queued { font-size: 10.5px; font-weight: 600; color: var(--amber); border: 1px solid #57481f; border-radius: 999px; padding: 0 7px; margin-left: 4px; }
 .msg.error .bubble { background: #301a19; border-color: #5c2a26; color: #ffb4ae; }

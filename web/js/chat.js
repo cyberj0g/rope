@@ -10,7 +10,7 @@ import { revealBlock } from "./protocol.js";
 function blockKey(b) {
   const t = b.tool;
   return (prefs.showThinking ? "T" : "") + (prefs.showTools ? "L" : "") +
-    [b.kind, b.content, b.queued, b.model, b.summary ? 1 : 0,
+    [b.kind, b.content, b.queued, b.model, b.duration_ms || 0, b.summary ? 1 : 0,
     JSON.stringify(b.file || null),
     b.images.map(i => (i.path || "") + " " + i.width + "x" + i.height).join(","),
     t ? [t.name, t.status, t.arguments, t.output || "", t.diff || "", t.redacted ? 1 : 0] : "",
@@ -97,7 +97,7 @@ function blockContent(session, b) {
     wrap.className = "msg assistant";
     const who = document.createElement("div");
     who.className = b.kind === "status" ? "who status" : "who";
-    who.innerHTML = `${b.kind === "status" ? "Status" : "Assistant"}${b.model ? `<span class="mdl">${esc(b.model)}</span>` : ""}${b.queued ? `<span class="badge-queued">queued</span>` : ""}`;
+    who.innerHTML = `${b.kind === "status" ? "Status" : "Assistant"}${b.model ? `<span class="mdl">${esc(b.model)}</span>` : ""}${b.kind === "assistant" && b.duration_ms ? `<span class="mdl dur">${fmtDur(b.duration_ms)}</span>` : ""}${b.queued ? `<span class="badge-queued">queued</span>` : ""}`;
     const bubble = document.createElement("div");
     bubble.className = "bubble md";
     bubble.innerHTML = md(b.content);

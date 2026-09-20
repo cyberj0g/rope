@@ -402,7 +402,7 @@ pub async fn run(
         tokio::select! {
             event = events.recv() => if let Some(event) = event {
                 let history_loaded = matches!(&event, Event::History(_) | Event::Snapshot(_));
-                if matches!(&event, Event::Update(update) if matches!(update.event, Event::GenerationFinished)) {
+                if matches!(&event, Event::Update(update) if matches!(update.event, Event::GenerationFinished { .. })) {
                     ring_bell(&mut io::stdout())?;
                 }
                 chat_height = apply_runtime_event(&mut state, event, chat, chat_height, &mut renders);
@@ -519,7 +519,7 @@ fn apply_runtime_event(
                 | Event::Retrying { .. }
                 | Event::CompactionStarted
                 | Event::ContextCompacted { .. }
-                | Event::GenerationFinished
+                | Event::GenerationFinished { .. }
                 | Event::GenerationCancelled
                 | Event::Error(_)
         );
@@ -3070,6 +3070,7 @@ fn block_header(
             kind,
             expanded,
             summary,
+            duration,
             ..
         } => {
             let color = match kind {
@@ -3086,8 +3087,10 @@ fn block_header(
                 | MessageKind::Assistant
                 | MessageKind::Status => {
                     let header = format!("{} {label}", if *expanded { "▾" } else { "▸" });
-                    if matches!(kind, MessageKind::Assistant) && !model.is_empty() {
-                        assistant_header(header, model, color, selected)
+                    if matches!(kind, MessageKind::Assistant)
+                        && (!model.is_empty() || duration.is_some())
+                    {
+                        assistant_header(header, model, *duration, color, selected)
                     } else {
                         section_header(header, color, selected)
                     }
@@ -3513,10 +3516,19 @@ fn section_header(text: String, color: Color, selected: bool) -> Line<'static> {
     Line::styled(text, style)
 }
 
-fn assistant_header(text: String, model: &str, color: Color, selected: bool) -> Line<'static> {
+fn assistant_header(
+    text: String,
+    model: &str,
+    duration: Option<Duration>,
+    color: Color,
+    selected: bool,
+) -> Line<'static> {
+    let time = duration
+        .map(|duration| format!(" · {}", format_elapsed(duration)))
+        .unwrap_or_default();
     if selected {
         return Line::styled(
-            format!("{text}  {model}"),
+            format!("{text}  {model}{time}"),
             Style::default()
                 .bg(Color::DarkGray)
                 .fg(Color::White)
@@ -3528,7 +3540,10 @@ fn assistant_header(text: String, model: &str, color: Color, selected: bool) -> 
             text,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  {model}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  {model}{time}"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ])
 }
 
@@ -5286,7 +5301,7 @@ mod tests {
             output_tokens: 120,
             duration: Duration::from_secs(2),
         });
-        state.apply(Event::GenerationFinished);
+        state.apply(Event::GenerationFinished { duration: None });
         let idle = rendered(&state);
         assert!(idle.contains("avg. 60.0 tokens/s"));
         assert_eq!(idle.find("session"), Some(session_column));

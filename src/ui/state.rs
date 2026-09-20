@@ -124,6 +124,8 @@ pub enum ChatBlock {
         /// For the System "context compacted" marker: what the context was
         /// compacted to, rendered as a collapsible section under the message.
         summary: Option<String>,
+        /// Total time the turn took, on the turn's final assistant message.
+        duration: Option<Duration>,
     },
     Thinking {
         content: String,
@@ -859,6 +861,7 @@ impl UiState {
             kind: MessageKind::User,
             expanded: true,
             summary: None,
+            duration: None,
         });
     }
 
@@ -871,6 +874,7 @@ impl UiState {
             kind: MessageKind::Steer,
             expanded: true,
             summary: None,
+            duration: None,
         });
     }
 
@@ -885,6 +889,7 @@ impl UiState {
             kind: MessageKind::Error,
             expanded: true,
             summary: None,
+            duration: None,
         });
     }
 
@@ -1194,6 +1199,7 @@ impl UiState {
                     kind: MessageKind::System,
                     expanded: true,
                     summary: None,
+                    duration: None,
                 });
             }
             Event::Notice(notice) => self.notice = Some(notice),
@@ -1361,6 +1367,7 @@ impl UiState {
                             kind: MessageKind::Assistant,
                             expanded: true,
                             summary: None,
+                            duration: None,
                         });
                         let block = self.blocks.len() - 1;
                         self.assistant = Some(block);
@@ -1529,6 +1536,7 @@ impl UiState {
                     kind: MessageKind::System,
                     expanded: false,
                     summary: Some(summary),
+                    duration: None,
                 };
                 let index = if self.generating && !self.compacting {
                     self.blocks
@@ -1559,7 +1567,25 @@ impl UiState {
                     self.notice = None;
                 }
             }
-            Event::GenerationFinished => {
+            Event::GenerationFinished { duration } => {
+                if let Some(duration) = duration
+                    && let Some(index) = self.blocks.iter().rposition(|block| {
+                        matches!(
+                            block,
+                            ChatBlock::Message {
+                                kind: MessageKind::Assistant,
+                                ..
+                            }
+                        )
+                    })
+                    && let ChatBlock::Message {
+                        duration: turn_duration,
+                        ..
+                    } = &mut self.blocks[index]
+                {
+                    *turn_duration = Some(duration);
+                    self.bump_render(index);
+                }
                 self.turn_id = None;
                 self.approval_id = None;
                 self.finish_reasoning();
@@ -1622,6 +1648,7 @@ impl UiState {
                     kind: MessageKind::System,
                     expanded: true,
                     summary: None,
+                    duration: None,
                 });
                 self.generating = false;
                 self.compacting = false;
@@ -1745,6 +1772,7 @@ impl UiState {
                         images: block.images.clone(),
                         summary: block.summary.clone(),
                         expanded: saved.unwrap_or(block.summary.is_none()),
+                        duration: block.duration_ms.map(Duration::from_millis),
                     }
                 }
             };
@@ -1904,6 +1932,7 @@ impl UiState {
                         kind: MessageKind::System,
                         expanded: false,
                         summary,
+                        duration: None,
                     });
                 }
                 Message::User { content, images } => self.push_block(ChatBlock::Message {
@@ -1914,6 +1943,7 @@ impl UiState {
                     kind: MessageKind::User,
                     expanded: true,
                     summary: None,
+                    duration: None,
                 }),
                 Message::Steer { content, images } => self.push_block(ChatBlock::Message {
                     label: "Steer".into(),
@@ -1923,6 +1953,7 @@ impl UiState {
                     kind: MessageKind::Steer,
                     expanded: true,
                     summary: None,
+                    duration: None,
                 }),
                 Message::Assistant {
                     content,
@@ -1930,6 +1961,7 @@ impl UiState {
                     reasoning,
                     tool_calls,
                     response_items: _,
+                    duration_ms,
                     ..
                 } => {
                     if !reasoning.is_empty() {
@@ -1955,6 +1987,7 @@ impl UiState {
                             },
                             expanded: true,
                             summary: None,
+                            duration: duration_ms.map(Duration::from_millis),
                         });
                     }
                     for call in tool_calls {
@@ -2241,7 +2274,7 @@ mod tests {
         assert!(!state.connecting);
         assert!(!state.waiting);
 
-        state.apply(Event::GenerationFinished);
+        state.apply(Event::GenerationFinished { duration: None });
         assert!(!state.generating);
         assert!(!state.connecting);
         assert!(!state.waiting);
@@ -2371,7 +2404,7 @@ mod tests {
             Event::MessageAccepted(Message::user("work".into())),
             Event::GenerationStarted,
             Event::TextDelta("done".into()),
-            Event::GenerationFinished,
+            Event::GenerationFinished { duration: None },
             Event::OperationStarted {
                 id: "compact".into(),
                 compacting: true,
@@ -2405,7 +2438,7 @@ mod tests {
         let mut state = UiState::new();
         state.push_user("build the feature".into());
         state.apply(Event::TextDelta("done".into()));
-        state.apply(Event::GenerationFinished);
+        state.apply(Event::GenerationFinished { duration: None });
         state.apply(Event::OperationStarted {
             id: "compact".into(),
             compacting: true,
@@ -2722,16 +2755,29 @@ mod tests {
         state.apply(Event::ModelRequestStarted("test-model".into()));
         state.apply(Event::ResponseStarted);
         state.apply(Event::TextDelta("Here is the answer.".into()));
-        state.apply(Event::GenerationFinished);
+        state.apply(Event::GenerationFinished {
+            duration: Some(Duration::from_secs(3)),
+        });
 
-        // The final assistant turn keeps its label.
+        // The final assistant turn keeps its label and carries the turn's
+        // total time, from the user's prompt to the finished answer.
         assert!(matches!(
             state.blocks.last(),
             Some(ChatBlock::Message {
                 label,
                 kind: MessageKind::Assistant,
+                duration: Some(duration),
                 ..
-            }) if label == "Assistant"
+            }) if label == "Assistant" && *duration == Duration::from_secs(3)
+        ));
+        // Intermediate statuses stay without a turn duration.
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                kind: MessageKind::Status,
+                duration,
+                ..
+            } if duration.is_none()
         ));
     }
 

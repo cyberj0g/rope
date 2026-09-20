@@ -244,15 +244,16 @@ pub(super) async fn run<P: Provider + ?Sized>(
                             Err(error) => Err(error),
                         };
                         match result {
-                            Ok(()) => { send_context(&events, &session, &config).await; events.send(Event::GenerationFinished).await.ok(); }
+                            Ok(()) => { send_context(&events, &session, &config).await; events.send(Event::GenerationFinished { duration: None }).await.ok(); }
                             Err(error) => { events.send(Event::Error(error)).await.ok(); }
                         }
                     }
                     InternalEvent::Finished(result) if generation.is_some() => {
+                        let duration = generation.as_ref().unwrap().started.elapsed();
                         generation = None; pending_approval = None;
                         tools.cancel_active().await;
                         messages.truncate(messages.len().saturating_sub(1));
-                        let TurnResult { completed, compaction, title } = result;
+                        let TurnResult { mut completed, compaction, title } = result;
                         if let Some(title) = title {
                             session.set_title(title);
                             events.send(Event::SessionChanged(session.display_name().to_owned())).await.ok();
@@ -265,6 +266,14 @@ pub(super) async fn run<P: Provider + ?Sized>(
                                 + usize::from(compaction.through > messages.len());
                             messages.push(marker.clone()); persisted.push(marker);
                         }
+                        // The turn's total time is stamped on its final
+                        // answer, the last assistant message, so it stays
+                        // visible after the session is reloaded.
+                        if let Some(message) = completed.last_mut()
+                            && let Message::Assistant { duration_ms, .. } = message
+                        {
+                            *duration_ms = Some(duration.as_millis() as u64);
+                        }
                         messages.extend(completed.clone()); persisted.extend(completed);
                         let projected = request_context(&messages, &session.meta);
                         if projected.iter().any(is_ejected_web_result) {
@@ -273,7 +282,7 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         }
                         let saved = async { session.append(&persisted).await?; session.save().await }.await;
                         if let Err(error) = saved { events.send(Event::Error(format!("save session: {error:#}"))).await.ok(); }
-                        else { events.send(Event::GenerationFinished).await.ok(); }
+                        else { events.send(Event::GenerationFinished { duration: Some(duration) }).await.ok(); }
                         events.send(Event::RefreshProject).await.ok();
                         let mut steered = pending_prompts.lock().unwrap().drain(..).collect::<Vec<_>>();
                         if !steered.is_empty() {

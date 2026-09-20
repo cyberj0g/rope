@@ -96,6 +96,10 @@ pub enum Message {
         tool_calls: Vec<ToolCall>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         response_items: Vec<Value>,
+        /// Total time the turn this message answers took, from the user's
+        /// prompt to the final response. Set on the turn's final message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     Tool {
         call_id: String,
@@ -150,6 +154,7 @@ impl Message {
             reasoning,
             tool_calls,
             response_items: Vec::new(),
+            duration_ms: None,
         }
     }
     pub fn assistant_response(
@@ -166,6 +171,7 @@ impl Message {
             reasoning,
             tool_calls,
             response_items,
+            duration_ms: None,
         }
     }
     pub fn with_raw_request(mut self, id: Option<String>) -> Self {
@@ -247,7 +253,11 @@ mod tests {
 
         assert!(matches!(
             message,
-            Message::Assistant { response_items, .. } if response_items.is_empty()
+            Message::Assistant {
+                response_items,
+                duration_ms,
+                ..
+            } if response_items.is_empty() && duration_ms.is_none()
         ));
     }
 

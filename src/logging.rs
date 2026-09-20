@@ -88,7 +88,7 @@ fn event_message(event: &Event, snapshot: &Snapshot) -> Option<(&'static str, St
         }
         Event::CompactionStarted => "compacting context".into(),
         Event::ContextCompacted { .. } => "context compacted".into(),
-        Event::GenerationFinished => format!(
+        Event::GenerationFinished { .. } => format!(
             "turn finished; session total: {} tokens",
             snapshot.state.total_tokens
         ),

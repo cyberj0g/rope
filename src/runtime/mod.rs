@@ -259,7 +259,12 @@ pub enum Event {
     ContextCompacted {
         summary: String,
     },
-    GenerationFinished,
+    GenerationFinished {
+        /// Total wall-clock time of the finished turn, from the user's
+        /// prompt to the final response; `None` for operations like a
+        /// manual compaction that have no user-facing answer.
+        duration: Option<Duration>,
+    },
     GenerationCancelled,
     Error(String),
 }
@@ -309,6 +314,9 @@ struct ActiveTurn {
     id: String,
     task: JoinHandle<()>,
     progress: TurnProgressHandle,
+    /// When the turn's user prompt was submitted, so the finished turn can
+    /// report how long it took end to end.
+    started: Instant,
 }
 
 #[derive(Clone)]
@@ -459,6 +467,7 @@ async fn spawn_turn<P: Provider + ?Sized>(
     *generation = Some(ActiveTurn {
         id: id.clone(),
         progress: progress.clone(),
+        started: Instant::now(),
         task: tokio::spawn(async move {
             let result = match project_prompt {
                 Ok(prompt) => {
@@ -4173,7 +4182,7 @@ mod tests {
             .unwrap();
         let mut finished = 0;
         while let Some(event) = event_rx.recv().await {
-            if matches!(event, Event::GenerationFinished) {
+            if matches!(event, Event::GenerationFinished { .. }) {
                 finished += 1;
                 if finished == 2 {
                     break;
@@ -4518,7 +4527,7 @@ mod tests {
             .await
             .unwrap();
         while let Some(event) = event_rx.recv().await {
-            if matches!(event, Event::GenerationFinished) {
+            if matches!(event, Event::GenerationFinished { .. }) {
                 break;
             }
         }
@@ -4532,8 +4541,10 @@ mod tests {
         let (_, messages) = Session::resume_in(root.clone(), "cancel").await.unwrap();
         assert_eq!(messages.len(), 7);
         assert!(matches!(&messages[0], Message::User { content, .. } if content == "go"));
-        assert!(matches!(&messages[1], Message::Assistant { tool_calls, .. }
-            if tool_calls.len() == 1 && tool_calls[0].id == "call_1"));
+        assert!(
+            matches!(&messages[1], Message::Assistant { tool_calls, duration_ms, .. }
+            if tool_calls.len() == 1 && tool_calls[0].id == "call_1" && duration_ms.is_none())
+        );
         assert!(
             matches!(&messages[2], Message::Tool { call_id, content, .. }
             if call_id == "call_1" && content == "done")
@@ -4544,7 +4555,8 @@ mod tests {
         );
         assert!(matches!(&messages[5], Message::User { content, .. } if content == "continue"));
         assert!(
-            matches!(&messages[6], Message::Assistant { content, .. } if content == "continued answer")
+            matches!(&messages[6], Message::Assistant { content, duration_ms, .. }
+                if content == "continued answer" && duration_ms.is_some())
         );
 
         // The next turn's model request carries the salvaged work and the

@@ -111,6 +111,9 @@ pub struct Block {
     pub tool: Option<ToolView>,
     pub timer: Timer,
     pub queued: bool,
+    /// Total time the turn took, on the turn's final assistant block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -240,6 +243,7 @@ impl Projection {
             tool: None,
             timer: Timer::default(),
             queued: false,
+            duration_ms: None,
         }
     }
 
@@ -322,6 +326,7 @@ impl Projection {
                     reasoning,
                     model,
                     tool_calls,
+                    duration_ms,
                     ..
                 } => {
                     if !reasoning.is_empty() {
@@ -336,6 +341,7 @@ impl Projection {
                         };
                         let mut block = self.block(kind, content.clone());
                         block.model = model.clone();
+                        block.duration_ms = *duration_ms;
                         self.push(block, changes);
                     }
                     for call in tool_calls {
@@ -721,8 +727,20 @@ impl Projection {
                 }
                 self.snapshot.state.notice = None;
             }
-            Event::GenerationFinished | Event::GenerationCancelled | Event::Error(_) => {
-                if matches!(event, Event::GenerationFinished) {
+            Event::GenerationFinished { .. } | Event::GenerationCancelled | Event::Error(_) => {
+                if let Event::GenerationFinished {
+                    duration: Some(duration),
+                } = event
+                    && let Some(index) = self
+                        .snapshot
+                        .blocks
+                        .iter()
+                        .rposition(|block| block.kind == BlockKind::Assistant)
+                {
+                    self.snapshot.blocks[index].duration_ms = Some(duration.as_millis() as u64);
+                    self.replace(index, &mut changes);
+                }
+                if matches!(event, Event::GenerationFinished { .. }) {
                     self.pending_raw.retain(|&i| self.snapshot.blocks[i].queued);
                 } else {
                     self.pending_raw.clear();
@@ -744,7 +762,7 @@ impl Projection {
                         self.replace(index, &mut changes);
                     }
                 }
-                if !matches!(event, Event::GenerationFinished) {
+                if !matches!(event, Event::GenerationFinished { .. }) {
                     self.delivered(usize::MAX, &mut changes);
                     let (kind, text) = match event {
                         Event::Error(error) => (BlockKind::Error, error.clone()),
@@ -811,7 +829,7 @@ mod tests {
             "next".into(),
             Vec::new(),
         )));
-        projection.apply(&Event::GenerationFinished);
+        projection.apply(&Event::GenerationFinished { duration: None });
         projection.apply(&Event::SteersDelivered(1));
         projection.apply(&Event::ModelRequestStarted("model".into()));
         projection.apply(&Event::RawRequest(Some("next-request".into())));
@@ -823,6 +841,23 @@ mod tests {
             projection.snapshot.blocks[2].raw_request.as_deref(),
             Some("next-request")
         );
+    }
+
+    #[test]
+    fn finished_turn_stamps_its_total_duration_on_the_final_answer() {
+        let mut projection = Projection::new("session".into());
+        projection.apply(&Event::MessageAccepted(Message::user("work".into())));
+        projection.apply(&Event::TextDelta("answer".into()));
+        projection.apply(&Event::GenerationFinished {
+            duration: Some(Duration::from_millis(1500)),
+        });
+        assert_eq!(projection.snapshot.blocks[1].duration_ms, Some(1500));
+
+        // An operation without a user-facing answer stamps nothing.
+        projection.apply(&Event::MessageAccepted(Message::user("again".into())));
+        projection.apply(&Event::TextDelta("second".into()));
+        projection.apply(&Event::GenerationFinished { duration: None });
+        assert_eq!(projection.snapshot.blocks[3].duration_ms, None);
     }
 
     #[test]

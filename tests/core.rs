@@ -167,7 +167,7 @@ async fn shared_sessions_accept_concurrent_messages_and_snapshot_the_live_tail()
     let mut reconnected = core.subscribe(&id).await.unwrap();
     continuation.finish("done");
     until(&mut reconnected, |event| {
-        matches!(event, Event::GenerationFinished)
+        matches!(event, Event::GenerationFinished { .. })
     })
     .await;
     let snapshot = core.subscribe(&id).await.unwrap().snapshot;
@@ -247,7 +247,7 @@ async fn independent_sessions_run_concurrently_and_old_cancels_are_rejected() {
     assert!(request_a.stream.is_closed());
     request_b.finish("beta done");
     until(&mut events_b, |event| {
-        matches!(event, Event::GenerationFinished)
+        matches!(event, Event::GenerationFinished { .. })
     })
     .await;
     assert_eq!(
@@ -309,7 +309,10 @@ async fn approval_is_shared_and_resolved_once() {
             .is_none()
     );
     next.finish("done");
-    until(&mut a, |event| matches!(event, Event::GenerationFinished)).await;
+    until(&mut a, |event| {
+        matches!(event, Event::GenerationFinished { .. })
+    })
+    .await;
     core.shutdown().await.unwrap();
 }
 
@@ -343,7 +346,7 @@ async fn a_response_cut_off_at_the_context_limit_compacts_and_continues() {
     }));
     continuation.finish("finished");
     until(&mut subscription, |event| {
-        matches!(event, Event::GenerationFinished)
+        matches!(event, Event::GenerationFinished { .. })
     })
     .await;
     core.shutdown().await.unwrap();
@@ -409,7 +412,7 @@ async fn mid_turn_compaction_preserves_steering_and_the_saved_boundary() {
         } else {
             continuation.finish("finished");
             until(&mut subscription, |event| {
-                matches!(event, Event::GenerationFinished)
+                matches!(event, Event::GenerationFinished { .. })
             })
             .await;
         }
@@ -453,7 +456,7 @@ async fn manual_compaction_stays_responsive_and_can_be_cancelled() {
     let mut a = core.subscribe(&id).await.unwrap();
     core.command(&id, prompt("first")).await.unwrap();
     harness.next().await.finish("answer");
-    until(&mut a, |e| matches!(e, Event::GenerationFinished)).await;
+    until(&mut a, |e| matches!(e, Event::GenerationFinished { .. })).await;
     let turn_id = core
         .command(&id, Action::Compact)
         .await
@@ -566,7 +569,7 @@ async fn slow_subscribers_do_not_block_the_runtime_and_can_resnapshot() {
     let request = harness.next().await;
     let reading = tokio::spawn(async move {
         until(&mut fast, |event| {
-            matches!(event, Event::GenerationFinished)
+            matches!(event, Event::GenerationFinished { .. })
         })
         .await
     });
@@ -668,7 +671,7 @@ async fn raw_requests_are_lazy_historical_and_survive_compaction_and_restart() {
     harness.next().await.tool("list_files", json!({"path":"."}));
     harness.next().await.finish("first answer");
     until(&mut subscription, |e| {
-        matches!(e, Event::GenerationFinished)
+        matches!(e, Event::GenerationFinished { .. })
     })
     .await;
     let first = harness.core.subscribe(&id).await.unwrap().snapshot;
@@ -708,7 +711,7 @@ async fn raw_requests_are_lazy_historical_and_survive_compaction_and_restart() {
     harness.core.command(&id, Action::Compact).await.unwrap();
     harness.next().await.finish("summary of first prompt");
     until(&mut subscription, |e| {
-        matches!(e, Event::GenerationFinished)
+        matches!(e, Event::GenerationFinished { .. })
     })
     .await;
     let compacted = harness.core.subscribe(&id).await.unwrap().snapshot;

@@ -481,7 +481,7 @@ async fn file_downloads_require_publication_and_encode_filenames() {
         .await;
         harness.next().await.finish("sent");
         until(&mut subscription, |event| {
-            matches!(event, Event::GenerationFinished)
+            matches!(event, Event::GenerationFinished { .. })
         })
         .await;
         let snapshot = harness.core.subscribe(&id).await.unwrap().snapshot;
