@@ -80,6 +80,8 @@
   include/exclude filters, environment-backed secrets, bounded startup and call
   times, cancellation, graceful shutdown, and approval grants tied to the
   server configuration fingerprint
+- Streamable HTTP MCP servers with environment-backed bearer authentication
+  and custom headers, stateless/session-aware operation, and session recovery
 
 External tools receive their function arguments as JSON on stdin and must return
 `{"output":"..."}` on stdout.

@@ -210,6 +210,10 @@ pub struct McpServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    pub url: String,
+    pub bearer_token_env: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub header_env_vars: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
     pub env_vars: BTreeMap<String, String>,
     pub approval: Option<Approval>,
@@ -228,6 +232,10 @@ impl Default for McpServerConfig {
             command: String::new(),
             args: Vec::new(),
             cwd: None,
+            url: String::new(),
+            bearer_token_env: None,
+            headers: BTreeMap::new(),
+            header_env_vars: BTreeMap::new(),
             env: BTreeMap::new(),
             env_vars: BTreeMap::new(),
             approval: None,
@@ -492,17 +500,21 @@ impl Config {
                 McpTransport::Stdio if server.command.is_empty() => {
                     bail!("MCP stdio server {name} needs a command")
                 }
-                McpTransport::StreamableHttp => {
-                    bail!(
-                        "MCP server {name} uses streamable_http, which is not enabled in this build"
-                    )
-                }
+                McpTransport::StreamableHttp => validate_mcp_url(name, &server.url)?,
                 McpTransport::Stdio => {}
             }
             for variable in server.env_vars.values() {
                 if variable.is_empty() {
                     bail!("MCP server {name} has an empty environment variable reference");
                 }
+            }
+            if server
+                .bearer_token_env
+                .as_ref()
+                .is_some_and(String::is_empty)
+                || server.header_env_vars.values().any(String::is_empty)
+            {
+                bail!("MCP server {name} has an empty HTTP environment variable reference");
             }
         }
         Ok(())
@@ -667,6 +679,17 @@ fn merge(base: &mut toml::Value, overlay: toml::Value) {
         }
         (base, overlay) => *base = overlay,
     }
+}
+
+fn validate_mcp_url(name: &str, value: &str) -> Result<()> {
+    let url = url::Url::parse(value).with_context(|| format!("invalid MCP server {name} URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("MCP server {name} URL must use http or https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("MCP server {name} URL must not contain credentials");
+    }
+    Ok(())
 }
 
 fn replace_mcp_servers(base: &mut toml::Value, overlay: &toml::Value) {

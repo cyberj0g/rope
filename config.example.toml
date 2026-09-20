@@ -49,3 +49,10 @@ mcp = "ask"
 #read_file = "allow"
 #[mcp.servers.files.env_vars]
 #API_TOKEN = "FILES_MCP_TOKEN"
+
+#[mcp.servers.remote]
+#transport = "streamable_http"
+#url = "https://mcp.example.com/mcp"
+#bearer_token_env = "REMOTE_MCP_TOKEN"
+#[mcp.servers.remote.header_env_vars]
+#X-Workspace-Key = "REMOTE_MCP_WORKSPACE_KEY"

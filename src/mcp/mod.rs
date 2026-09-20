@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use http::{HeaderName, HeaderValue};
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, Peer, RoleClient,
     model::{
@@ -17,7 +18,10 @@ use rmcp::{
         ClientRequest, ContentBlock, ProtocolVersion, ResourceContents, ServerResult,
     },
     service::{PeerRequestOptions, RunningService},
-    transport::TokioChildProcess,
+    transport::{
+        StreamableHttpClientTransport, TokioChildProcess,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -33,19 +37,33 @@ const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 type Service = RunningService<RoleClient, ClientConfig>;
 
-pub async fn add_stdio_tools(registry: &mut ToolRegistry, config: &Config, root: &Path) {
+pub async fn add_tools(registry: &mut ToolRegistry, config: &Config, root: &Path) {
     let servers = config
         .mcp
         .servers
         .iter()
-        .filter(|(_, server)| server.enabled && server.transport == McpTransport::Stdio)
-        .map(|(name, server)| {
-            connect_stdio(
-                name.clone(),
-                server.clone(),
-                root.to_path_buf(),
-                config.tools.mcp,
-            )
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, server)| async move {
+            match server.transport {
+                McpTransport::Stdio => {
+                    connect_stdio(
+                        name.clone(),
+                        server.clone(),
+                        root.to_path_buf(),
+                        config.tools.mcp,
+                    )
+                    .await
+                }
+                McpTransport::StreamableHttp => {
+                    connect_http(
+                        name.clone(),
+                        server.clone(),
+                        root.to_path_buf(),
+                        config.tools.mcp,
+                    )
+                    .await
+                }
+            }
         });
     for result in futures_util::future::join_all(servers).await {
         match result {
@@ -131,6 +149,66 @@ async fn connect_stdio(
     .await
     .with_context(|| format!("MCP server '{name}' startup timed out"))?
     .with_context(|| format!("initialize MCP server '{name}'"))?;
+    finish_connection(name, config, cwd, default_approval, service).await
+}
+
+async fn connect_http(
+    name: String,
+    config: McpServerConfig,
+    project_root: PathBuf,
+    default_approval: Approval,
+) -> Result<ConnectedServer> {
+    let mut headers = HashMap::new();
+    for (key, value) in &config.headers {
+        headers.insert(
+            HeaderName::from_bytes(key.as_bytes())
+                .with_context(|| format!("invalid HTTP header name for MCP server '{name}'"))?,
+            HeaderValue::from_str(value)
+                .with_context(|| format!("invalid HTTP header value for MCP server '{name}'"))?,
+        );
+    }
+    for (key, source) in &config.header_env_vars {
+        let value = std::env::var(source)
+            .with_context(|| format!("MCP server '{name}' needs environment variable {source}"))?;
+        headers.insert(
+            HeaderName::from_bytes(key.as_bytes())
+                .with_context(|| format!("invalid HTTP header name for MCP server '{name}'"))?,
+            HeaderValue::from_str(&value)
+                .with_context(|| format!("invalid HTTP header value for MCP server '{name}'"))?,
+        );
+    }
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(config.url.clone()).custom_headers(headers);
+    if let Some(source) = &config.bearer_token_env {
+        transport_config =
+            transport_config.auth_header(std::env::var(source).with_context(|| {
+                format!("MCP server '{name}' needs environment variable {source}")
+            })?);
+    }
+    let transport = StreamableHttpClientTransport::from_config(transport_config);
+    let service = tokio::time::timeout(
+        Duration::from_secs(config.startup_timeout_secs),
+        ClientConfig::default().serve_with_lifecycle(
+            transport,
+            ClientLifecycleMode::Auto {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                legacy_version: Some(ProtocolVersion::V_2025_11_25),
+            },
+        ),
+    )
+    .await
+    .with_context(|| format!("MCP server '{name}' startup timed out"))?
+    .with_context(|| format!("initialize MCP server '{name}'"))?;
+    finish_connection(name, config, project_root, default_approval, service).await
+}
+
+async fn finish_connection(
+    name: String,
+    config: McpServerConfig,
+    identity_root: PathBuf,
+    default_approval: Approval,
+    service: Service,
+) -> Result<ConnectedServer> {
     let peer = service.peer().clone();
     let listed = tokio::time::timeout(
         Duration::from_secs(config.startup_timeout_secs),
@@ -141,7 +219,7 @@ async fn connect_stdio(
     .with_context(|| format!("list tools from MCP server '{name}'"))?;
     let filters = ToolFilters::new(&config.include_tools, &config.exclude_tools)
         .with_context(|| format!("compile tool filters for MCP server '{name}'"))?;
-    let fingerprint = server_fingerprint(&name, &config, &cwd);
+    let fingerprint = server_fingerprint(&name, &config, &identity_root);
     let connection = Arc::new(McpConnection {
         peer,
         service: AsyncMutex::new(Some(service)),
@@ -416,6 +494,8 @@ fn server_fingerprint(name: &str, config: &McpServerConfig, cwd: &Path) -> Strin
     let mut hash = Sha256::new();
     hash.update(name);
     hash.update([0]);
+    hash.update(format!("{:?}", config.transport));
+    hash.update([0]);
     hash.update(&config.command);
     for arg in &config.args {
         hash.update([0]);
@@ -423,6 +503,24 @@ fn server_fingerprint(name: &str, config: &McpServerConfig, cwd: &Path) -> Strin
     }
     hash.update([0]);
     hash.update(cwd.as_os_str().as_encoded_bytes());
+    hash.update([0]);
+    hash.update(&config.url);
+    if let Some(source) = &config.bearer_token_env {
+        hash.update([0]);
+        hash.update(source);
+    }
+    for (key, value) in &config.headers {
+        hash.update([0]);
+        hash.update(key);
+        hash.update([0]);
+        hash.update(value);
+    }
+    for (key, source) in &config.header_env_vars {
+        hash.update([0]);
+        hash.update(key);
+        hash.update([0]);
+        hash.update(source);
+    }
     for (key, value) in &config.env {
         hash.update([0]);
         hash.update(key);
@@ -488,5 +586,107 @@ mod tests {
         assert_eq!(result.output, "echo: hello");
         assert!(!result.is_error);
         registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn discovers_and_calls_a_streamable_http_server_with_env_auth() {
+        use axum::{
+            Json, Router,
+            extract::State,
+            http::{HeaderMap, StatusCode},
+            response::{IntoResponse, Response},
+            routing::post,
+        };
+
+        #[derive(Clone)]
+        struct ExpectedHeaders {
+            authorization: String,
+            home: String,
+        }
+
+        async fn endpoint(
+            State(expected): State<ExpectedHeaders>,
+            headers: HeaderMap,
+            Json(request): Json<Value>,
+        ) -> Response {
+            assert_eq!(
+                headers.get("authorization").unwrap(),
+                expected.authorization.as_str()
+            );
+            assert_eq!(headers.get("x-rope-test").unwrap(), expected.home.as_str());
+            let method = request["method"].as_str().unwrap();
+            let Some(id) = request.get("id").cloned() else {
+                return StatusCode::ACCEPTED.into_response();
+            };
+            let body = match method {
+                "server/discover" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32601, "message": "not found" }
+                }),
+                "initialize" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": { "tools": { "listChanged": false } },
+                        "serverInfo": { "name": "fixture", "version": "1" }
+                    }
+                }),
+                "tools/list" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": { "tools": [{
+                        "name": "echo", "description": "Echo a value",
+                        "inputSchema": { "type": "object" }
+                    }] }
+                }),
+                "tools/call" => serde_json::json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "content": [{ "type": "text", "text": "http echo" }],
+                        "isError": false
+                    }
+                }),
+                _ => unreachable!("unexpected MCP method: {method}"),
+            };
+            Json(body).into_response()
+        }
+
+        let user = std::env::var("USER").unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let app = Router::new()
+            .route("/mcp", post(endpoint))
+            .with_state(ExpectedHeaders {
+                authorization: format!("Bearer {user}"),
+                home,
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = Config::default();
+        let mut server_config = McpServerConfig {
+            transport: McpTransport::StreamableHttp,
+            url: format!("http://{address}/mcp"),
+            bearer_token_env: Some("USER".into()),
+            ..McpServerConfig::default()
+        };
+        server_config
+            .header_env_vars
+            .insert("x-rope-test".into(), "HOME".into());
+        config.mcp.servers.insert("remote".into(), server_config);
+
+        let registry = tool::discover_at(&config, Path::new(env!("CARGO_MANIFEST_DIR")))
+            .await
+            .unwrap();
+        let result = registry
+            .get("mcp__remote__echo")
+            .unwrap()
+            .tool
+            .run(serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(result.output, "http echo");
+        registry.shutdown().await;
+        server.abort();
     }
 }

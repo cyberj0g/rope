@@ -292,7 +292,7 @@ pub async fn discover_at(config: &Config, root: &std::path::Path) -> Result<Tool
         config.tools.external,
     )
     .await?;
-    crate::mcp::add_stdio_tools(&mut registry, config, &cwd).await;
+    crate::mcp::add_tools(&mut registry, config, &cwd).await;
     registry.insert(UpdatePlanTool, Approval::Allow);
     Ok(registry)
 }
