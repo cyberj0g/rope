@@ -5,7 +5,12 @@ mod org_outline;
 mod web_browser;
 mod web_search;
 
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    process::Stdio,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{Result, bail};
 use tokio::sync::mpsc;
@@ -136,6 +141,7 @@ pub struct ToolEntry {
     pub tool: Arc<dyn Tool>,
     pub approval: Approval,
     pub approval_key: String,
+    origin: Option<String>,
 }
 
 #[async_trait]
@@ -146,7 +152,7 @@ pub trait ToolResource: Send + Sync {
 
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: BTreeMap<String, ToolEntry>,
+    tools: Arc<RwLock<BTreeMap<String, ToolEntry>>>,
     resources: Vec<Arc<dyn ToolResource>>,
     notices: Vec<String>,
 }
@@ -163,12 +169,13 @@ impl ToolRegistry {
         approval: Approval,
         approval_key: String,
     ) {
-        self.tools.insert(
+        self.tools.write().unwrap().insert(
             tool.name().to_owned(),
             ToolEntry {
                 tool: Arc::new(tool),
                 approval,
                 approval_key,
+                origin: None,
             },
         );
     }
@@ -180,18 +187,56 @@ impl ToolRegistry {
         approval_key: String,
     ) -> Result<()> {
         let name = tool.name().to_owned();
-        if self.tools.contains_key(&name) {
+        let mut tools = self.tools.write().unwrap();
+        if tools.contains_key(&name) {
             bail!("duplicate tool name: {name}");
         }
-        self.tools.insert(
+        tools.insert(
             name,
             ToolEntry {
                 tool: Arc::new(tool),
                 approval,
                 approval_key,
+                origin: None,
             },
         );
         Ok(())
+    }
+
+    pub(crate) fn replace_origin<T: Tool + 'static>(
+        &self,
+        origin: &str,
+        entries: Vec<(T, Approval, String)>,
+    ) -> Result<usize> {
+        let mut replacement = BTreeMap::new();
+        for (tool, approval, approval_key) in entries {
+            let name = tool.name().to_owned();
+            if replacement.contains_key(&name) {
+                bail!("duplicate tool name: {name}");
+            }
+            replacement.insert(
+                name,
+                ToolEntry {
+                    tool: Arc::new(tool),
+                    approval,
+                    approval_key,
+                    origin: Some(origin.to_owned()),
+                },
+            );
+        }
+        let mut tools = self.tools.write().unwrap();
+        for name in replacement.keys() {
+            if tools
+                .get(name)
+                .is_some_and(|entry| entry.origin.as_deref() != Some(origin))
+            {
+                bail!("duplicate tool name: {name}");
+            }
+        }
+        tools.retain(|_, entry| entry.origin.as_deref() != Some(origin));
+        let count = replacement.len();
+        tools.extend(replacement);
+        Ok(count)
     }
 
     pub fn add_resource<T: ToolResource + 'static>(&mut self, resource: Arc<T>) {
@@ -206,14 +251,19 @@ impl ToolRegistry {
         &self.notices
     }
 
-    pub fn get(&self, name: &str) -> Result<&ToolEntry> {
+    pub fn get(&self, name: &str) -> Result<ToolEntry> {
         self.tools
+            .read()
+            .unwrap()
             .get(name)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))
     }
 
     pub fn definitions(&self, vision: bool) -> Vec<ToolDefinition> {
         self.tools
+            .read()
+            .unwrap()
             .values()
             .filter(|entry| vision || !entry.tool.vision_only())
             .map(|entry| ToolDefinition {
@@ -228,7 +278,14 @@ impl ToolRegistry {
     }
 
     pub async fn cancel_active(&self) {
-        for entry in self.tools.values() {
+        let tools = self
+            .tools
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in tools {
             entry.tool.cancel_active().await;
         }
         for resource in &self.resources {
@@ -237,7 +294,14 @@ impl ToolRegistry {
     }
 
     pub async fn shutdown(&self) {
-        for entry in self.tools.values() {
+        let tools = self
+            .tools
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in tools {
             entry.tool.shutdown().await;
         }
         for resource in &self.resources {

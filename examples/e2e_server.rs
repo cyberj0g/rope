@@ -370,6 +370,7 @@ async fn main() -> Result<()> {
         web_browser: Approval::Ask,
         web_search: Approval::Ask,
         external: Approval::Ask,
+        mcp: Approval::Ask,
     };
 
     let core = Core::new(

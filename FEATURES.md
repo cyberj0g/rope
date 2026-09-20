@@ -82,6 +82,9 @@
   server configuration fingerprint
 - Streamable HTTP MCP servers with environment-backed bearer authentication
   and custom headers, stateless/session-aware operation, and session recovery
+- atomic MCP tool-catalog refresh on `tools/list_changed`, with updated schemas
+  included in the next model request and rich tool results preserving text,
+  structured JSON, resource links, embedded text resources, and images
 
 External tools receive their function arguments as JSON on stdin and must return
 `{"output":"..."}` on stdout.

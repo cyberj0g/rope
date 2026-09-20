@@ -12,12 +12,12 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use http::{HeaderName, HeaderValue};
 use rmcp::{
-    ClientLifecycleMode, ClientServiceExt, Peer, RoleClient,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt, Peer, RoleClient,
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientConfig,
         ClientRequest, ContentBlock, ProtocolVersion, ResourceContents, ServerResult,
     },
-    service::{PeerRequestOptions, RunningService},
+    service::{NotificationContext, PeerRequestOptions, RunningService},
     transport::{
         StreamableHttpClientTransport, TokioChildProcess,
         streamable_http_client::StreamableHttpClientTransportConfig,
@@ -25,7 +25,11 @@ use rmcp::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::{io::AsyncReadExt, sync::Mutex as AsyncMutex};
+use tokio::{
+    io::AsyncReadExt,
+    sync::{Mutex as AsyncMutex, mpsc},
+    task::JoinHandle,
+};
 
 use crate::{
     config::{Config, McpServerConfig, McpTransport},
@@ -35,7 +39,40 @@ use crate::{
 
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
-type Service = RunningService<RoleClient, ClientConfig>;
+type Service = RunningService<RoleClient, McpClient>;
+
+#[derive(Clone)]
+struct McpClient {
+    info: ClientConfig,
+    refresh: mpsc::UnboundedSender<()>,
+}
+
+impl McpClient {
+    fn new() -> (Self, mpsc::UnboundedReceiver<()>) {
+        let (refresh, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                info: ClientConfig::default(),
+                refresh,
+            },
+            receiver,
+        )
+    }
+}
+
+impl ClientHandler for McpClient {
+    fn get_info(&self) -> ClientConfig {
+        self.info.clone()
+    }
+
+    fn on_tool_list_changed(
+        &self,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = ()> + Send + '_ {
+        self.refresh.send(()).ok();
+        std::future::ready(())
+    }
+}
 
 pub async fn add_tools(registry: &mut ToolRegistry, config: &Config, root: &Path) {
     let servers = config
@@ -68,18 +105,29 @@ pub async fn add_tools(registry: &mut ToolRegistry, config: &Config, root: &Path
     for result in futures_util::future::join_all(servers).await {
         match result {
             Ok(connected) => {
-                let count = connected.tools.len();
-                for tool in connected.tools {
-                    let approval = tool.approval;
-                    let approval_key =
-                        format!("{}:{}", connected.connection.approval_prefix, tool.original);
-                    if let Err(error) = registry.try_insert_with_key(tool, approval, approval_key) {
+                let entries = connected
+                    .tools
+                    .into_iter()
+                    .map(|tool| {
+                        let approval = tool.approval;
+                        let approval_key =
+                            format!("{}:{}", connected.connection.approval_prefix, tool.original);
+                        (tool, approval, approval_key)
+                    })
+                    .collect();
+                let count = match registry.replace_origin(&connected.connection.origin, entries) {
+                    Ok(count) => count,
+                    Err(error) => {
                         registry.notice(format!(
-                            "MCP server '{}' skipped a tool: {error}",
+                            "MCP server '{}' skipped its tools: {error}",
                             connected.name
                         ));
+                        0
                     }
-                }
+                };
+                connected
+                    .connection
+                    .start_refresh(registry.clone(), connected.refresh);
                 registry.add_resource(connected.connection);
                 registry.notice(format!(
                     "MCP server '{}' connected with {count} tool{}",
@@ -96,6 +144,7 @@ struct ConnectedServer {
     name: String,
     connection: Arc<McpConnection>,
     tools: Vec<McpTool>,
+    refresh: mpsc::UnboundedReceiver<()>,
 }
 
 async fn connect_stdio(
@@ -135,7 +184,7 @@ async fn connect_stdio(
             while stderr.read(&mut buffer).await.is_ok_and(|read| read > 0) {}
         });
     }
-    let client = ClientConfig::default();
+    let (client, refresh) = McpClient::new();
     let service = tokio::time::timeout(
         Duration::from_secs(config.startup_timeout_secs),
         client.serve_with_lifecycle(
@@ -149,7 +198,7 @@ async fn connect_stdio(
     .await
     .with_context(|| format!("MCP server '{name}' startup timed out"))?
     .with_context(|| format!("initialize MCP server '{name}'"))?;
-    finish_connection(name, config, cwd, default_approval, service).await
+    finish_connection(name, config, cwd, default_approval, service, refresh).await
 }
 
 async fn connect_http(
@@ -186,9 +235,10 @@ async fn connect_http(
             })?);
     }
     let transport = StreamableHttpClientTransport::from_config(transport_config);
+    let (client, refresh) = McpClient::new();
     let service = tokio::time::timeout(
         Duration::from_secs(config.startup_timeout_secs),
-        ClientConfig::default().serve_with_lifecycle(
+        client.serve_with_lifecycle(
             transport,
             ClientLifecycleMode::Auto {
                 preferred_versions: vec![ProtocolVersion::V_2026_07_28],
@@ -199,7 +249,15 @@ async fn connect_http(
     .await
     .with_context(|| format!("MCP server '{name}' startup timed out"))?
     .with_context(|| format!("initialize MCP server '{name}'"))?;
-    finish_connection(name, config, project_root, default_approval, service).await
+    finish_connection(
+        name,
+        config,
+        project_root,
+        default_approval,
+        service,
+        refresh,
+    )
+    .await
 }
 
 async fn finish_connection(
@@ -208,6 +266,7 @@ async fn finish_connection(
     identity_root: PathBuf,
     default_approval: Approval,
     service: Service,
+    refresh: mpsc::UnboundedReceiver<()>,
 ) -> Result<ConnectedServer> {
     let peer = service.peer().clone();
     let listed = tokio::time::timeout(
@@ -217,54 +276,107 @@ async fn finish_connection(
     .await
     .with_context(|| format!("MCP server '{name}' tool discovery timed out"))?
     .with_context(|| format!("list tools from MCP server '{name}'"))?;
-    let filters = ToolFilters::new(&config.include_tools, &config.exclude_tools)
-        .with_context(|| format!("compile tool filters for MCP server '{name}'"))?;
     let fingerprint = server_fingerprint(&name, &config, &identity_root);
     let connection = Arc::new(McpConnection {
         peer,
         service: AsyncMutex::new(Some(service)),
         active: Mutex::new(HashMap::new()),
+        refresh_task: Mutex::new(None),
         call_timeout: Duration::from_secs(config.call_timeout_secs),
         approval_prefix: format!("mcp:{name}:{fingerprint}"),
+        origin: format!("mcp:{name}"),
+        name: name.clone(),
+        config: config.clone(),
+        default_approval,
     });
-    let mut tools = Vec::new();
-    let mut exposed = HashMap::new();
-    for tool in listed {
-        let original = tool.name.into_owned();
-        if !filters.matches(&original) {
-            continue;
-        }
-        let name_for_model = exposed_name(&name, &original);
-        if let Some(other) = exposed.insert(name_for_model.clone(), original.clone()) {
-            bail!(
-                "MCP server '{name}' tools '{other}' and '{original}' map to the same model name"
-            );
-        }
-        let description = tool
-            .description
-            .map(|description| description.into_owned())
-            .unwrap_or_else(|| format!("Tool from MCP server {name}"));
-        let schema = Value::Object((*tool.input_schema).clone());
-        let approval = config
-            .tools
-            .get(&original)
-            .copied()
-            .or(config.approval)
-            .unwrap_or(default_approval);
-        tools.push(McpTool {
-            name: name_for_model,
-            original,
-            description,
-            schema,
-            approval,
-            connection: connection.clone(),
-        });
-    }
+    let tools = connection.build_tools(listed)?;
     Ok(ConnectedServer {
         name,
         connection,
         tools,
+        refresh,
     })
+}
+
+impl McpConnection {
+    fn build_tools(self: &Arc<Self>, listed: Vec<rmcp::model::Tool>) -> Result<Vec<McpTool>> {
+        let name = &self.name;
+        let config = &self.config;
+        let filters = ToolFilters::new(&config.include_tools, &config.exclude_tools)
+            .with_context(|| format!("compile tool filters for MCP server '{name}'"))?;
+        let mut tools = Vec::new();
+        let mut exposed = HashMap::new();
+        for tool in listed {
+            let original = tool.name.into_owned();
+            if !filters.matches(&original) {
+                continue;
+            }
+            let name_for_model = exposed_name(name, &original);
+            if let Some(other) = exposed.insert(name_for_model.clone(), original.clone()) {
+                bail!(
+                    "MCP server '{name}' tools '{other}' and '{original}' map to the same model name"
+                );
+            }
+            let description = tool
+                .description
+                .map(|description| description.into_owned())
+                .unwrap_or_else(|| format!("Tool from MCP server {name}"));
+            let schema = Value::Object((*tool.input_schema).clone());
+            let approval = config
+                .tools
+                .get(&original)
+                .copied()
+                .or(config.approval)
+                .unwrap_or(self.default_approval);
+            tools.push(McpTool {
+                name: name_for_model,
+                original,
+                description,
+                schema,
+                approval,
+                connection: self.clone(),
+            });
+        }
+        Ok(tools)
+    }
+
+    fn start_refresh(
+        self: &Arc<Self>,
+        registry: ToolRegistry,
+        mut notifications: mpsc::UnboundedReceiver<()>,
+    ) {
+        let connection = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            while notifications.recv().await.is_some() {
+                while notifications.try_recv().is_ok() {}
+                let Some(connection) = connection.upgrade() else {
+                    break;
+                };
+                let listed = tokio::time::timeout(
+                    Duration::from_secs(connection.config.startup_timeout_secs),
+                    connection.peer.list_all_tools(),
+                )
+                .await;
+                let Ok(Ok(listed)) = listed else {
+                    continue;
+                };
+                let Ok(tools) = connection.build_tools(listed) else {
+                    continue;
+                };
+                let entries = tools
+                    .into_iter()
+                    .map(|tool| {
+                        let approval = tool.approval;
+                        let approval_key =
+                            format!("{}:{}", connection.approval_prefix, tool.original);
+                        (tool, approval, approval_key)
+                    })
+                    .collect();
+                registry.replace_origin(&connection.origin, entries).ok();
+            }
+        });
+        *self.refresh_task.lock().unwrap() = Some(task);
+    }
 }
 
 struct ToolFilters {
@@ -330,8 +442,13 @@ struct McpConnection {
     peer: Peer<RoleClient>,
     service: AsyncMutex<Option<Service>>,
     active: Mutex<HashMap<rmcp::model::RequestId, ()>>,
+    refresh_task: Mutex<Option<JoinHandle<()>>>,
     call_timeout: Duration,
     approval_prefix: String,
+    origin: String,
+    name: String,
+    config: McpServerConfig,
+    default_approval: Approval,
 }
 
 impl McpConnection {
@@ -383,6 +500,11 @@ impl ToolResource for McpConnection {
 
     async fn shutdown(&self) {
         self.cancel_active().await;
+        let refresh_task = self.refresh_task.lock().unwrap().take();
+        if let Some(task) = refresh_task {
+            task.abort();
+            task.await.ok();
+        }
         if let Some(service) = self.service.lock().await.as_mut() {
             service
                 .close_with_timeout(Duration::from_secs(5))
@@ -400,21 +522,7 @@ fn convert_result(result: rmcp::model::CallToolResult) -> Result<ToolResult> {
         match content {
             ContentBlock::Text(text) => parts.push(text.text),
             ContentBlock::Image(value) if image.is_none() => {
-                if value.data.len() > MAX_IMAGE_BYTES * 4 / 3 + 4 {
-                    parts.push("[MCP image omitted: exceeds 20 MiB]".into());
-                    continue;
-                }
-                let bytes = STANDARD.decode(&value.data).context("decode MCP image")?;
-                let dimensions = image::load_from_memory(&bytes)
-                    .map(|image| (image.width(), image.height()))
-                    .unwrap_or_default();
-                image = Some(ImageContent {
-                    mime_type: value.mime_type,
-                    data: value.data,
-                    path: None,
-                    width: dimensions.0,
-                    height: dimensions.1,
-                });
+                image = decode_image(value.mime_type, value.data, &mut parts)?;
             }
             ContentBlock::Image(_) => parts.push("[additional MCP image omitted]".into()),
             ContentBlock::Audio(value) => parts.push(format!(
@@ -431,25 +539,55 @@ fn convert_result(result: rmcp::model::CallToolResult) -> Result<ToolResult> {
                     mime_type,
                     blob,
                     ..
-                } => parts.push(format!(
-                    "[MCP resource omitted: {uri}, {}, {} base64 characters]",
-                    mime_type.unwrap_or_else(|| "application/octet-stream".into()),
-                    blob.len()
-                )),
+                } => {
+                    let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".into());
+                    if image.is_none() && mime_type.starts_with("image/") {
+                        image = decode_image(mime_type, blob, &mut parts)?;
+                        parts.push(format!("MCP image resource: {uri}"));
+                    } else {
+                        parts.push(format!(
+                            "[MCP resource omitted: {uri}, {mime_type}, {} base64 characters]",
+                            blob.len()
+                        ));
+                    }
+                }
                 _ => parts.push("[unsupported MCP resource omitted]".into()),
             },
-            ContentBlock::ResourceLink(resource) => parts.push(format!(
-                "MCP resource: {} ({})",
-                resource.name, resource.uri
-            )),
+            ContentBlock::ResourceLink(resource) => {
+                let mut details = Vec::new();
+                if let Some(mime_type) = resource.mime_type {
+                    details.push(mime_type);
+                }
+                if let Some(size) = resource.size {
+                    details.push(format!("{size} bytes"));
+                }
+                let title = resource.title.unwrap_or(resource.name);
+                let suffix = (!details.is_empty())
+                    .then(|| format!(" [{}]", details.join(", ")))
+                    .unwrap_or_default();
+                let description = resource
+                    .description
+                    .map(|description| format!("\n{description}"))
+                    .unwrap_or_default();
+                parts.push(format!(
+                    "MCP resource: {title} ({}){suffix}{description}",
+                    resource.uri
+                ));
+            }
             _ => parts.push("[unsupported MCP content omitted]".into()),
         }
     }
     if let Some(structured) = result.structured_content {
         let json = serde_json::to_string_pretty(&structured)?;
-        if !parts.iter().any(|part| part.trim() == json) {
+        if !parts.iter().any(|part| {
+            part.trim() == json
+                || serde_json::from_str::<Value>(part).is_ok_and(|value| value == structured)
+        }) {
             parts.push(json);
         }
+    }
+    if parts.is_empty() && result.is_error == Some(true) {
+        parts.push("MCP tool returned an error without details".into());
     }
     Ok(ToolResult {
         output: parts.join("\n\n"),
@@ -458,6 +596,32 @@ fn convert_result(result: rmcp::model::CallToolResult) -> Result<ToolResult> {
         file: None,
         diff: None,
     })
+}
+
+fn decode_image(
+    mime_type: String,
+    data: String,
+    parts: &mut Vec<String>,
+) -> Result<Option<ImageContent>> {
+    if data.len() > MAX_IMAGE_BYTES * 4 / 3 + 4 {
+        parts.push("[MCP image omitted: exceeds 20 MiB]".into());
+        return Ok(None);
+    }
+    let bytes = STANDARD.decode(&data).context("decode MCP image")?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        parts.push("[MCP image omitted: exceeds 20 MiB]".into());
+        return Ok(None);
+    }
+    let dimensions = image::load_from_memory(&bytes)
+        .map(|image| (image.width(), image.height()))
+        .unwrap_or_default();
+    Ok(Some(ImageContent {
+        mime_type,
+        data,
+        path: None,
+        width: dimensions.0,
+        height: dimensions.1,
+    }))
 }
 
 fn exposed_name(server: &str, tool: &str) -> String {
@@ -555,6 +719,51 @@ mod tests {
         assert_eq!(name, exposed_name("my server", &"strange.tool/".repeat(10)));
     }
 
+    #[test]
+    fn preserves_structured_resources_and_embedded_images() {
+        let result = serde_json::from_value(serde_json::json!({
+            "content": [
+                { "type": "text", "text": "{\"answer\":42}" },
+                {
+                    "type": "resource_link",
+                    "uri": "file:///report.txt",
+                    "name": "report",
+                    "title": "Report",
+                    "description": "Generated report",
+                    "mimeType": "text/plain",
+                    "size": 12
+                },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///pixel.png",
+                        "mimeType": "image/png",
+                        "blob": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                    }
+                }
+            ],
+            "structuredContent": { "answer": 42 },
+            "isError": false
+        }))
+        .unwrap();
+
+        let converted = convert_result(result).unwrap();
+
+        assert!(converted.image.is_some());
+        assert!(
+            converted
+                .output
+                .contains("Report (file:///report.txt) [text/plain, 12 bytes]")
+        );
+        assert!(converted.output.contains("Generated report"));
+        assert!(
+            converted
+                .output
+                .contains("MCP image resource: file:///pixel.png")
+        );
+        assert_eq!(converted.output.matches("answer").count(), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn discovers_and_calls_a_real_stdio_server() {
@@ -585,6 +794,17 @@ mod tests {
 
         assert_eq!(result.output, "echo: hello");
         assert!(!result.is_error);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.get("mcp__fixture__new_echo").is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(registry.get("mcp__fixture__echo").is_err());
         registry.shutdown().await;
     }
 

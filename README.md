@@ -142,7 +142,9 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
   `[mcp.servers.NAME]`, with include/exclude filters, environment-backed bearer
   tokens and headers, call timeouts, and server- or tool-level approval
   policies. Server failures are reported as session notices without hiding
-  Rope's built-in tools.
+  Rope's built-in tools. Tool-list change notifications update the next model
+  request without restarting the session; text, structured data, resource
+  links, embedded text, and images are retained in tool results.
 - Context management: live context-fill tracking, bounded tool output,
   automatic compaction with visible markers, and global/project
   `AGENTS.md` instructions.
