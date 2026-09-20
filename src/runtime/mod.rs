@@ -283,6 +283,7 @@ enum InternalEvent {
     PlanUpdated(ExecutionPlan),
     Approval {
         call: ToolCall,
+        approval_key: String,
         reply: oneshot::Sender<ApprovalDecision>,
     },
     ProjectRefresh,
@@ -329,6 +330,7 @@ struct Compaction {
 struct PendingApproval {
     id: String,
     tool: String,
+    approval_key: String,
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
@@ -757,7 +759,14 @@ async fn turn<P: Provider + ?Sized>(
             &messages[messages.len().saturating_sub(1)..],
         )
     };
-    let estimated = known.saturating_add(estimate_tokens(unknown));
+    let schema_tokens = estimate_tool_tokens(&tools.definitions(config.active_model().vision));
+    let estimated = known
+        .saturating_add(estimate_tokens(unknown))
+        .saturating_add(if context_tokens == 0 {
+            schema_tokens
+        } else {
+            0
+        });
     let max_tokens = config.active_model().max_context_tokens;
     if estimated as f64 >= max_tokens as f64 * config.compaction_threshold as f64 {
         let user = messages.pop().context("missing user message")?;
@@ -1282,6 +1291,7 @@ async fn agent<P: Provider + ?Sized>(
         if compact_before_request {
             let available = available_context_tokens(
                 &messages,
+                tools,
                 config,
                 project_prompt.as_deref(),
                 current_plan.as_ref(),
@@ -1307,6 +1317,7 @@ async fn agent<P: Provider + ?Sized>(
         if let Some(prompt) = &project_prompt {
             request_messages.insert(0, Message::system(prompt.clone()));
         }
+        let tool_definitions = tools.definitions(config.active_model().vision);
         let request = CompletionRequest {
             provider: config.provider_name().to_owned(),
             model: config.model_id().to_owned(),
@@ -1315,7 +1326,7 @@ async fn agent<P: Provider + ?Sized>(
             reasoning_effort: config.effective_reasoning_effort(),
             max_tokens: None,
             stream: true,
-            tools: tools.definitions(config.active_model().vision),
+            tools: tool_definitions,
         };
         let (stream, raw_request) =
             stream_with_retry(&provider, request, events, true, Some(progress)).await?;
@@ -1340,6 +1351,7 @@ async fn agent<P: Provider + ?Sized>(
                     .max_context_tokens
                     .saturating_sub(available_context_tokens(
                         &messages,
+                        tools,
                         config,
                         project_prompt.as_deref(),
                         current_plan.as_ref(),
@@ -1412,6 +1424,7 @@ async fn agent<P: Provider + ?Sized>(
                 );
                 used = max_tokens.saturating_sub(available_context_tokens(
                     &messages,
+                    tools,
                     config,
                     project_prompt.as_deref(),
                     current_plan.as_ref(),
@@ -1429,6 +1442,7 @@ async fn agent<P: Provider + ?Sized>(
                     internal
                         .send(InternalEvent::Approval {
                             call: call.clone(),
+                            approval_key: entry.approval_key.clone(),
                             reply,
                         })
                         .await?;
@@ -1474,7 +1488,13 @@ async fn agent<P: Provider + ?Sized>(
                 bail_tool_denied(&call.name)
             };
             let (mut output, mut image, file, diff, success) = match result {
-                Ok(result) => (result.output, result.image, result.file, result.diff, true),
+                Ok(result) => (
+                    result.output,
+                    result.image,
+                    result.file,
+                    result.diff,
+                    !result.is_error,
+                ),
                 Err(error) => (format!("Error: {error:#}"), None, None, None, false),
             };
             // The pre-run reservation covered the text, not the image. An
@@ -1612,6 +1632,7 @@ async fn compact_mid_turn<P: Provider + ?Sized>(
 
 fn available_context_tokens(
     messages: &[Message],
+    tools: &ToolRegistry,
     config: &Config,
     project_prompt: Option<&str>,
     current_plan: Option<&ExecutionPlan>,
@@ -1622,10 +1643,19 @@ fn available_context_tokens(
     if let Some(prompt) = project_prompt {
         context.insert(0, Message::system(prompt.into()));
     }
+    let used = estimate_tokens(&context).saturating_add(estimate_tool_tokens(
+        &tools.definitions(config.active_model().vision),
+    ));
     config
         .active_model()
         .max_context_tokens
-        .saturating_sub(estimate_tokens(&context))
+        .saturating_sub(used)
+}
+
+fn estimate_tool_tokens(tools: &[ToolDefinition]) -> u64 {
+    serde_json::to_string(tools)
+        .map_or(0, |value| value.len())
+        .div_ceil(4) as u64
 }
 
 /// Forwards partial tool output to the UI until the streamed byte budget is
@@ -1943,6 +1973,7 @@ mod tests {
         }
         async fn run(&self, args: Value) -> Result<ToolResult> {
             Ok(ToolResult {
+                is_error: false,
                 output: args["value"].as_str().unwrap().to_owned(),
                 image: None,
                 file: None,
@@ -1982,6 +2013,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
             Ok(ToolResult {
+                is_error: false,
                 output,
                 image: None,
                 file: None,
@@ -2925,7 +2957,7 @@ mod tests {
                     break result;
                 }
                 Some(event) = internal_rx.recv() => {
-                    if let InternalEvent::Approval { call, reply } = event {
+                    if let InternalEvent::Approval { call, reply, .. } = event {
                         approvals += 1;
                         assert_eq!(call.name, "shell");
                         reply.send(ApprovalDecision::AllowOnce).ok();
@@ -3855,6 +3887,7 @@ mod tests {
             }
             async fn run(&self, _args: Value) -> Result<ToolResult> {
                 Ok(ToolResult {
+                    is_error: false,
                     output: "viewed big.png".into(),
                     image: Some(ImageContent {
                         mime_type: "image/png".into(),

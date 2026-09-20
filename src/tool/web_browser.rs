@@ -70,6 +70,7 @@ impl Tool for WebBrowserTool {
         let page = self.browser.load(&url).await?;
         let extracted = extract_page(&page);
         Ok(ToolResult {
+            is_error: false,
             output: serde_json::to_string_pretty(&json!({
                 "url": page.url,
                 "title": page.title,

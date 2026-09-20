@@ -181,6 +181,7 @@ impl Tool for OrgOutlineTool {
         };
         let outline = extract_outline(&content);
         Ok(ToolResult {
+            is_error: false,
             output: render(&target.to_string_lossy(), &outline),
             image: None,
             file: None,
@@ -224,6 +225,7 @@ fn node_json(node: &OrgNode) -> String {
 
 fn tool_error(code: &str, message: &str) -> ToolResult {
     ToolResult {
+        is_error: false,
         output: json!({ "error": code, "message": message }).to_string(),
         image: None,
         file: None,

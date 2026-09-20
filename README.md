@@ -89,6 +89,8 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
 - **Vision models** - the chat supports pasting and displaying images, if terminal emulator supports it.
 - **OpenAI-compatible API** - works with local generation
   (vLLM, llama.cpp) and remote hosted APIs, with per-model profiles for routing.
+- **MCP tools** - connects to configured stdio MCP servers, discovers paginated
+  tool catalogs, and applies Rope's per-tool approval flow to every call.
 - **Written in Rust** - a single self-contained binary.
 - **No database** - sessions are plain JSONL files on disk.
 - **No subagents** (yet)
@@ -135,6 +137,10 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
 - External tools: any executable that reads JSON on stdin and returns
   `{"output": "..."}` on stdout, discovered from `./.rope/tools/` and
   `~/.config/rope/tools/`.
+- MCP tools: stdio servers configured under `[mcp.servers.NAME]`, with
+  include/exclude filters, environment-variable mapping, call timeouts, and
+  server- or tool-level approval policies. Server failures are reported as
+  session notices without hiding Rope's built-in tools.
 - Context management: live context-fill tracking, bounded tool output,
   automatic compaction with visible markers, and global/project
   `AGENTS.md` instructions.

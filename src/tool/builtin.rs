@@ -150,6 +150,7 @@ impl Tool for ReadTool {
             .take(args.limit.unwrap_or(usize::MAX))
             .collect();
         Ok(ToolResult {
+            is_error: false,
             output,
             image: None,
             file: None,
@@ -191,6 +192,7 @@ impl Tool for WriteTool {
         let diff = file_diff(&self.0, &target, before.as_deref(), &args.content);
         tokio::fs::write(&target, args.content).await?;
         Ok(ToolResult {
+            is_error: false,
             output: format!("wrote {}", target.display()),
             image: None,
             file: None,
@@ -236,6 +238,7 @@ impl Tool for EditTool {
         let diff = file_diff(&self.0, &target, Some(&content), &edited);
         tokio::fs::write(&target, edited).await?;
         Ok(ToolResult {
+            is_error: false,
             output: format!("edited {}", target.display()),
             image: None,
             file: None,
@@ -1054,6 +1057,7 @@ impl Tool for ShellTool {
             )
             .await?;
         Ok(ToolResult {
+            is_error: false,
             output: snapshot.envelope(),
             image: None,
             file: None,
@@ -1116,6 +1120,7 @@ impl Tool for ShellPollTool {
             )
             .await?;
         Ok(ToolResult {
+            is_error: false,
             output: snapshot.envelope(),
             image: None,
             file: None,
@@ -1169,6 +1174,7 @@ impl Tool for ShellCancelTool {
             )
             .await?;
         Ok(ToolResult {
+            is_error: false,
             output: snapshot.envelope(),
             image: None,
             file: None,
@@ -1248,6 +1254,7 @@ impl Tool for SearchFilesTool {
                         );
                     }
                     return Ok(ToolResult {
+                        is_error: false,
                         output: String::from_utf8_lossy(&output.stdout).into_owned(),
                         image: None,
                         file: None,
@@ -1265,6 +1272,7 @@ impl Tool for SearchFilesTool {
         })
         .await??;
         Ok(ToolResult {
+            is_error: false,
             output,
             image: None,
             file: None,
@@ -1317,6 +1325,7 @@ impl Tool for ListFilesTool {
                         .collect::<Vec<_>>();
                     paths.sort();
                     return Ok(ToolResult {
+                        is_error: false,
                         output: paths.join("\n"),
                         image: None,
                         file: None,
@@ -1332,6 +1341,7 @@ impl Tool for ListFilesTool {
         let output =
             tokio::task::spawn_blocking(move || list_files_fallback(&root, &matcher)).await??;
         Ok(ToolResult {
+            is_error: false,
             output,
             image: None,
             file: None,
@@ -1448,6 +1458,7 @@ impl Tool for ViewImageTool {
             .ok()
             .unwrap_or((0, 0));
         Ok(ToolResult {
+            is_error: false,
             output: format!("viewed {}", target.display()),
             image: Some(crate::runtime::ImageContent {
                 mime_type: mime_type.into(),
@@ -1497,6 +1508,7 @@ impl Tool for SendFileTool {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| target.display().to_string());
         Ok(ToolResult {
+            is_error: false,
             output: format!(
                 "sent {} ({} bytes)\nFile delivered to the user and displayed in chat. No further delivery action is needed for this file.",
                 target.display(),
@@ -1582,6 +1594,7 @@ impl Tool for UpdatePlanTool {
             .map(|explanation| explanation.trim().to_owned())
             .filter(|explanation| !explanation.is_empty());
         Ok(ToolResult {
+            is_error: false,
             output: serde_json::to_string_pretty(&plan)?,
             image: None,
             file: None,

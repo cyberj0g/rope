@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -49,6 +49,7 @@ pub struct Config {
     pub paste_collapse_chars: usize,
     pub compaction_threshold: f32,
     pub tools: ToolPolicies,
+    pub mcp: McpConfig,
     #[serde(skip)]
     pub recent_models: Vec<String>,
     #[serde(skip)]
@@ -165,6 +166,7 @@ pub struct ToolPolicies {
     pub web_browser: Approval,
     pub web_search: Approval,
     pub external: Approval,
+    pub mcp: Approval,
 }
 
 impl Default for ToolPolicies {
@@ -181,6 +183,59 @@ impl Default for ToolPolicies {
             web_browser: Approval::Ask,
             web_search: Approval::Ask,
             external: Approval::Ask,
+            mcp: Approval::Ask,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    #[default]
+    Stdio,
+    StreamableHttp,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub enabled: bool,
+    pub transport: McpTransport,
+    pub command: String,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: BTreeMap<String, String>,
+    pub env_vars: BTreeMap<String, String>,
+    pub approval: Option<Approval>,
+    pub tools: BTreeMap<String, Approval>,
+    pub include_tools: Vec<String>,
+    pub exclude_tools: Vec<String>,
+    pub startup_timeout_secs: u64,
+    pub call_timeout_secs: u64,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            transport: McpTransport::Stdio,
+            command: String::new(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            env_vars: BTreeMap::new(),
+            approval: None,
+            tools: BTreeMap::new(),
+            include_tools: Vec::new(),
+            exclude_tools: Vec::new(),
+            startup_timeout_secs: 10,
+            call_timeout_secs: 300,
         }
     }
 }
@@ -200,6 +255,7 @@ impl Default for Config {
             paste_collapse_chars: 200,
             compaction_threshold: 0.75,
             tools: ToolPolicies::default(),
+            mcp: McpConfig::default(),
             recent_models: Vec::new(),
             recent_commands: Vec::new(),
             notices: Vec::new(),
@@ -248,6 +304,7 @@ impl Config {
                 let mut overlay = read_toml(path)?;
                 promote_legacy_provider(&mut overlay);
                 promote_legacy_tool_names(&mut overlay);
+                replace_mcp_servers(&mut value, &overlay);
                 merge(&mut value, overlay);
             }
         }
@@ -421,6 +478,33 @@ impl Config {
         if !(0.0..=1.0).contains(&self.compaction_threshold) {
             bail!("compaction_threshold must be between 0 and 1");
         }
+        for (name, server) in &self.mcp.servers {
+            if name.is_empty() {
+                bail!("MCP server name cannot be empty");
+            }
+            if !server.enabled {
+                continue;
+            }
+            if server.startup_timeout_secs == 0 || server.call_timeout_secs == 0 {
+                bail!("MCP server {name} timeouts must be greater than zero");
+            }
+            match server.transport {
+                McpTransport::Stdio if server.command.is_empty() => {
+                    bail!("MCP stdio server {name} needs a command")
+                }
+                McpTransport::StreamableHttp => {
+                    bail!(
+                        "MCP server {name} uses streamable_http, which is not enabled in this build"
+                    )
+                }
+                McpTransport::Stdio => {}
+            }
+            for variable in server.env_vars.values() {
+                if variable.is_empty() {
+                    bail!("MCP server {name} has an empty environment variable reference");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -585,6 +669,26 @@ fn merge(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
+fn replace_mcp_servers(base: &mut toml::Value, overlay: &toml::Value) {
+    let Some(servers) = overlay
+        .get("mcp")
+        .and_then(|mcp| mcp.get("servers"))
+        .and_then(toml::Value::as_table)
+    else {
+        return;
+    };
+    let Some(base_servers) = base
+        .get_mut("mcp")
+        .and_then(|mcp| mcp.get_mut("servers"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+    for name in servers.keys() {
+        base_servers.remove(name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +824,37 @@ write = "allow"
         );
         assert_eq!(value["temperature"].as_float(), Some(0.4));
         assert_eq!(value["tools"]["write"].as_str(), Some("allow"));
+    }
+
+    #[test]
+    fn local_mcp_server_replaces_the_global_definition() {
+        let mut value: toml::Value = toml::from_str(
+            r#"
+[mcp.servers.docs]
+command = "global-server"
+args = ["--global"]
+[mcp.servers.docs.env]
+TOKEN = "secret"
+"#,
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(
+            r#"
+[mcp.servers.docs]
+command = "local-server"
+"#,
+        )
+        .unwrap();
+
+        replace_mcp_servers(&mut value, &overlay);
+        merge(&mut value, overlay);
+
+        assert_eq!(
+            value["mcp"]["servers"]["docs"]["command"].as_str(),
+            Some("local-server")
+        );
+        assert!(value["mcp"]["servers"]["docs"].get("args").is_none());
+        assert!(value["mcp"]["servers"]["docs"].get("env").is_none());
     }
 
     #[test]

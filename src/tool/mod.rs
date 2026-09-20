@@ -73,12 +73,18 @@ pub enum PlanStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolResult {
     pub output: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<FileContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -129,22 +135,75 @@ pub trait Tool: Send + Sync {
 pub struct ToolEntry {
     pub tool: Arc<dyn Tool>,
     pub approval: Approval,
+    pub approval_key: String,
+}
+
+#[async_trait]
+pub trait ToolResource: Send + Sync {
+    async fn cancel_active(&self) {}
+    async fn shutdown(&self) {}
 }
 
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, ToolEntry>,
+    resources: Vec<Arc<dyn ToolResource>>,
+    notices: Vec<String>,
 }
 
 impl ToolRegistry {
     pub fn insert<T: Tool + 'static>(&mut self, tool: T, approval: Approval) {
+        let approval_key = tool.name().to_owned();
+        self.insert_with_key(tool, approval, approval_key);
+    }
+
+    pub fn insert_with_key<T: Tool + 'static>(
+        &mut self,
+        tool: T,
+        approval: Approval,
+        approval_key: String,
+    ) {
         self.tools.insert(
             tool.name().to_owned(),
             ToolEntry {
                 tool: Arc::new(tool),
                 approval,
+                approval_key,
             },
         );
+    }
+
+    pub fn try_insert_with_key<T: Tool + 'static>(
+        &mut self,
+        tool: T,
+        approval: Approval,
+        approval_key: String,
+    ) -> Result<()> {
+        let name = tool.name().to_owned();
+        if self.tools.contains_key(&name) {
+            bail!("duplicate tool name: {name}");
+        }
+        self.tools.insert(
+            name,
+            ToolEntry {
+                tool: Arc::new(tool),
+                approval,
+                approval_key,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn add_resource<T: ToolResource + 'static>(&mut self, resource: Arc<T>) {
+        self.resources.push(resource);
+    }
+
+    pub fn notice(&mut self, notice: impl Into<String>) {
+        self.notices.push(notice.into());
+    }
+
+    pub fn notices(&self) -> &[String] {
+        &self.notices
     }
 
     pub fn get(&self, name: &str) -> Result<&ToolEntry> {
@@ -172,11 +231,17 @@ impl ToolRegistry {
         for entry in self.tools.values() {
             entry.tool.cancel_active().await;
         }
+        for resource in &self.resources {
+            resource.cancel_active().await;
+        }
     }
 
     pub async fn shutdown(&self) {
         for entry in self.tools.values() {
             entry.tool.shutdown().await;
+        }
+        for resource in &self.resources {
+            resource.shutdown().await;
         }
     }
 }
@@ -227,6 +292,7 @@ pub async fn discover_at(config: &Config, root: &std::path::Path) -> Result<Tool
         config.tools.external,
     )
     .await?;
+    crate::mcp::add_stdio_tools(&mut registry, config, &cwd).await;
     registry.insert(UpdatePlanTool, Approval::Allow);
     Ok(registry)
 }

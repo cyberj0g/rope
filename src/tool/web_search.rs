@@ -123,6 +123,7 @@ impl Tool for WebSearchTool {
                     let results = provider.parse(&page.html, args.max_results);
                     if !results.is_empty() {
                         return Ok(ToolResult {
+                            is_error: false,
                             output: serde_json::to_string_pretty(&json!({
                                 "query": query,
                                 "provider": provider.name(),

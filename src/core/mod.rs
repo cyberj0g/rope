@@ -71,6 +71,7 @@ struct Inner {
     storage_root: PathBuf,
     provider: Arc<dyn Provider>,
     sessions: AsyncMutex<HashMap<String, Arc<LoadedSession>>>,
+    loading: AsyncMutex<()>,
     catalog: Arc<Mutex<Catalog>>,
     project: watch::Receiver<ProjectUpdate>,
     refresh_project: mpsc::Sender<()>,
@@ -148,6 +149,7 @@ impl Core {
                 storage_root,
                 provider,
                 sessions: AsyncMutex::new(HashMap::new()),
+                loading: AsyncMutex::new(()),
                 catalog,
                 project,
                 refresh_project,
@@ -181,17 +183,20 @@ impl Core {
 
     async fn load(&self, name: Option<String>, create: bool) -> Result<String> {
         let name = name.map(|name| session::clean_name(&name)).transpose()?;
-        let mut sessions = self.inner.sessions.lock().await;
+        let _loading = self.inner.loading.lock().await;
         if self.inner.closing.load(Ordering::Acquire) {
             bail!("core is shutting down");
         }
-        if let Some(name) = &name
-            && sessions.contains_key(name)
         {
-            if create {
-                bail!("session already exists: {name}");
+            let sessions = self.inner.sessions.lock().await;
+            if let Some(name) = &name
+                && sessions.contains_key(name)
+            {
+                if create {
+                    bail!("session already exists: {name}");
+                }
+                return Ok(name.clone());
             }
-            return Ok(name.clone());
         }
         let existing = name
             .as_ref()
@@ -372,17 +377,29 @@ impl Core {
         initialized
             .await
             .context("session stopped during initialization")?;
-        sessions.insert(
-            id.clone(),
-            Arc::new(LoadedSession {
-                commands,
-                hub,
-                directory,
-                task: AsyncMutex::new(Some(task)),
-                pump: AsyncMutex::new(Some(pump)),
-                _lock: lock,
-            }),
-        );
+        let loaded = Arc::new(LoadedSession {
+            commands,
+            hub,
+            directory,
+            task: AsyncMutex::new(Some(task)),
+            pump: AsyncMutex::new(Some(pump)),
+            _lock: lock,
+        });
+        let mut sessions = self.inner.sessions.lock().await;
+        if self.inner.closing.load(Ordering::Acquire) {
+            drop(sessions);
+            let (reply, result) = oneshot::channel();
+            loaded.commands.send(Command::Shutdown(reply)).await.ok();
+            result.await.ok();
+            if let Some(task) = loaded.task.lock().await.take() {
+                task.await.ok();
+            }
+            if let Some(pump) = loaded.pump.lock().await.take() {
+                pump.await.ok();
+            }
+            bail!("core is shutting down");
+        }
+        sessions.insert(id.clone(), loaded);
         Ok(id)
     }
 

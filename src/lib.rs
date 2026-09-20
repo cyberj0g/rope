@@ -3,6 +3,7 @@ pub mod config;
 pub mod core;
 pub mod file_processing;
 pub mod logging;
+pub mod mcp;
 pub mod model_catalog;
 pub mod onboarding;
 pub mod project;

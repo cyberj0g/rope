@@ -53,6 +53,9 @@ pub(super) async fn run<P: Provider + ?Sized>(
                 .ok();
         }
     }
+    for notice in tools.notices() {
+        events.send(Event::Notice(notice.clone())).await.ok();
+    }
     events.send(Event::History(messages.clone())).await.ok();
     events
         .send(Event::SessionChanged(session.display_name().to_owned()))
@@ -124,10 +127,10 @@ pub(super) async fn run<P: Provider + ?Sized>(
                     Command::Approve(decision) => {
                         if let Some(pending) = pending_approval.take() {
                             if decision == ApprovalDecision::AllowSession
-                                && !session.meta.approved_tools.contains(&pending.tool) {
-                                session.meta.approved_tools.push(pending.tool.clone());
+                                && !session.meta.approved_tools.contains(&pending.approval_key) {
+                                session.meta.approved_tools.push(pending.approval_key.clone());
                                 if let Err(failure) = session.save().await {
-                                    session.meta.approved_tools.retain(|tool| tool != &pending.tool);
+                                    session.meta.approved_tools.retain(|tool| tool != &pending.approval_key);
                                     error = Some(CommandError::new("persistence", format!("save approval: {failure:#}")));
                                 }
                             }
@@ -317,12 +320,12 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         if let Err(error) = session.save().await { events.send(Event::Notice(format!("save plan: {error:#}"))).await.ok(); }
                         events.send(Event::PlanChanged(Some(plan))).await.ok();
                     }
-                    InternalEvent::Approval { call, reply } => {
+                    InternalEvent::Approval { call, approval_key, reply } => {
                         if generation.is_none() || pending_approval.is_some() { reply.send(ApprovalDecision::Deny).ok(); }
-                        else if session.meta.approved_tools.contains(&call.name) { reply.send(ApprovalDecision::AllowSession).ok(); }
+                        else if session.meta.approved_tools.contains(&approval_key) { reply.send(ApprovalDecision::AllowSession).ok(); }
                         else {
                             let id = uuid::Uuid::new_v4().to_string();
-                            pending_approval = Some(PendingApproval { id: id.clone(), tool: call.name.clone(), reply });
+                            pending_approval = Some(PendingApproval { id: id.clone(), tool: call.name.clone(), approval_key, reply });
                             events.send(Event::ApprovalRequested { approval_id: id, call }).await.ok();
                         }
                     }

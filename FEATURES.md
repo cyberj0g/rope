@@ -76,6 +76,10 @@
 - per-tool `allow`, `ask`, and `deny` policies in `config.toml`
 - executable JSON tools discovered from `.rope/tools/` and `~/.config/rope/tools/`
 - local external tools override global tools with the same filename
+- stdio MCP servers with paginated discovery, stable provider-safe tool names,
+  include/exclude filters, environment-backed secrets, bounded startup and call
+  times, cancellation, graceful shutdown, and approval grants tied to the
+  server configuration fingerprint
 
 External tools receive their function arguments as JSON on stdin and must return
 `{"output":"..."}` on stdout.

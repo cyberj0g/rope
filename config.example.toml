@@ -35,3 +35,17 @@ org_outline = "allow"
 web_browser = "ask"
 web_search = "ask"
 external = "ask"
+mcp = "ask"
+
+# MCP servers are started once per Rope session. Project config replaces a
+# global server with the same name instead of merging their process settings.
+#[mcp.servers.files]
+#command = "npx"
+#args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#include_tools = ["read_*"]
+#exclude_tools = ["*secret*"]
+#approval = "ask"
+#[mcp.servers.files.tools]
+#read_file = "allow"
+#[mcp.servers.files.env_vars]
+#API_TOKEN = "FILES_MCP_TOKEN"
