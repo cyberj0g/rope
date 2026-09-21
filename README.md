@@ -4,13 +4,13 @@
 
 A minimalistic terminal coding agent harness in Rust. The model chats, calls tools, edits
 files, and drives a headless browser — while every one of those states is
-shown live in your terminal. 
+shown live in your terminal or the included web UI.
 
 The main focus is **observability**.
 Whether it is thinking, generating, running a tool, waiting for approval,
 or compacting context, you can watch it: streamed tool calls, per-call
-diffs, a live git pane, a live plan pane, token and cost counters, and a
-status line that reflects the current state at a glance.
+diffs, a live git pane, a live plan pane, token and cost counters, turn
+timers, and a raw provider request inspector.
 
 ## Demo
 
@@ -44,8 +44,9 @@ rope --headless --listen 127.0.0.1:8787
 ```
 
 Open `http://127.0.0.1:8787` for the included web UI — a mobile-first page
-with the same conversation rendering, tools, plans, Git pane, approvals,
-steering, and image or camera attachments as the TUI. Paste the token from the
+with conversation rendering, tools, plans, Git pane, approvals, steering,
+and image or camera attachments. Switch models and reasoning effort, search
+or delete sessions, and download files sent by the agent. Paste the token from the
 file whose path Rope prints at startup (normally `~/.config/rope/server-token`).
 You can also supply `ROPE_SERVER_TOKEN` or `--token-file PATH`. Open the served
 page over HTTP, rather than opening `web/index.html` directly.
@@ -80,7 +81,7 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
 
 - **Highly observable** - the runtime's full state (generation, tool
   execution, approvals, context fill, cost) is projected into the UI in
-  real time.
+  real time, with recorded provider requests inspectable in either UI.
 - **Integrated web search and web browsing** - built-in `web_search` and
   `web_browser` tools run against a local headless browser, so all web
   traffic stays under your control for improved privacy. Cookie popups are
@@ -125,13 +126,18 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
   with auto-generated titles, token totals, and resume via
   `rope --session NAME`, `/new`, or the `/session` picker.
 - Iterative model → tool → model execution with immediate cancellation
-  and automatic retry with backoff on transient failures.
+  that preserves completed work, and automatic retry with backoff on
+  transient failures.
 - Steering: send a message while a turn is in progress and it is injected
   into the conversation at the next model request, shown as a `Steer` message.
 - Per-tool `allow` / `ask` / `deny` approval policies in `config.toml`,
   with session-persisted decisions.
 - Built-in tools: `read`, `write`, `edit` (with per-call diffs),
-  `shell`, `search_files`, `list_files`.
+  `shell`, `shell_poll`, `shell_cancel`, `search_files`, `list_files`,
+  and `org_outline`. Long-running shell commands stream output and can be
+  polled or stopped by the model.
+- File delivery: `send_file` publishes local files in chat, with inline
+  images and downloads in the web UI and clickable file paths in the TUI.
 - Web tools: `web_search` (DuckDuckGo with Bing fallback) and
   `web_browser` (JavaScript-rendered, visible page content) over a shared
   headless browser session.
@@ -146,8 +152,11 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
   request without restarting the session; text, structured data, resource
   links, embedded text, and images are retained in tool results.
 - Context management: live context-fill tracking, bounded tool output,
-  automatic compaction with visible markers, and global/project
-  `AGENTS.md` instructions.
+  automatic compaction throughout long turns with visible summary markers,
+  manual `/compact`, and global/project `AGENTS.md` instructions.
+- Raw request inspector: open `[raw]` in either UI to search and expand the
+  recorded provider JSON, including instructions, messages, tools, and
+  model settings. Requests and total turn times survive session reloads.
 - Terminal UI: CommonMark rendering with syntax-colored code, image
   attachments (Sixel / iTerm2 / Kitty), live git status pane with a
   full-screen diff view (when the directory is a git worktree), plan pane,
