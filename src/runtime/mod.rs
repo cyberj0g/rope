@@ -24,7 +24,7 @@ use crate::{
     project::ProjectState,
     provider::{Provider, ResponseDelta, Usage},
     session::{Session, SessionMeta},
-    tool::{Approval, ExecutionPlan, ToolDefinition, ToolRegistry},
+    tool::{Approval, ExecutionPlan, PlanStatus, ToolDefinition, ToolRegistry},
 };
 pub use message::{FileContent, ImageContent, MAX_FILE_BYTES, Message, ToolCall, guess_mime_type};
 
@@ -117,10 +117,73 @@ pub struct UserPrompt {
 }
 
 impl UserPrompt {
-    /// The Steer message this prompt persists as in conversation history.
+    /// The user message this prompt starts when no turn is running.
+    pub fn user_message(self, plan: Option<&ExecutionPlan>) -> Message {
+        Message::user_with_images(
+            with_runtime_context(self.content, plan),
+            self.images,
+        )
+    }
+
+    /// The Steer message this prompt persists as in conversation history:
+    /// the raw prompt, with no runtime context pinned.
     pub fn steer_message(self) -> Message {
         Message::steer(self.content, self.images)
     }
+}
+
+/// The model-facing boundary of the runtime context pinned to a user
+/// message. A namespaced tag pair keeps the boundary parseable for the
+/// chat renderers (which hide the block) and for `strip_runtime_context`.
+const RUNTIME_CONTEXT_BEGIN: &str = "<runtime-context>";
+const RUNTIME_CONTEXT_END: &str = "</runtime-context>";
+/// The pre-tag boundary, kept so messages from older sessions still strip.
+const LEGACY_RUNTIME_CONTEXT: &str = "Runtime context:";
+
+/// The context a user message pins at send time: the current time and,
+/// while any plan step is still open, the session plan. It is appended to
+/// the message once, when the prompt is sent, and never updated afterwards
+/// — every message keeps the context it went out with, like the rest of
+/// history. The block is invisible in the chat; only the model sees it.
+fn with_runtime_context(content: String, plan: Option<&ExecutionPlan>) -> String {
+    let mut content = content;
+    if !content.is_empty() {
+        content.push_str("\n\n");
+    }
+    content.push_str(&runtime_context(plan));
+    content
+}
+
+fn runtime_context(plan: Option<&ExecutionPlan>) -> String {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M");
+    let mut context = format!("{RUNTIME_CONTEXT_BEGIN}\n- current time: {now}");
+    // The plan rides along only while work is open: every update_plan call
+    // stays in context un-compacted, so a fully completed plan adds nothing
+    // the model does not already have.
+    if let Some(plan) = plan
+        && plan.plan.iter().any(|step| step.status != PlanStatus::Completed)
+    {
+        context.push_str(&format!(
+            "\n- current plan:\n{}",
+            serde_json::to_string_pretty(plan).unwrap()
+        ));
+    }
+    context.push_str(&format!("\n{RUNTIME_CONTEXT_END}"));
+    context
+}
+
+/// The part of a user message before its pinned runtime context, if any.
+pub fn strip_runtime_context(content: &str) -> &str {
+    let mut cut = content.len();
+    for marker in [RUNTIME_CONTEXT_BEGIN, LEGACY_RUNTIME_CONTEXT] {
+        if content.starts_with(marker) {
+            return "";
+        }
+        if let Some(index) = content.find(&format!("\n\n{marker}")) {
+            cut = cut.min(index);
+        }
+    }
+    &content[..cut]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -334,10 +397,13 @@ struct PendingApproval {
     reply: oneshot::Sender<ApprovalDecision>,
 }
 
-/// Steering prompts queued for the active turn. Drained by the turn's agent
-/// at each model request and, if the turn ends first, by the runtime, which
-/// resubmits the leftovers as a fresh turn.
-type SteerQueue = Arc<Mutex<Vec<UserPrompt>>>;
+/// Steering messages queued for the active turn. The message is built
+/// when the user sends the prompt — the raw steer text, with no runtime
+/// context pinned — so what the client displays is exactly what reaches
+/// the model. Drained by the turn's agent at each model request and, if
+/// the turn ends first, by the runtime, which resubmits the leftovers as
+/// a fresh turn.
+type SteerQueue = Arc<Mutex<Vec<Message>>>;
 
 /// Persists the work an interrupted turn already completed, so the
 /// conversation continues from the real state instead of from before the
@@ -380,13 +446,7 @@ async fn persist_interrupted_turn(
     messages.extend(tail);
     // Steers queued for the turn never reached the model; persist them
     // with the turn so history keeps what the user said.
-    messages.extend(
-        pending_prompts
-            .lock()
-            .unwrap()
-            .drain(..)
-            .map(UserPrompt::steer_message),
-    );
+    messages.extend(pending_prompts.lock().unwrap().drain(..));
     messages.push(Message::system(marker.into()).with_raw_request(raw_request));
     if compacted {
         session.meta.context_tokens = estimate_tokens(&request_context(messages, &session.meta));
@@ -448,7 +508,6 @@ async fn spawn_turn<P: Provider + ?Sized>(
     let request_messages = request_context(messages, &session.meta);
     let context_tokens = session.meta.context_tokens;
     let generate_title = session.needs_title();
-    let current_plan = session.meta.plan.clone();
     let project_prompt = project.prompt().await;
     *pending_prompts = Arc::new(Mutex::new(Vec::new()));
     let steers = pending_prompts.clone();
@@ -482,7 +541,6 @@ async fn spawn_turn<P: Provider + ?Sized>(
                         context_tokens,
                         prompt,
                         generate_title,
-                        current_plan,
                         steers,
                         &progress,
                         &events,
@@ -592,65 +650,8 @@ fn request_context(messages: &[Message], meta: &SessionMeta) -> Vec<Message> {
         messages.to_vec()
     };
     eject_consumed_web_results(&mut context);
-    compact_plan_history(&mut context);
     strip_display_metadata(&mut context);
     context
-}
-
-const PLAN_CONTEXT_PREFIX: &str = "Current execution plan (keep it updated with update_plan):\n";
-
-fn apply_plan_context(messages: &mut Vec<Message>, plan: Option<&ExecutionPlan>) {
-    compact_plan_history(messages);
-    if let Some(plan) = plan {
-        messages.insert(
-            0,
-            Message::system(format!(
-                "{PLAN_CONTEXT_PREFIX}{}",
-                serde_json::to_string_pretty(plan).unwrap()
-            )),
-        );
-    }
-}
-
-fn compact_plan_history(messages: &mut [Message]) -> usize {
-    // The latest update_plan call stays un-compacted: it is the model's only
-    // in-context example of the call shape. Compacting every call taught
-    // weaker models to imitate the {"stored": true} marker instead of
-    // sending the complete plan.
-    let latest_plan_call = messages.iter().rev().find_map(|message| match message {
-        Message::Assistant { tool_calls, .. } => tool_calls
-            .iter()
-            .rev()
-            .find(|call| call.name == "update_plan")
-            .map(|call| call.id.clone()),
-        _ => None,
-    });
-    let mut call_ids = HashSet::new();
-    let mut compacted = 0;
-    for message in messages {
-        match message {
-            Message::Assistant { tool_calls, .. } => {
-                for call in tool_calls
-                    .iter_mut()
-                    .filter(|call| call.name == "update_plan")
-                {
-                    if Some(&call.id) == latest_plan_call.as_ref() {
-                        continue;
-                    }
-                    call_ids.insert(call.id.clone());
-                    call.arguments = serde_json::json!({ "stored": true });
-                }
-            }
-            Message::Tool {
-                call_id, content, ..
-            } if call_ids.remove(call_id) => {
-                *content = r#"{"stored":true,"note":"Latest plan is provided separately."}"#.into();
-                compacted += 1;
-            }
-            _ => {}
-        }
-    }
-    compacted
 }
 
 fn strip_display_metadata(messages: &mut [Message]) -> usize {
@@ -740,7 +741,6 @@ async fn turn<P: Provider + ?Sized>(
     context_tokens: u64,
     project_prompt: Option<String>,
     generate_title: bool,
-    current_plan: Option<ExecutionPlan>,
     steers: SteerQueue,
     progress: &TurnProgressHandle,
     events: &mpsc::Sender<Event>,
@@ -810,7 +810,6 @@ async fn turn<P: Provider + ?Sized>(
         persist_from,
         visible_through,
         project_prompt,
-        current_plan,
         &steers,
         progress,
         events,
@@ -1031,7 +1030,7 @@ async fn generate_session_title<P: Provider + ?Sized>(
 ) -> String {
     let fallback = fallback_session_title(messages);
     let Some(user) = messages.iter().find_map(|message| match message {
-        Message::User { content, .. } => Some(content.as_str()),
+        Message::User { content, .. } => Some(strip_runtime_context(content).to_owned()),
         _ => None,
     }) else {
         return fallback;
@@ -1144,6 +1143,7 @@ fn fallback_session_title(messages: &[Message]) -> String {
         _ => None,
     });
     content
+        .map(strip_runtime_context)
         .and_then(clean_session_title)
         .unwrap_or_else(|| "New Conversation".into())
 }
@@ -1231,7 +1231,6 @@ async fn agent<P: Provider + ?Sized>(
     persist_from: usize,
     user_full_index: usize,
     project_prompt: Option<String>,
-    mut current_plan: Option<ExecutionPlan>,
     steers: &SteerQueue,
     progress: &TurnProgressHandle,
     events: &mpsc::Sender<Event>,
@@ -1242,13 +1241,7 @@ async fn agent<P: Provider + ?Sized>(
     let mut recovered_truncation = false;
     progress.lock().unwrap().messages = messages[persist_from..].to_vec();
     loop {
-        let queued = steers
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .map(UserPrompt::steer_message)
-            .collect::<Vec<_>>();
+        let queued = steers.lock().unwrap().iter().cloned().collect::<Vec<_>>();
         let predicted =
             used_context_tokens.map(|used| used.saturating_add(estimate_tokens(&queued)));
         let max_tokens = config.active_model().max_context_tokens;
@@ -1274,12 +1267,7 @@ async fn agent<P: Provider + ?Sized>(
         // Steering prompts sent during this turn are injected here, so the
         // next model request carries them after everything delivered so
         // far — including in-flight tool results.
-        let steered = steers
-            .lock()
-            .unwrap()
-            .drain(..)
-            .map(UserPrompt::steer_message)
-            .collect::<Vec<_>>();
+        let steered = steers.lock().unwrap().drain(..).collect::<Vec<_>>();
         if !steered.is_empty() {
             events
                 .send(Event::SteersDelivered(steered.len()))
@@ -1294,7 +1282,6 @@ async fn agent<P: Provider + ?Sized>(
                 tools,
                 config,
                 project_prompt.as_deref(),
-                current_plan.as_ref(),
             );
             if available == 0 {
                 bail!("context exhausted: compaction could not free room for the next request");
@@ -1313,7 +1300,6 @@ async fn agent<P: Provider + ?Sized>(
             .ok();
         let mut request_messages = messages.clone();
         strip_display_metadata(&mut request_messages);
-        apply_plan_context(&mut request_messages, current_plan.as_ref());
         if let Some(prompt) = &project_prompt {
             request_messages.insert(0, Message::system(prompt.clone()));
         }
@@ -1354,7 +1340,6 @@ async fn agent<P: Provider + ?Sized>(
                         tools,
                         config,
                         project_prompt.as_deref(),
-                        current_plan.as_ref(),
                     ))
             },
             |usage| usage.total_tokens,
@@ -1427,7 +1412,6 @@ async fn agent<P: Provider + ?Sized>(
                     tools,
                     config,
                     project_prompt.as_deref(),
-                    current_plan.as_ref(),
                 ));
                 remaining = max_tokens.saturating_sub(used);
                 if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
@@ -1556,7 +1540,6 @@ async fn agent<P: Provider + ?Sized>(
             if success && call.name == "update_plan" {
                 let plan: ExecutionPlan =
                     serde_json::from_str(&output).context("decode normalized execution plan")?;
-                current_plan = Some(plan.clone());
                 internal.send(InternalEvent::PlanUpdated(plan)).await?;
             }
             let message = Message::Tool {
@@ -1635,11 +1618,9 @@ fn available_context_tokens(
     tools: &ToolRegistry,
     config: &Config,
     project_prompt: Option<&str>,
-    current_plan: Option<&ExecutionPlan>,
 ) -> u64 {
     let mut context = messages.to_vec();
     strip_display_metadata(&mut context);
-    apply_plan_context(&mut context, current_plan);
     if let Some(prompt) = project_prompt {
         context.insert(0, Message::system(prompt.into()));
     }
@@ -2045,7 +2026,6 @@ mod tests {
             0,
             0,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -2100,7 +2080,6 @@ mod tests {
             vec![Message::user("hi".into())],
             0,
             0,
-            None,
             None,
             &no_steers(),
             &fresh_progress(),
@@ -2160,7 +2139,6 @@ mod tests {
             vec![Message::user("run it".into())],
             0,
             0,
-            None,
             None,
             &no_steers(),
             &fresh_progress(),
@@ -2224,7 +2202,6 @@ mod tests {
             vec![Message::user("run it".into())],
             0,
             0,
-            None,
             None,
             &no_steers(),
             &fresh_progress(),
@@ -2315,7 +2292,6 @@ mod tests {
             0,
             0,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -2388,7 +2364,6 @@ mod tests {
             0,
             0,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -2438,7 +2413,6 @@ mod tests {
             0,
             0,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -2484,7 +2458,6 @@ mod tests {
             vec![Message::user("run it".into())],
             0,
             0,
-            None,
             None,
             &no_steers(),
             &fresh_progress(),
@@ -2554,7 +2527,6 @@ mod tests {
             0,
             0,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -2613,7 +2585,6 @@ mod tests {
             vec![Message::user("run it".into())],
             0,
             0,
-            None,
             None,
             &no_steers(),
             &fresh_progress(),
@@ -2683,7 +2654,6 @@ mod tests {
             vec![Message::user("keep working".into())],
             0,
             0,
-            None,
             None,
             &no_steers(),
             &progress,
@@ -2777,7 +2747,6 @@ mod tests {
             2,
             7,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -2843,7 +2812,6 @@ mod tests {
             vec![Message::user("go".into())],
             0,
             0,
-            None,
             None,
             &no_steers(),
             &fresh_progress(),
@@ -2930,7 +2898,6 @@ mod tests {
                     vec![Message::user("go".into())],
                     0,
                     0,
-                    None,
                     None,
                     &no_steers(),
                     &fresh_progress(),
@@ -3051,7 +3018,6 @@ mod tests {
             0,
             0,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -3145,87 +3111,103 @@ mod tests {
     }
 
     #[test]
-    fn model_context_keeps_only_the_latest_full_plan_call() {
-        let old_plan = serde_json::json!({
-            "plan": [{ "step": "obsolete step", "status": "completed" }]
-        });
-        let latest_plan = serde_json::json!({
-            "plan": [{ "step": "current step", "status": "in_progress" }]
-        });
-        let mut messages = vec![
-            Message::assistant(
-                String::new(),
-                "model".into(),
-                String::new(),
-                vec![ToolCall {
-                    id: "plan-1".into(),
-                    name: "update_plan".into(),
-                    arguments: old_plan.clone(),
-                }],
-            ),
-            Message::tool("plan-1".into(), old_plan.to_string(), None, None),
-            Message::assistant(
-                String::new(),
-                "model".into(),
-                String::new(),
-                vec![ToolCall {
-                    id: "plan-2".into(),
-                    name: "update_plan".into(),
-                    arguments: latest_plan.clone(),
-                }],
-            ),
-            Message::tool("plan-2".into(), latest_plan.to_string(), None, None),
-        ];
-        let current = ExecutionPlan {
-            explanation: None,
-            plan: vec![crate::tool::PlanStep {
-                step: "current step".into(),
-                status: crate::tool::PlanStatus::InProgress,
-            }],
-        };
-
-        apply_plan_context(&mut messages, Some(&current));
-        let encoded = serde_json::to_string(&messages).unwrap();
-
-        // Older calls collapse to the stored marker.
-        assert!(!encoded.contains("obsolete step"));
-        assert_eq!(
-            encoded
-                .matches("Latest plan is provided separately")
-                .count(),
-            1
-        );
-        // The latest call stays un-compacted (call args, result, and the
-        // plan system message) so the model always has a complete
-        // in-context example of the update_plan shape.
-        assert_eq!(encoded.matches("current step").count(), 3);
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|message| matches!(message, Message::System { content, .. } if content.starts_with(PLAN_CONTEXT_PREFIX)))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn plan_context_still_applies_without_any_plan_call_in_context() {
-        let mut messages = vec![Message::user("continue".into())];
-        let current = ExecutionPlan {
+    fn user_message_pins_the_runtime_context_at_send_time() {
+        let plan = ExecutionPlan {
             explanation: None,
             plan: vec![crate::tool::PlanStep {
                 step: "current step".into(),
                 status: crate::tool::PlanStatus::Pending,
             }],
         };
-
-        apply_plan_context(&mut messages, Some(&current));
-
-        let Message::System { content, .. } = &messages[0] else {
-            panic!("expected the plan system message first");
+        let message = UserPrompt {
+            content: "continue".into(),
+            images: Vec::new(),
+        }
+        .user_message(Some(&plan));
+        let Message::User { content, .. } = message else {
+            panic!("expected a user message");
         };
-        assert!(content.starts_with(PLAN_CONTEXT_PREFIX));
+        assert!(content.starts_with("continue\n\n<runtime-context>\n- current time: "));
+        assert!(content.contains("- current plan:"));
         assert!(content.contains("current step"));
+        assert!(content.ends_with("\n</runtime-context>"));
+        assert_eq!(strip_runtime_context(&content), "continue");
+    }
+
+    #[test]
+    fn user_message_omits_the_plan_when_all_steps_are_completed() {
+        let plan = ExecutionPlan {
+            explanation: None,
+            plan: vec![crate::tool::PlanStep {
+                step: "done step".into(),
+                status: crate::tool::PlanStatus::Completed,
+            }],
+        };
+        let message = UserPrompt {
+            content: "next".into(),
+            images: Vec::new(),
+        }
+        .user_message(Some(&plan));
+        let Message::User { content, .. } = message else {
+            panic!("expected a user message");
+        };
+        // A fully completed plan is already fully in context as
+        // update_plan calls, so it is not pinned again.
+        assert!(content.starts_with("next\n\n<runtime-context>\n- current time: "));
+        assert!(!content.contains("- current plan:"));
+        assert_eq!(strip_runtime_context(&content), "next");
+    }
+
+    #[test]
+    fn strip_runtime_context_handles_legacy_and_edge_forms() {
+        // Legacy sessions pinned a bare "Runtime context:" line.
+        assert_eq!(
+            strip_runtime_context("hi\n\nRuntime context:\n- current time: 2026-01-01 00:00"),
+            "hi"
+        );
+        // An image-only prompt has no leading text: the block is the whole
+        // message and the visible part is empty.
+        let message = UserPrompt {
+            content: String::new(),
+            images: Vec::new(),
+        }
+        .user_message(None);
+        let Message::User { content, .. } = message else {
+            panic!("expected a user message");
+        };
+        assert!(content.starts_with("<runtime-context>"));
+        assert_eq!(strip_runtime_context(&content), "");
+        // Plain messages pass through untouched.
+        assert_eq!(strip_runtime_context("plain text"), "plain text");
+    }
+
+    #[test]
+    fn user_message_without_a_plan_pins_only_the_time() {
+        let message = UserPrompt {
+            content: "hi".into(),
+            images: Vec::new(),
+        }
+        .user_message(None);
+        let Message::User { content, .. } = message else {
+            panic!("expected a user message");
+        };
+        assert!(!content.contains("- current plan:"));
+        assert!(content.contains("<runtime-context>\n- current time: "));
+        assert_eq!(strip_runtime_context(&content), "hi");
+    }
+
+    #[test]
+    fn steer_message_carries_no_runtime_context() {
+        let message = UserPrompt {
+            content: "stay focused".into(),
+            images: Vec::new(),
+        }
+        .steer_message();
+        let Message::Steer { content, .. } = message else {
+            panic!("expected a steer message");
+        };
+        assert_eq!(content, "stay focused");
+        assert!(!content.contains("<runtime-context>"));
     }
 
     #[test]
@@ -3404,7 +3386,6 @@ mod tests {
             1800,
             None,
             false,
-            None,
             no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -3476,7 +3457,6 @@ mod tests {
             1000,
             None,
             false,
-            None,
             no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -3936,7 +3916,6 @@ mod tests {
             0,
             0,
             None,
-            None,
             &no_steers(),
             &fresh_progress(),
             &event_tx,
@@ -4014,10 +3993,13 @@ mod tests {
         let mut tools = ToolRegistry::default();
         tools.insert(Echo, Approval::Allow);
         let steers = no_steers();
-        steers.lock().unwrap().push(UserPrompt {
-            content: "focus on the tests".into(),
-            images: Vec::new(),
-        });
+        steers.lock().unwrap().push(
+            UserPrompt {
+                content: "focus on the tests".into(),
+                images: Vec::new(),
+            }
+            .steer_message(),
+        );
         let (event_tx, event_rx) = mpsc::channel(16);
         // Never read: drop the receiver so event sends fail fast instead
         // of blocking once the buffer fills.
@@ -4031,9 +4013,7 @@ mod tests {
             vec![Message::user("run it".into())],
             0,
             0,
-            None,
-            None,
-            &steers,
+            None,                        &steers,
             &fresh_progress(),
             &event_tx,
             &internal_tx,
@@ -4087,9 +4067,7 @@ mod tests {
                     vec![Message::user("run it".into())],
                     0,
                     0,
-                    None,
-                    None,
-                    &steers,
+                    None,                                        &steers,
                     &fresh_progress(),
                     &events,
                     &internal,
@@ -4101,10 +4079,13 @@ mod tests {
         // Well past the first request, mid-tool-run: the steer must not
         // re-request what already went out, only the next delivery.
         tokio::time::sleep(Duration::from_millis(10)).await;
-        steers.lock().unwrap().push(UserPrompt {
-            content: "also fix the docs".into(),
-            images: Vec::new(),
-        });
+        steers.lock().unwrap().push(
+            UserPrompt {
+                content: "also fix the docs".into(),
+                images: Vec::new(),
+            }
+            .steer_message(),
+        );
         agent_task.await.unwrap().unwrap();
 
         let requests = provider.requests();
@@ -4116,7 +4097,8 @@ mod tests {
                 .any(|message| matches!(message, Message::Steer { .. }))
         );
         assert!(requests[1].messages.iter().any(|message| {
-            matches!(message, Message::Steer { content, .. } if content == "also fix the docs")
+            matches!(message, Message::Steer { content, .. }
+                if content == "also fix the docs")
         }));
     }
 
@@ -4242,7 +4224,8 @@ mod tests {
         // identity as the UI rendered it.
         let resubmitted = &requests[2].messages;
         assert!(resubmitted.last().is_some_and(|message| {
-            matches!(message, Message::Steer { content, .. } if content == "steered")
+            matches!(message, Message::Steer { content, .. }
+                if content == "steered")
         }));
     }
 
@@ -4573,7 +4556,9 @@ mod tests {
         // followed by the fresh turn's own user + assistant messages.
         let (_, messages) = Session::resume_in(root.clone(), "cancel").await.unwrap();
         assert_eq!(messages.len(), 7);
-        assert!(matches!(&messages[0], Message::User { content, .. } if content == "go"));
+        assert!(
+            matches!(&messages[0], Message::User { content, .. } if content.starts_with("go\n\n<runtime-context>"))
+        );
         assert!(
             matches!(&messages[1], Message::Assistant { tool_calls, duration_ms, .. }
             if tool_calls.len() == 1 && tool_calls[0].id == "call_1" && duration_ms.is_none())
@@ -4582,11 +4567,17 @@ mod tests {
             matches!(&messages[2], Message::Tool { call_id, content, .. }
             if call_id == "call_1" && content == "done")
         );
-        assert!(matches!(&messages[3], Message::Steer { content, .. } if content == "keep going"));
+        assert!(
+            matches!(&messages[3], Message::Steer { content, .. }
+                if content == "keep going")
+        );
         assert!(
             matches!(&messages[4], Message::System { content, .. } if content == CANCELLED_BY_USER)
         );
-        assert!(matches!(&messages[5], Message::User { content, .. } if content == "continue"));
+        assert!(
+            matches!(&messages[5], Message::User { content, .. }
+                if content.starts_with("continue\n\n<runtime-context>"))
+        );
         assert!(
             matches!(&messages[6], Message::Assistant { content, duration_ms, .. }
                 if content == "continued answer" && duration_ms.is_some())
@@ -4610,7 +4601,8 @@ mod tests {
             .expect("the cancellation marker left the next context");
         let seen_continue = next
             .iter()
-            .position(|m| matches!(m, Message::User { content, .. } if content == "continue"))
+            .position(|m| matches!(m, Message::User { content, .. }
+                if content.starts_with("continue\n\n<runtime-context>")))
             .expect("the fresh prompt is in the context");
         assert!(seen_tool < seen_marker);
         assert!(seen_marker < seen_continue);

@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::Local;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
@@ -51,9 +50,7 @@ impl ProjectState {
         } else {
             None
         };
-        let now = Local::now().format("%Y-%m-%d %H:%M").to_string();
         Ok(Some(compose_prompt(
-            &now,
             &self.cwd,
             global.as_deref(),
             project.as_deref(),
@@ -87,16 +84,8 @@ impl ProjectState {
     }
 }
 
-fn compose_prompt(
-    now: &str,
-    cwd: &Path,
-    global: Option<&str>,
-    project: Option<&str>,
-) -> String {
-    let mut sections = vec![
-        format!("Current date and time: {now}"),
-        format!("Current working directory: {}", cwd.display()),
-    ];
+fn compose_prompt(cwd: &Path, global: Option<&str>, project: Option<&str>) -> String {
+    let mut sections = vec![format!("Current working directory: {}", cwd.display())];
     if let Some(instructions) = global {
         sections.push(format!(
             "Global instructions (~/.config/rope/AGENTS.md):\n{instructions}"
@@ -197,18 +186,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_always_includes_the_current_date_and_working_directory() {
+    fn prompt_includes_the_working_directory_without_the_date() {
         assert_eq!(
-            compose_prompt("2026-08-28 14:05", Path::new("/project"), None, None),
-            "Current date and time: 2026-08-28 14:05\n\nCurrent working directory: /project"
+            compose_prompt(Path::new("/project"), None, None),
+            "Current working directory: /project"
         );
     }
 
     #[test]
-    fn prompt_places_the_date_and_directory_before_agent_instructions() {
+    fn prompt_places_the_directory_before_agent_instructions() {
         assert_eq!(
-            compose_prompt("2026-08-28 14:05", Path::new("/project"), Some("global"), Some("project")),
-            "Current date and time: 2026-08-28 14:05\n\nCurrent working directory: /project\n\nGlobal instructions (~/.config/rope/AGENTS.md):\nglobal\n\nProject instructions (AGENTS.md):\nproject"
+            compose_prompt(Path::new("/project"), Some("global"), Some("project")),
+            "Current working directory: /project\n\nGlobal instructions (~/.config/rope/AGENTS.md):\nglobal\n\nProject instructions (AGENTS.md):\nproject"
         );
     }
 

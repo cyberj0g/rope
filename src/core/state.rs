@@ -300,7 +300,10 @@ impl Projection {
                     } else {
                         BlockKind::User
                     };
-                    let mut block = self.block(kind, content.clone());
+                    // The model-facing runtime context pinned to the message
+                    // never renders in the chat.
+                    let content = crate::runtime::strip_runtime_context(content).to_owned();
+                    let mut block = self.block(kind, content);
                     block.images = images.clone();
                     self.push(block, changes);
                 }

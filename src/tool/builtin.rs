@@ -1565,9 +1565,7 @@ impl Tool for UpdatePlanTool {
         if !args.get("plan").is_some_and(Value::is_array) {
             bail!(
                 "missing `plan`: send the complete plan on every update — a non-empty array of \
-                {{\"step\": string, \"status\": \"pending\" | \"in_progress\" | \"completed\"}} objects. \
-                {{\"stored\": true}} is only the marker history shows for already-stored plans; \
-                it does not update the plan"
+                {{\"step\": string, \"status\": \"pending\" | \"in_progress\" | \"completed\"}} objects"
             );
         }
         let mut plan: ExecutionPlan = serde_json::from_value(args)?;

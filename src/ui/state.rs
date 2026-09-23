@@ -855,7 +855,7 @@ impl UiState {
     pub fn push_user_with_images(&mut self, content: String, images: Vec<ImageContent>) {
         self.push_block(ChatBlock::Message {
             label: "You".into(),
-            content,
+            content: crate::runtime::strip_runtime_context(&content).to_owned(),
             images,
             model: String::new(),
             kind: MessageKind::User,
@@ -868,7 +868,7 @@ impl UiState {
     pub fn push_steer_with_images(&mut self, content: String, images: Vec<ImageContent>) {
         self.push_block(ChatBlock::Message {
             label: "Steer".into(),
-            content,
+            content: crate::runtime::strip_runtime_context(&content).to_owned(),
             images,
             model: String::new(),
             kind: MessageKind::Steer,
@@ -1937,7 +1937,7 @@ impl UiState {
                 }
                 Message::User { content, images } => self.push_block(ChatBlock::Message {
                     label: "You".into(),
-                    content,
+                    content: crate::runtime::strip_runtime_context(&content).to_owned(),
                     images,
                     model: String::new(),
                     kind: MessageKind::User,
@@ -1947,7 +1947,7 @@ impl UiState {
                 }),
                 Message::Steer { content, images } => self.push_block(ChatBlock::Message {
                     label: "Steer".into(),
-                    content,
+                    content: crate::runtime::strip_runtime_context(&content).to_owned(),
                     images,
                     model: String::new(),
                     kind: MessageKind::Steer,

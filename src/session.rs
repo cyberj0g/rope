@@ -484,7 +484,10 @@ async fn first_user_message(path: &Path) -> Option<String> {
     data.lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| match serde_json::from_str::<Message>(line) {
-            Ok(Message::User { content, .. }) if !content.trim().is_empty() => Some(content),
+            Ok(Message::User { content, .. }) => {
+                let content = crate::runtime::strip_runtime_context(&content);
+                (!content.trim().is_empty()).then(|| content.to_owned())
+            }
             _ => None,
         })
         .next()

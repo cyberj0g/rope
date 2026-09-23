@@ -393,7 +393,8 @@ async fn mid_turn_compaction_preserves_steering_and_the_saved_boundary() {
 
         let continuation = harness.next().await;
         assert!(continuation.request.messages.iter().any(|message| {
-            matches!(message, Message::Steer { content, .. } if content == "also check the tests")
+            matches!(message, Message::Steer { content, .. }
+                if content == "also check the tests")
         }));
         assert!(
             !continuation
@@ -428,12 +429,14 @@ async fn mid_turn_compaction_preserves_steering_and_the_saved_boundary() {
         );
         assert_eq!(session.meta.compacted_through, 4);
         assert!(
-            matches!(&messages[1], Message::User { content, .. } if content == "read the note and continue")
+            matches!(&messages[1], Message::User { content, .. }
+                if content.starts_with("read the note and continue\n\n<runtime-context>"))
         );
         assert!(matches!(&messages[3], Message::Tool { .. }));
         let remaining = &messages[session.meta.compacted_through..];
         assert!(
-            matches!(&remaining[0], Message::Steer { content, .. } if content == "also check the tests")
+            matches!(&remaining[0], Message::Steer { content, .. }
+                if content == "also check the tests")
         );
         assert_eq!(remaining.len(), 2);
         if cancel {
@@ -751,7 +754,7 @@ async fn raw_requests_are_lazy_historical_and_survive_compaction_and_restart() {
     let second = cancelled
         .blocks
         .iter()
-        .find(|b| b.content == "second prompt")
+        .find(|b| b.content.starts_with("second prompt"))
         .unwrap();
     let second_raw = harness.core.raw_request(&id, &second.id).await.unwrap();
     assert!(second_raw.to_string().contains("summary of first prompt"));
@@ -784,7 +787,7 @@ async fn raw_requests_are_lazy_historical_and_survive_compaction_and_restart() {
         let block = restored
             .blocks
             .iter()
-            .find(|b| b.content == content)
+            .find(|b| b.content.starts_with(content))
             .unwrap();
         assert_eq!(
             expected,

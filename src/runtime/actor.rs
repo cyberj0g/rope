@@ -97,10 +97,15 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         if compacting.is_some() {
                             error = Some(CommandError::new("busy", "manual compaction is running"));
                         } else if generation.is_some() {
-                            events.send(Event::MessageAccepted(prompt.clone().steer_message())).await.ok();
-                            pending_prompts.lock().unwrap().push(prompt);
+                            // The steer message is the raw prompt — no
+                            // runtime context is pinned to steers — and
+                            // that exact message is what gets queued and
+                            // persisted.
+                            let steer = prompt.steer_message();
+                            events.send(Event::MessageAccepted(steer.clone())).await.ok();
+                            pending_prompts.lock().unwrap().push(steer);
                         } else {
-                            let first = Message::user_with_images(prompt.content, prompt.images);
+                            let first = prompt.user_message(session.meta.plan.as_ref());
                             events.send(Event::MessageAccepted(first.clone())).await.ok();
                             spawn_turn(&mut generation, &mut pending_prompts, &mut messages,
                                 &mut session, &project, &provider, &tools, &config, first,
@@ -292,7 +297,7 @@ pub(super) async fn run<P: Provider + ?Sized>(
                             let first = steered.remove(0);
                             events.send(Event::SteersDelivered(1)).await.ok();
                             spawn_turn(&mut generation, &mut pending_prompts, &mut messages, &mut session,
-                                &project, &provider, &tools, &config, first.steer_message(), &events, &internal_tx).await;
+                                &project, &provider, &tools, &config, first, &events, &internal_tx).await;
                             pending_prompts.lock().unwrap().extend(steered);
                         }
                     }

@@ -367,7 +367,10 @@ impl Core {
                         }) = &event
                             && entry.info.first_message.is_none()
                         {
-                            entry.info.first_message = Some(content.clone());
+                            let first = crate::runtime::strip_runtime_context(content);
+                            if !first.is_empty() {
+                                entry.info.first_message = Some(first.to_owned());
+                            }
                         }
                     }
                     catalog.publish();

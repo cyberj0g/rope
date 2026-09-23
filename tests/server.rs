@@ -372,7 +372,16 @@ async fn arbitrary_uploads_reach_the_model_and_stay_session_scoped() {
         })
         .unwrap();
     assert!(images.is_empty());
-    let uploaded: FileContent = serde_json::from_str(content.split_once("Attached file: ").unwrap().1).unwrap();
+    let uploaded: FileContent = serde_json::from_str(
+        content
+            .split_once("Attached file: ")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(std::path::Path::new(&uploaded.path).file_name().unwrap(), name);
     #[cfg(unix)]
     assert!(uploaded.path.starts_with("/tmp/rope-upload-"));

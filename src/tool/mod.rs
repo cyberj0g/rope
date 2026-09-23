@@ -469,7 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_plan_rejects_the_stored_history_marker() {
+    async fn update_plan_rejects_a_call_without_a_plan_array() {
         let error = UpdatePlanTool
             .run(serde_json::json!({ "stored": true }))
             .await
@@ -477,6 +477,5 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("missing `plan`"));
         assert!(message.contains("complete plan"));
-        assert!(message.contains("\"stored\": true"));
     }
 }
