@@ -42,6 +42,7 @@
     <div id="main" style="flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;position:relative;">
       <div id="topbar">
         <button class="iconbtn" id="tbMenu" aria-label="Conversations"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+        <button class="iconbtn" id="tbParent" aria-label="Back to parent chat" hidden>←</button>
         <div id="tbTitle">
           <span id="tbName">Rope</span>
           <span id="tbPhase" class="idle"><span class="dot"></span><span id="tbPhaseText">connecting…</span></span>
@@ -49,6 +50,7 @@
         <button class="chip" id="chipPlan" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6h11M9 12h11M9 18h11"/><path d="m4 5 1 1 2-2M4 11l1 1 2-2M4 17l1 1 2-2"/></svg><b id="chipPlanText">Plan</b></button>
         <button class="chip" id="chipGit" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7M15.6 9.5 8.5 16"/></svg><b id="chipGitText">Git</b></button>
         <button class="chip" id="chipModel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/></svg><b id="chipModelText">model</b></button>
+        <button class="chip" id="chipAgent"><b id="chipAgentText">Assistant</b></button>
         <button class="iconbtn" id="tbSearch" aria-label="Search chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>
       </div>
 

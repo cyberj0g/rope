@@ -2,7 +2,10 @@ use std::{path::Path, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use tokio::{io::{AsyncRead, AsyncReadExt}, process::Command};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+};
 
 const MAX_PREVIEW_BYTES: usize = 16 * 1024;
 
@@ -14,13 +17,17 @@ pub trait FileProcessor: Send + Sync {
 }
 
 pub async fn preview(path: &Path, processors: &[&dyn FileProcessor]) -> Option<String> {
-    let processor = processors.iter().find(|processor| processor.accepts(path))?;
+    let processor = processors
+        .iter()
+        .find(|processor| processor.accepts(path))?;
     let result = tokio::time::timeout(Duration::from_secs(10), processor.process(path)).await;
     let text = match result {
         Ok(Ok(mut text)) => {
             if text.len() > MAX_PREVIEW_BYTES {
                 let mut end = MAX_PREVIEW_BYTES;
-                while !text.is_char_boundary(end) { end -= 1; }
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
                 text.truncate(end);
                 text.push_str("\n[preview truncated; use the file path for the full content]");
             }
@@ -29,7 +36,10 @@ pub async fn preview(path: &Path, processors: &[&dyn FileProcessor]) -> Option<S
         Ok(Err(error)) => format!("preview unavailable: {error:#}"),
         Err(_) => "preview unavailable: processing exceeded 10 seconds".into(),
     };
-    Some(format!("Automatic file preview ({}):\n{text}", processor.name()))
+    Some(format!(
+        "Automatic file preview ({}):\n{text}",
+        processor.name()
+    ))
 }
 
 pub struct ArchiveListing;
@@ -37,16 +47,24 @@ pub struct PdfText;
 
 #[async_trait]
 impl FileProcessor for ArchiveListing {
-    fn name(&self) -> &str { "archive listing" }
+    fn name(&self) -> &str {
+        "archive listing"
+    }
 
     fn accepts(&self, path: &Path) -> bool {
         let name = path.to_string_lossy().to_ascii_lowercase();
-        [".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"]
-            .iter().any(|suffix| name.ends_with(suffix))
+        [
+            ".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+        ]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
     }
 
     async fn process(&self, path: &Path) -> Result<String> {
-        let mut command = if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("zip")) {
+        let mut command = if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
             let mut command = Command::new("unzip");
             command.args(["-Z", "-1"]);
             command
@@ -62,15 +80,21 @@ impl FileProcessor for ArchiveListing {
 
 #[async_trait]
 impl FileProcessor for PdfText {
-    fn name(&self) -> &str { "PDF text" }
+    fn name(&self) -> &str {
+        "PDF text"
+    }
 
     fn accepts(&self, path: &Path) -> bool {
-        path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
     }
 
     async fn process(&self, path: &Path) -> Result<String> {
         let mut command = Command::new("pdftotext");
-        command.args(["-layout", "-enc", "UTF-8"]).arg(path).arg("-");
+        command
+            .args(["-layout", "-enc", "UTF-8"])
+            .arg(path)
+            .arg("-");
         let text = command_text(command).await?;
         if text.trim().is_empty() {
             return Ok("No embedded text found; this PDF may need OCR.".into());
@@ -86,9 +110,17 @@ async fn read_limited(reader: impl AsyncRead + Unpin, limit: usize) -> Result<Ve
 }
 
 async fn command_text(mut command: Command) -> Result<String> {
-    let program = command.as_std().get_program().to_string_lossy().into_owned();
-    let mut child = command.kill_on_drop(true).stdin(Stdio::null())
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let mut child = command
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .with_context(|| format!("start {program}; install it to enable this preview"))?;
     let (stdout, stderr) = tokio::try_join!(
         read_limited(child.stdout.take().unwrap(), MAX_PREVIEW_BYTES + 1),
@@ -112,9 +144,15 @@ mod tests {
 
     #[async_trait]
     impl FileProcessor for LongPreview {
-        fn name(&self) -> &str { "test" }
-        fn accepts(&self, _: &Path) -> bool { true }
-        async fn process(&self, _: &Path) -> Result<String> { Ok("é".repeat(MAX_PREVIEW_BYTES)) }
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn accepts(&self, _: &Path) -> bool {
+            true
+        }
+        async fn process(&self, _: &Path) -> Result<String> {
+            Ok("é".repeat(MAX_PREVIEW_BYTES))
+        }
     }
 
     #[tokio::test]
@@ -135,7 +173,9 @@ mod tests {
         header.set_size(5);
         header.set_mode(0o644);
         header.set_cksum();
-        archive.append_data(&mut header, "nested/notes.txt", &b"hello"[..]).unwrap();
+        archive
+            .append_data(&mut header, "nested/notes.txt", &b"hello"[..])
+            .unwrap();
         archive.finish().unwrap();
         let text = preview(&path, &[&ArchiveListing]).await.unwrap();
         assert!(text.contains("nested/notes.txt"), "{text}");

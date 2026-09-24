@@ -58,6 +58,32 @@ function renderPlanSheet() {
   fillPlanBody(body, S.selected && S.sessions.get(S.selected)?.plan);
 }
 
+function openAgentPicker() {
+  const st = S.selected && S.sessions.get(S.selected)?.state;
+  openSheet("Agent", body => {
+    body.innerHTML = '<div class="sheet-search"><input id="agentFilter" placeholder="Search agents" autocomplete="off"></div><div id="agentList"></div><div class="sheet-note">Switching agents requires an idle chat.</div>';
+    const list = $("agentList");
+    const draw = query => {
+      list.innerHTML = "";
+      for (const agent of S.agents.filter(a => !query || `${a.id} ${a.name} ${a.description}`.toLowerCase().includes(query))) {
+        const row = document.createElement("button");
+        row.className = "srow agent-row";
+        row.innerHTML = `<div class="t"><div class="n">${esc(agent.name)}</div><div class="s">${esc(agent.description)}${agent.model ? ` · ${esc(agent.model)}` : ""}</div></div>${st && agent.id === (st.agent || "assistant") ? '<span class="badge">current</span>' : ""}`;
+        row.onclick = () => {
+          if (!st) return closeSheet();
+          command({ type: "set_agent", agent: agent.id, revision: st.settings_revision })
+            .then(closeSheet).catch(e => toast(e.message, "err"));
+        };
+        list.appendChild(row);
+      }
+    };
+    $("agentFilter").oninput = e => draw(e.target.value.toLowerCase());
+    draw("");
+    $("agentFilter").focus();
+  });
+}
+$("chipAgent").onclick = openAgentPicker;
+
 $("chipModel").onclick = () => {
   const st = S.selected && S.sessions.get(S.selected)?.state;
   openSheet("Model & reasoning", body => {
@@ -169,4 +195,4 @@ $("chipPlan").onclick = () => {
   openSheet("Plan", body => fillPlanBody(body, S.selected && S.sessions.get(S.selected)?.plan));
 };
 
-export { openSheet, closeSheet, openDiffSheet, fillPlanBody, renderPlanSheet };
+export { openSheet, closeSheet, openDiffSheet, fillPlanBody, renderPlanSheet, openAgentPicker };

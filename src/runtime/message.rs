@@ -100,6 +100,9 @@ pub enum Message {
         /// prompt to the final response. Set on the turn's final message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+        /// The agent that produced this response. Older messages have none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     Tool {
         call_id: String,
@@ -118,6 +121,126 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+}
+
+/// Terminal state of one `subagent` invocation.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Completed,
+    /// The child's turn was cancelled by the user; the caller continues.
+    UserCancelled,
+    Failed,
+    /// The process restarted while the invocation was in flight; the
+    /// record is reconciled at load time and never restarted.
+    Interrupted,
+}
+
+/// The structured result of one `subagent` tool call. The control fields
+/// (`session_id`, `agent`, `status`) are structured metadata, never inferred
+/// from displayed output, and survive the runtime's output limits — only
+/// the `response` / `error` text may be truncated.
+#[derive(Clone, Debug, Serialize)]
+pub struct SubagentOutcome {
+    pub session_id: Option<String>,
+    pub agent: String,
+    pub status: SubagentStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+}
+
+impl SubagentOutcome {
+    pub fn new(agent: impl Into<String>, status: SubagentStatus) -> Self {
+        Self {
+            session_id: None,
+            agent: agent.into(),
+            status,
+            response: None,
+            error: None,
+            message: None,
+            tokens: None,
+        }
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self.status,
+            SubagentStatus::Failed | SubagentStatus::Interrupted
+        )
+    }
+
+    pub fn json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
+    }
+}
+
+/// Shrinks a `subagent` result to at most `max_bytes` while keeping it valid
+/// JSON: the long text fields are cut (keeping the tail) until the control
+/// fields plus whatever fits remain. Returns the input unchanged when it is
+/// not a JSON object.
+pub fn bounded_subagent_json(json: &str, max_bytes: usize) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(json) else {
+        return json.to_owned();
+    };
+    let total = |value: &Value| {
+        serde_json::to_string(value)
+            .map(|v| v.len())
+            .unwrap_or(usize::MAX)
+    };
+    if total(&value) <= max_bytes {
+        return json.to_owned();
+    }
+    let string_len = |text: &str| serde_json::to_string(text).map(|v| v.len()).unwrap_or(0);
+    for field in ["response", "error", "message"] {
+        // Phase 1: pull the field's text out (ends the mutable borrow).
+        let Some(original) = ({
+            let object = match value.as_object_mut() {
+                Some(object) => object,
+                None => break,
+            };
+            match object.get_mut(field) {
+                Some(Value::String(text)) => Some(std::mem::take(text)),
+                _ => None,
+            }
+        }) else {
+            continue;
+        };
+        // Phase 2: compute the serialized size of the document with this
+        // field set to "", so we can budget the remaining bytes.
+        let base = total(&value).saturating_sub(string_len(""));
+        let fits =
+            |chars: &[char]| base + string_len(&chars.iter().collect::<String>()) <= max_bytes;
+        let mut chars: Vec<char> = original.chars().collect();
+        while !fits(&chars) && chars.len() > 24 {
+            let half = chars.len() / 2;
+            chars.drain(half.saturating_sub(12)..half + 12);
+        }
+        if !fits(&chars) {
+            chars.truncate(24);
+        }
+        if !chars.is_empty() {
+            chars.insert(0, '…');
+        }
+        while !fits(&chars) && chars.len() > 1 {
+            chars.pop();
+        }
+        // Phase 3: write the (possibly truncated) text back.
+        if let Some(object) = value.as_object_mut()
+            && let Some(Value::String(text)) = object.get_mut(field)
+        {
+            *text = chars.into_iter().collect();
+        }
+        if total(&value) <= max_bytes {
+            break;
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| json.to_owned())
 }
 
 impl Message {
@@ -155,6 +278,7 @@ impl Message {
             tool_calls,
             response_items: Vec::new(),
             duration_ms: None,
+            agent: None,
         }
     }
     pub fn assistant_response(
@@ -172,7 +296,16 @@ impl Message {
             tool_calls,
             response_items,
             duration_ms: None,
+            agent: None,
         }
+    }
+    /// Tags the response with the agent that produced it, for historical
+    /// attribution across agent switches.
+    pub fn with_agent(mut self, agent: String) -> Self {
+        if let Self::Assistant { agent: slot, .. } = &mut self {
+            *slot = Some(agent);
+        }
+        self
     }
     pub fn with_raw_request(mut self, id: Option<String>) -> Self {
         match &mut self {

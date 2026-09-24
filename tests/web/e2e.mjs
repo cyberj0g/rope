@@ -94,7 +94,8 @@ function makePng(width, height) {
 /* ---------- e2e server ---------- */
 function startServer(port) {
   const bin = path.join(repoRoot, "target", "debug", "examples", "e2e_server");
-  if (!fs.existsSync(bin)) spawnSync("cargo", ["build", "--example", "e2e_server"], { cwd: repoRoot, stdio: "inherit" });
+  const built = spawnSync("cargo", ["build", "--locked", "--example", "e2e_server"], { cwd: repoRoot, stdio: "inherit" });
+  if (built.status !== 0) throw new Error("failed to build the e2e server");
   const child = spawn(bin, [], {
     cwd: repoRoot,
     env: { ...process.env, ROPE_E2E_PORT: String(port || 0), ROPE_E2E_TOKEN: "e2e-token" },
@@ -1121,8 +1122,8 @@ try {
   });
   await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.reasoning_effort === "low"`,
     "reasoning effort switched to low", 10000);
-  const stripLow = await page.evaluate(() => document.getElementById("stripModel").textContent);
-  if (!stripLow.endsWith("· low")) fail("status strip does not show the current reasoning effort: " + stripLow);
+  await waitFor(page, () => document.getElementById("stripModel").textContent.endsWith("· low"),
+    "status strip shows the current reasoning effort");
   await page.click("#chipModel");
   await waitFor(page, () => document.getElementById("sheetWrap").classList.contains("on"), "model sheet back to medium");
   await page.evaluate(() => {
@@ -1200,6 +1201,31 @@ try {
   });
   await waitForMain(`window.__rope.state.catalogTotal >= 30`, "filter reset restored the full catalog", 15000);
   ok(`pagination: ${pageState.rows}/${pageState.total} loaded, Load more -> ${rows2} rows, filter matched a page-2 row server-side`);
+
+  console.log("30. agents: selection, delegated child chat, and parent navigation");
+  await page.click("#newChat");
+  await waitFor(page, idleProbe, "new agent chat ready");
+  await page.click("#chipAgent");
+  await waitFor(page, () => document.getElementById("agentList")?.children.length >= 2, "agent picker rows");
+  await page.evaluate(() => [...document.querySelectorAll("#agentList .srow")]
+    .find(row => row.querySelector(".n")?.textContent === "Review")?.click());
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.agent === "review"`, "review agent selected");
+  await page.fill("#input", "/agent assistant");
+  await page.keyboard.press("Enter");
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.state?.agent == null`, "assistant restored by /agent");
+  await sendPrompt(page, "rope-e2e-agent");
+  await waitFor(page, () => !!document.querySelector(".subagent-card button"), "subagent card opens chat");
+  if (!(await page.locator(".subagent-card small").textContent()).includes("rope-e2e-agent-child")) fail("subagent task preview is missing");
+  const rootAgentSession = await mainEval("window.__rope.state.selected");
+  await page.click(".subagent-card button");
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.parent?.session === __a`, "child chat with parent link", 10000, rootAgentSession);
+  await waitFor(page, () => document.getElementById("chatInner")?.textContent?.includes("Child review is complete."), "child answer visible");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await waitForMain(`window.__rope.state.sessions.get(window.__rope.state.selected)?.parent?.session === __a`, "child chat restored after reload", 10000, rootAgentSession);
+  await page.click("#tbParent");
+  await waitForMain(`window.__rope.state.selected === __a`, "returned to parent chat", 10000, rootAgentSession);
+  await shot(page, "25-agent.png");
+  ok("agent picker, /agent, child chat, reload, and parent navigation work");
 
   if (pageErrors.length) {
     fail("page errors: " + pageErrors.slice(0, 3).join(" | "));

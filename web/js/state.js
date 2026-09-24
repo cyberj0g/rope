@@ -16,6 +16,7 @@ const S = {
   requestId: 0,
   socket: null,
   models: [],
+  agents: [],
   projectRoot: "",
   project: null,
   catalog: [],

@@ -32,28 +32,57 @@ pub enum Action {
         effort: Option<ReasoningEffort>,
         revision: u64,
     },
+    /// Switches the session's agent. Requires the session to be idle and
+    /// carries the settings revision for optimistic concurrency, like
+    /// model changes.
+    SetAgent {
+        agent: String,
+        revision: u64,
+    },
     Compact,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    CreateSession { name: Option<String> },
+    CreateSession {
+        name: Option<String>,
+    },
     /// Permanently removes a session: its transcript, attachments, and metadata.
-    DeleteSession { session_id: String },
-    Subscribe { session_id: String },
-    Unsubscribe { session_id: String },
-    Command { session_id: String, action: Action },
-    GitDiff { path: Option<String> },
+    DeleteSession {
+        session_id: String,
+    },
+    Subscribe {
+        session_id: String,
+    },
+    Unsubscribe {
+        session_id: String,
+    },
+    Command {
+        session_id: String,
+        action: Action,
+    },
+    GitDiff {
+        path: Option<String>,
+    },
     /// Serves the catalog through this connection's window: at most `offset`
     /// entries, starting from the first, of the sessions matching `query`
     /// (which searches every session on the server, not only the loaded ones).
     /// Every later catalog push reuses the same query and window.
-    CatalogView { query: Option<String>, offset: usize },
+    CatalogView {
+        query: Option<String>,
+        offset: usize,
+    },
     /// Delivers the full content of a block that was withheld while
     /// collapsed; the connection keeps receiving its live updates afterwards.
-    RevealBlock { session_id: String, block_id: String },
-    RawRequest { session_id: String, block_id: String },
+    RevealBlock {
+        session_id: String,
+        block_id: String,
+    },
+    RawRequest {
+        session_id: String,
+        block_id: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +130,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Accepted {
     pub turn_id: Option<String>,
     pub settings_revision: u64,
+    /// Set when the message was not handled by the addressed session but
+    /// forwarded as a steer to the descendant its active delegation was
+    /// waiting on: the receipt's destination session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_to: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

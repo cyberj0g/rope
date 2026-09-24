@@ -158,6 +158,10 @@ function renderStatus() {
   updateSendBtn();
   // model chip
   $("chipModelText").textContent = st.model || "model";
+  $("chipAgentText").textContent = S.agents.find(a => a.id === (st.agent || "assistant"))?.name || st.agent || "Assistant";
+  $("tbParent").hidden = !snap.parent;
+  $("tbParent").title = snap.parent ? `Back to ${snap.parent.session}` : "";
+  $("tbParent").onclick = () => snap.parent && select(snap.parent.session);
   renderChips();
   renderApproval();
 }
@@ -172,7 +176,9 @@ function updateSendBtn() {
   btn.setAttribute("aria-label", running ? "Send steering message" : "Send");
   $("cancelBtn").hidden = !running;
   $("hintRight").innerHTML = running ? '<kbd>Esc</kbd> cancel' : "";
-  $("hintLeft").innerHTML = running ? `steering · ${st?.queued_steers || 0} queued` : "";
+  $("hintLeft").textContent = running
+    ? (st?.delegation ? `steering subagent · ${st.queued_steers || 0} queued` : `steering · ${st?.queued_steers || 0} queued`)
+    : "";
 }
 function renderChips() {
   const snap = S.selected && S.sessions.get(S.selected);

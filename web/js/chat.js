@@ -5,15 +5,16 @@ import { renderImages, renderFile } from "./files.js";
 import { openRaw } from "./raw.js";
 import { openDiffSheet } from "./panels.js";
 import { search, applySearch } from "./search.js";
-import { revealBlock } from "./protocol.js";
+import { revealBlock, select } from "./protocol.js";
 
 function blockKey(b) {
   const t = b.tool;
+  const child = t?.name === "subagent" && S.sessions.get(S.selected)?.state?.children?.find(c => c.tool_call_id === t.call_id);
   return (prefs.showThinking ? "T" : "") + (prefs.showTools ? "L" : "") +
     [b.kind, b.content, b.queued, b.model, b.duration_ms || 0, b.summary ? 1 : 0,
     JSON.stringify(b.file || null),
     b.images.map(i => (i.path || "") + " " + i.width + "x" + i.height).join(","),
-    t ? [t.name, t.status, t.arguments, t.output || "", t.diff || "", t.redacted ? 1 : 0] : "",
+    t ? [t.name, t.status, t.arguments, t.output || "", t.diff || "", t.redacted ? 1 : 0, child?.session || "", child?.status || ""] : "",
     b.redacted ? "R" : "",
     b.timer.running ? "r" : b.timer.elapsed_ms].join("\u0001");
 }
@@ -97,7 +98,8 @@ function blockContent(session, b) {
     wrap.className = "msg assistant";
     const who = document.createElement("div");
     who.className = b.kind === "status" ? "who status" : "who";
-    who.innerHTML = `${b.kind === "status" ? "Status" : "Assistant"}${b.model ? `<span class="mdl">${esc(b.model)}</span>` : ""}${b.kind === "assistant" && b.duration_ms ? `<span class="mdl dur">${fmtDur(b.duration_ms)}</span>` : ""}${b.queued ? `<span class="badge-queued">queued</span>` : ""}`;
+    const agentName = S.agents.find(a => a.id === (b.agent || "assistant"))?.name || b.agent || "Assistant";
+    who.innerHTML = `${b.kind === "status" ? "Status" : esc(agentName)}${b.model ? `<span class="mdl">${esc(b.model)}</span>` : ""}${b.kind === "assistant" && b.duration_ms ? `<span class="mdl dur">${fmtDur(b.duration_ms)}</span>` : ""}${b.queued ? `<span class="badge-queued">queued</span>` : ""}`;
     const bubble = document.createElement("div");
     bubble.className = "bubble md";
     bubble.innerHTML = md(b.content);
@@ -124,6 +126,22 @@ function blockContent(session, b) {
   if (b.kind === "tool") {
     wrap.className = "msg tool";
     renderFile(wrap, session, b);
+    if (b.tool.name === "subagent") {
+      const child = S.sessions.get(session)?.state?.children?.find(c => c.tool_call_id === b.tool.call_id);
+      const args = (() => { try { return JSON.parse(b.tool.arguments); } catch { return {}; } })();
+      const card = document.createElement("div");
+      card.className = "subagent-card";
+      const name = S.agents.find(a => a.id === (child?.agent || args.agent))?.name || child?.agent || args.agent || "Subagent";
+      card.innerHTML = `<strong>${esc(name)}</strong><span>${esc(child?.status || b.tool.status)}</span><small>${esc(child?.prompt || args.prompt || "")}</small>`;
+      if (child) {
+        const open = document.createElement("button");
+        open.type = "button";
+        open.textContent = "Open chat →";
+        open.onclick = () => select(child.session);
+        card.append(open);
+      }
+      wrap.append(card);
+    }
     if (!prefs.showTools) return wrap;
     const t = b.tool;
     const d = sectionEl("tool", t.name, b.timer);

@@ -428,16 +428,12 @@ async fn mid_turn_compaction_preserves_steering_and_the_saved_boundary() {
             Some("the note has been read; keep working")
         );
         assert_eq!(session.meta.compacted_through, 4);
-        assert!(
-            matches!(&messages[1], Message::User { content, .. }
-                if content.starts_with("read the note and continue\n\n<runtime-context>"))
-        );
+        assert!(matches!(&messages[1], Message::User { content, .. }
+                if content.starts_with("read the note and continue\n\n<runtime-context>")));
         assert!(matches!(&messages[3], Message::Tool { .. }));
         let remaining = &messages[session.meta.compacted_through..];
-        assert!(
-            matches!(&remaining[0], Message::Steer { content, .. }
-                if content == "also check the tests")
-        );
+        assert!(matches!(&remaining[0], Message::Steer { content, .. }
+                if content == "also check the tests"));
         assert_eq!(remaining.len(), 2);
         if cancel {
             assert!(
@@ -796,4 +792,298 @@ async fn raw_requests_are_lazy_historical_and_survive_compaction_and_restart() {
         );
     }
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn subagent_spawn_releases_the_child_creation_lock_before_loading() {
+    let mut harness = Harness::new().await;
+    let core = harness.core.clone();
+    let id = core.create(Some("parent".into())).await.unwrap();
+    let mut subscription = core.subscribe(&id).await.unwrap();
+    core.command(&id, prompt("delegate")).await.unwrap();
+    // The parent's first turn emits the delegation call.
+    harness.next().await.tool(
+        "subagent",
+        json!({"agent": "assistant", "prompt": "do the thing"}),
+    );
+    // The core spawns the child and starts its delegated turn.
+    harness.next().await.finish("child done");
+    // The parent receives the structured result and continues.
+    harness.next().await.finish("parent done");
+    until(&mut subscription, |event| {
+        matches!(event, Event::GenerationFinished { .. })
+    })
+    .await;
+    let snapshot = core.subscribe(&id).await.unwrap().snapshot;
+    let tool = snapshot
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .tool
+                .as_ref()
+                .is_some_and(|tool| tool.name == "subagent")
+        })
+        .and_then(|block| block.tool.clone())
+        .expect("subagent tool block");
+    assert_eq!(tool.status, ToolStatus::Done, "output: {:?}", tool.output);
+    let output = tool.output.as_deref().unwrap_or_default();
+    // Regression: the child's creation lock used to stay held while the core
+    // re-locked the same session, so the spawn failed with a lock error.
+    assert!(
+        !output.contains("already owned by another Rope process"),
+        "subagent spawn hit the session lock: {output}"
+    );
+    let outcome: serde_json::Value = serde_json::from_str(output).unwrap();
+    assert_eq!(outcome["status"], "completed");
+    // A child session was actually created on disk.
+    let children = std::fs::read_dir(harness.storage.path())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("sub-"))
+        .count();
+    assert_eq!(children, 1);
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn subagent_only_definition_runs_in_its_child_session() {
+    use rope::{config::Config, core::Core};
+    use std::sync::Arc;
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let agents = project.path().join(".rope/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("review.md"),
+        "+++\ndescription = \"Review code\"\nmode = \"subagent\"\n+++\nReview the code carefully.\n",
+    )
+    .unwrap();
+    let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let core = Core::new(
+        Config::default(),
+        project.path().into(),
+        storage.path().into(),
+        Arc::new(support::ControlledProvider(sender)),
+    )
+    .await
+    .unwrap();
+    let parent = core.create(Some("parent".into())).await.unwrap();
+    let mut subscription = core.subscribe(&parent).await.unwrap();
+    core.command(&parent, prompt("delegate review"))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    first.tool(
+        "subagent",
+        json!({"agent": "review", "prompt": "Review this"}),
+    );
+    let child = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .expect("subagent-only child must reach the provider");
+    let first_snapshot = core.subscribe(&parent).await.unwrap().snapshot;
+    let second_snapshot = core.subscribe(&parent).await.unwrap().snapshot;
+    assert_eq!(
+        first_snapshot.seq, second_snapshot.seq,
+        "subscribing must not create an unpublished sequence gap"
+    );
+    let child_id = first_snapshot.state.children[0].session.clone();
+    let child_snapshot = core.subscribe(&child_id).await.unwrap().snapshot;
+    assert_eq!(child_snapshot.parent.as_ref().unwrap().session, parent);
+    assert_eq!(child_snapshot.state.agent.as_deref(), Some("review"));
+    assert!(child.request.messages.iter().any(|message| matches!(
+        message,
+        Message::System { content, .. } if content.contains("Review the code carefully.")
+    )));
+    child.finish("Review complete");
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    resumed.finish("Parent complete");
+    until(&mut subscription, |event| {
+        matches!(event, Event::GenerationFinished { .. })
+    })
+    .await;
+    let snapshot = core.subscribe(&parent).await.unwrap().snapshot;
+    let outcome: serde_json::Value = serde_json::from_str(
+        snapshot
+            .blocks
+            .iter()
+            .find_map(|block| {
+                block
+                    .tool
+                    .as_ref()
+                    .filter(|tool| tool.name == "subagent")
+                    .and_then(|tool| tool.output.as_deref())
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(outcome["status"], "completed");
+    assert_eq!(outcome["response"], "Review complete");
+    assert_eq!(snapshot.state.children[0].status, "completed");
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_the_child_returns_user_cancelled_to_the_parent() {
+    let mut harness = Harness::new().await;
+    let core = harness.core.clone();
+    let parent = core.create(Some("parent-cancel".into())).await.unwrap();
+    let mut subscription = core.subscribe(&parent).await.unwrap();
+    core.command(&parent, prompt("delegate")).await.unwrap();
+    harness.next().await.tool(
+        "subagent",
+        json!({
+            "agent": "assistant", "prompt": "work"
+        }),
+    );
+    let _working_child = harness.next().await;
+    let child = core
+        .subscribe(&parent)
+        .await
+        .unwrap()
+        .snapshot
+        .state
+        .children[0]
+        .session
+        .clone();
+    let child_turn = core
+        .subscribe(&child)
+        .await
+        .unwrap()
+        .snapshot
+        .state
+        .turn_id
+        .unwrap();
+    core.command(
+        &child,
+        Action::Cancel {
+            turn_id: child_turn,
+        },
+    )
+    .await
+    .unwrap();
+    let continuation = harness.next().await;
+    let result = continuation
+        .request
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .expect("the caller receives a tool result");
+    let outcome: serde_json::Value = serde_json::from_str(result).unwrap();
+    assert_eq!(outcome["status"], "user_cancelled");
+    continuation.finish("I will continue");
+    until(&mut subscription, |event| {
+        matches!(event, Event::GenerationFinished { .. })
+    })
+    .await;
+    let snapshot = core.subscribe(&parent).await.unwrap().snapshot;
+    assert_eq!(snapshot.state.children[0].status, "user_cancelled");
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn steering_the_parent_reaches_the_working_child_before_parent_resumes() {
+    let mut harness = Harness::new().await;
+    let core = harness.core.clone();
+    let parent = core.create(Some("parent-steer".into())).await.unwrap();
+    let mut subscription = core.subscribe(&parent).await.unwrap();
+    core.command(&parent, prompt("delegate")).await.unwrap();
+    harness.next().await.tool(
+        "subagent",
+        json!({
+            "agent": "assistant", "prompt": "work"
+        }),
+    );
+    let child_request = harness.next().await;
+    let child = core
+        .subscribe(&parent)
+        .await
+        .unwrap()
+        .snapshot
+        .state
+        .children[0]
+        .session
+        .clone();
+    let accepted = core
+        .command(&parent, prompt("focus on the tests"))
+        .await
+        .unwrap();
+    assert_eq!(accepted.routed_to.as_deref(), Some(child.as_str()));
+    child_request.finish("first answer");
+    let followup = harness.next().await;
+    assert!(followup.request.messages.iter().any(|message| matches!(
+        message, Message::Steer { content, .. } if content == "focus on the tests"
+    )));
+    followup.finish("revised answer");
+    let resumed = harness.next().await;
+    let result = resumed
+        .request
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    let outcome: serde_json::Value = serde_json::from_str(result).unwrap();
+    assert_eq!(outcome["response"], "revised answer");
+    resumed.finish("parent done");
+    until(&mut subscription, |event| {
+        matches!(event, Event::GenerationFinished { .. })
+    })
+    .await;
+    core.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_parent_stops_nested_children_without_deadlocking() {
+    let mut harness = Harness::new().await;
+    let core = harness.core.clone();
+    let parent = core.create(Some("nested-cancel".into())).await.unwrap();
+    let parent_turn = core
+        .command(&parent, prompt("delegate twice"))
+        .await
+        .unwrap()
+        .turn_id
+        .unwrap();
+    harness.next().await.tool(
+        "subagent",
+        json!({
+            "agent": "assistant", "prompt": "delegate again"
+        }),
+    );
+    harness.next().await.tool(
+        "subagent",
+        json!({
+            "agent": "assistant", "prompt": "work"
+        }),
+    );
+    let _grandchild = harness.next().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        core.command(
+            &parent,
+            Action::Cancel {
+                turn_id: parent_turn,
+            },
+        ),
+    )
+    .await
+    .expect("nested cancellation must settle")
+    .unwrap();
+    let root = core.subscribe(&parent).await.unwrap().snapshot;
+    assert!(root.state.turn_id.is_none());
+    core.shutdown().await.unwrap();
 }

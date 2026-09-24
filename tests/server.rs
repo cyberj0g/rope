@@ -119,7 +119,10 @@ async fn web_page_and_module_imports_are_served_without_authentication() {
     let base = reqwest::Url::parse(&format!("http://{}/", server.address)).unwrap();
     let response = client.get(base.clone()).send().await.unwrap();
     assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["content-type"], "text/html; charset=utf-8");
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/html; charset=utf-8"
+    );
     let html = response.text().await.unwrap();
     assert!(html.contains("type=\"module\""));
     let assets = regex::Regex::new(r#"(?:src|href)="(/assets/[^"]+)""#).unwrap();
@@ -146,7 +149,11 @@ async fn web_page_and_module_imports_are_served_without_authentication() {
         let body = response.text().await.unwrap();
         assert!(!body.trim().is_empty(), "{url}");
         if !is_css {
-            pending.extend(imports.captures_iter(&body).map(|c| url.join(&c[1]).unwrap()));
+            pending.extend(
+                imports
+                    .captures_iter(&body)
+                    .map(|c| url.join(&c[1]).unwrap()),
+            );
         }
     }
     let response = client
@@ -273,7 +280,9 @@ async fn transport_authentication_origins_and_attachments_are_enforced() {
         .unwrap();
     wrong
         .send(Message::Text(
-            json!({"protocol":rope::protocol::VERSION,"token":"wrong"}).to_string().into(),
+            json!({"protocol":rope::protocol::VERSION,"token":"wrong"})
+                .to_string()
+                .into(),
         ))
         .await
         .unwrap();
@@ -350,13 +359,22 @@ async fn arbitrary_uploads_reach_the_model_and_stay_session_scoped() {
     let http = reqwest::Client::new();
     let url = format!("http://{}/api/sessions/{id}/attachments", server.address);
     let name = "notes résumé & + #.txt";
-    let response = http.post(&url).query(&[("filename", name)])
-        .bearer_auth("test-token").body("contents of the upload").send().await.unwrap();
+    let response = http
+        .post(&url)
+        .query(&[("filename", name)])
+        .bearer_auth("test-token")
+        .body("contents of the upload")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), 200);
     let file: FileContent = response.json().await.unwrap();
     assert_eq!(file.name, name);
     assert!(file.path.starts_with("uploads/"));
-    let action = Action::SendMessage { content: "Read this file".into(), attachments: vec![file.path.clone()] };
+    let action = Action::SendMessage {
+        content: "Read this file".into(),
+        attachments: vec![file.path.clone()],
+    };
     assert!(harness.core.command(&other, action.clone()).await.is_err());
     harness.core.command(&id, action).await.unwrap();
     let request = harness.next().await;
@@ -382,21 +400,47 @@ async fn arbitrary_uploads_reach_the_model_and_stay_session_scoped() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(std::path::Path::new(&uploaded.path).file_name().unwrap(), name);
+    assert_eq!(
+        std::path::Path::new(&uploaded.path).file_name().unwrap(),
+        name
+    );
     #[cfg(unix)]
     assert!(uploaded.path.starts_with("/tmp/rope-upload-"));
-    assert_eq!(std::fs::read(&uploaded.path).unwrap(), b"contents of the upload");
+    assert_eq!(
+        std::fs::read(&uploaded.path).unwrap(),
+        b"contents of the upload"
+    );
     assert!(!content.contains("contents of the upload"));
     request.finish("received");
 
     for name in ["../escape.txt", "..", "C:\\escape.txt"] {
-        assert_eq!(http.post(&url).query(&[("filename", name)]).bearer_auth("test-token")
-            .body("bad filename").send().await.unwrap().status(), 400);
+        assert_eq!(
+            http.post(&url)
+                .query(&[("filename", name)])
+                .bearer_auth("test-token")
+                .body("bad filename")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
     }
     let mut image = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::new_rgb8(2, 3).write_to(&mut image, image::ImageFormat::Png).unwrap();
-    let image: Value = http.post(&url).query(&[("filename", "picture.bin")])
-        .bearer_auth("test-token").body(image.into_inner()).send().await.unwrap().json().await.unwrap();
+    image::DynamicImage::new_rgb8(2, 3)
+        .write_to(&mut image, image::ImageFormat::Png)
+        .unwrap();
+    let image: Value = http
+        .post(&url)
+        .query(&[("filename", "picture.bin")])
+        .bearer_auth("test-token")
+        .body(image.into_inner())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert!(image["path"].as_str().unwrap().starts_with("attachments/"));
     assert_eq!(image["width"], 2);
     assert_eq!(image["height"], 3);
@@ -415,25 +459,59 @@ async fn archive_previews_are_added_without_model_tool_calls() {
     header.set_size(5);
     header.set_mode(0o644);
     header.set_cksum();
-    archive.append_data(&mut header, "notes.txt", &b"hello"[..]).unwrap();
-    let upload = harness.core.upload(&id, "documents.tar", &archive.into_inner().unwrap()).await.unwrap();
-    harness.core.command(&id, Action::SendMessage {
-        content: "Inspect archive".into(), attachments: vec![upload["path"].as_str().unwrap().into()],
-    }).await.unwrap();
+    archive
+        .append_data(&mut header, "notes.txt", &b"hello"[..])
+        .unwrap();
+    let upload = harness
+        .core
+        .upload(&id, "documents.tar", &archive.into_inner().unwrap())
+        .await
+        .unwrap();
+    harness
+        .core
+        .command(
+            &id,
+            Action::SendMessage {
+                content: "Inspect archive".into(),
+                attachments: vec![upload["path"].as_str().unwrap().into()],
+            },
+        )
+        .await
+        .unwrap();
     let request = harness.next().await;
     let content = request
         .request
         .messages
         .iter()
         .find_map(|message| match message {
-            Message::User { content, .. } if content.starts_with("Inspect archive") => Some(content),
+            Message::User { content, .. } if content.starts_with("Inspect archive") => {
+                Some(content)
+            }
             _ => None,
         })
         .unwrap();
     assert!(content.contains("Automatic file preview (archive listing):"));
-    assert!(content.contains("notes.txt") || content.contains("preview unavailable: start tar"), "{content}");
-    assert!(!request.request.tools.iter().any(|tool| tool.function.name == "process_file"));
-    let file: rope::runtime::FileContent = serde_json::from_str(content.split_once("Attached file: ").unwrap().1.lines().next().unwrap()).unwrap();
+    assert!(
+        content.contains("notes.txt") || content.contains("preview unavailable: start tar"),
+        "{content}"
+    );
+    assert!(
+        !request
+            .request
+            .tools
+            .iter()
+            .any(|tool| tool.function.name == "process_file")
+    );
+    let file: rope::runtime::FileContent = serde_json::from_str(
+        content
+            .split_once("Attached file: ")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
     request.finish("received listing");
     harness.core.shutdown().await.unwrap();
     std::fs::remove_dir_all(std::path::Path::new(&file.path).parent().unwrap()).unwrap();
@@ -564,7 +642,7 @@ async fn file_downloads_require_publication_and_encode_filenames() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn catalog_is_paginated_and_filtered_server_side() {
-    let mut harness = Harness::new().await;
+    let harness = Harness::new().await;
     for i in 1..=25 {
         harness
             .core
@@ -583,7 +661,9 @@ async fn catalog_is_paginated_and_filtered_server_side() {
     client
         .send(json!({"request_id":"1","type":"catalog_view","query":"alpha-2","offset":20}))
         .await;
-    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "1").await;
+    let reply = client
+        .until(|v| v["type"] == "reply" && v["request_id"] == "1")
+        .await;
     let mut names: Vec<&str> = reply["result"]["sessions"]
         .as_array()
         .unwrap()
@@ -591,7 +671,12 @@ async fn catalog_is_paginated_and_filtered_server_side() {
         .map(|s| s["name"].as_str().unwrap())
         .collect();
     names.sort();
-    assert_eq!(names, ["alpha-20", "alpha-21", "alpha-22", "alpha-23", "alpha-24", "alpha-25"]);
+    assert_eq!(
+        names,
+        [
+            "alpha-20", "alpha-21", "alpha-22", "alpha-23", "alpha-24", "alpha-25"
+        ]
+    );
     assert_eq!(reply["result"]["total"], 6);
 
     // The connection's window now follows the query: a catalog refresh keeps
@@ -599,19 +684,27 @@ async fn catalog_is_paginated_and_filtered_server_side() {
     harness.core.create(Some("alpha-26".into())).await.unwrap();
     let refreshed = client.until(|v| v["type"] == "catalog").await;
     assert_eq!(refreshed["catalog"]["total"], 7);
-    assert_eq!(refreshed["catalog"]["sessions"].as_array().unwrap().len(), 7);
+    assert_eq!(
+        refreshed["catalog"]["sessions"].as_array().unwrap().len(),
+        7
+    );
 
     // Widen the window; the reply and the next refresh carry the full page.
     client
         .send(json!({"request_id":"2","type":"catalog_view","query":null,"offset":27}))
         .await;
-    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "2").await;
+    let reply = client
+        .until(|v| v["type"] == "reply" && v["request_id"] == "2")
+        .await;
     assert_eq!(reply["result"]["sessions"].as_array().unwrap().len(), 26);
     assert_eq!(reply["result"]["total"], 26);
     // The next catalog refresh serves the widened, unfiltered window.
     harness.core.create(Some("beta".into())).await.unwrap();
     let refreshed = client.until(|v| v["type"] == "catalog").await;
-    assert_eq!(refreshed["catalog"]["sessions"].as_array().unwrap().len(), 27);
+    assert_eq!(
+        refreshed["catalog"]["sessions"].as_array().unwrap().len(),
+        27
+    );
     assert_eq!(refreshed["catalog"]["total"], 27);
 
     client.socket.close(None).await.unwrap();
@@ -648,14 +741,18 @@ async fn sessions_can_be_deleted_but_not_while_running() {
     client
         .send(json!({"request_id":"3","type":"delete_session","session_id":doomed}))
         .await;
-    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "3").await;
+    let reply = client
+        .until(|v| v["type"] == "reply" && v["request_id"] == "3")
+        .await;
     assert_eq!(reply["error"]["code"], "busy");
 
     // Unknown sessions are refused too.
     client
         .send(json!({"request_id":"4","type":"delete_session","session_id":"ghost"}))
         .await;
-    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "4").await;
+    let reply = client
+        .until(|v| v["type"] == "reply" && v["request_id"] == "4")
+        .await;
     assert_eq!(reply["error"]["code"], "unknown");
 
     request.finish("done");
@@ -663,9 +760,10 @@ async fn sessions_can_be_deleted_but_not_while_running() {
         .until(|v| {
             v["type"] == "event"
                 && v["update"]["session_id"] == doomed
-                && v["update"]["changes"]
-                    .as_array()
-                    .is_some_and(|c| c.iter().any(|c| c["type"] == "state" && c["state"]["phase"] == "idle"))
+                && v["update"]["changes"].as_array().is_some_and(|c| {
+                    c.iter()
+                        .any(|c| c["type"] == "state" && c["state"]["phase"] == "idle")
+                })
         })
         .await;
 
@@ -673,7 +771,9 @@ async fn sessions_can_be_deleted_but_not_while_running() {
     client
         .send(json!({"request_id":"5","type":"delete_session","session_id":doomed}))
         .await;
-    let reply = client.until(|v| v["type"] == "reply" && v["request_id"] == "5").await;
+    let reply = client
+        .until(|v| v["type"] == "reply" && v["request_id"] == "5")
+        .await;
     assert!(reply.get("error").is_none(), "{reply}");
     let refreshed = client.until(|v| v["type"] == "catalog").await;
     assert!(
@@ -691,7 +791,9 @@ async fn sessions_can_be_deleted_but_not_while_running() {
     client
         .send(json!({"request_id":"5","type":"delete_session","session_id":doomed}))
         .await;
-    let retry = client.until(|v| v["type"] == "reply" && v["request_id"] == "5").await;
+    let retry = client
+        .until(|v| v["type"] == "reply" && v["request_id"] == "5")
+        .await;
     assert_eq!(retry, reply);
 
     client.socket.close(None).await.unwrap();
@@ -701,9 +803,12 @@ async fn sessions_can_be_deleted_but_not_while_running() {
 #[tokio::test]
 async fn collapsed_thinking_and_tool_content_is_withheld_until_revealed() {
     let mut harness = Harness::new().await;
-    tokio::fs::write(harness.project.path().join("notes.md"), "secret tool business")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        harness.project.path().join("notes.md"),
+        "secret tool business",
+    )
+    .await
+    .unwrap();
     let id = harness.core.create(Some("redact".into())).await.unwrap();
     let server = start(&harness).await;
     let mut watcher = Client::connect(&server, None).await;
@@ -737,7 +842,8 @@ async fn collapsed_thinking_and_tool_content_is_withheld_until_revealed() {
     request.stream.send(Ok(ResponseDelta::Completed)).unwrap();
     drop(request); // the stream ends, the tool runs, and the turn continues
     let second = harness.next().await;
-    second.stream
+    second
+        .stream
         .send(Ok(ResponseDelta::Text("done reading".into())))
         .unwrap();
     drop(second);
@@ -769,25 +875,55 @@ async fn collapsed_thinking_and_tool_content_is_withheld_until_revealed() {
                 _ => {}
             }
         }
-        if changes.iter().any(|c| c["type"] == "state" && c["state"]["phase"] == "idle") {
+        if changes
+            .iter()
+            .any(|c| c["type"] == "state" && c["state"]["phase"] == "idle")
+        {
             break;
         }
     }
-    assert!(saw_tool_insert, "the tool header must arrive even when collapsed");
-    assert!(saw_visible_append, "assistant text must stream while tools stay redacted");
-    assert!(!saw_hidden_append, "collapsed tool content must not be delivered");
-    assert_eq!(tool_block["tool"]["arguments"], "", "redacted tool arguments");
-    assert!(tool_block["tool"]["output"].is_null(), "redacted tool output");
+    assert!(
+        saw_tool_insert,
+        "the tool header must arrive even when collapsed"
+    );
+    assert!(
+        saw_visible_append,
+        "assistant text must stream while tools stay redacted"
+    );
+    assert!(
+        !saw_hidden_append,
+        "collapsed tool content must not be delivered"
+    );
+    assert_eq!(
+        tool_block["tool"]["arguments"], "",
+        "redacted tool arguments"
+    );
+    assert!(
+        tool_block["tool"]["output"].is_null(),
+        "redacted tool output"
+    );
     assert_eq!(tool_block["tool"]["redacted"], true);
-    assert_eq!(tool_block["tool"]["name"], "read", "the tool name is visible");
+    assert_eq!(
+        tool_block["tool"]["name"], "read",
+        "the tool name is visible"
+    );
 
     // A late subscriber gets a redacted snapshot, not the withheld content.
     let mut late = Client::connect(&server, None).await;
     let snapshot = late.subscribe(&id).await;
     let text = snapshot.to_string();
-    assert!(!text.contains("pondering deeply"), "thinking content leaked: {text}");
-    assert!(!text.contains("secret tool business"), "tool output leaked: {text}");
-    assert!(text.contains("done reading"), "assistant content must stay visible");
+    assert!(
+        !text.contains("pondering deeply"),
+        "thinking content leaked: {text}"
+    );
+    assert!(
+        !text.contains("secret tool business"),
+        "tool output leaked: {text}"
+    );
+    assert!(
+        text.contains("done reading"),
+        "assistant content must stay visible"
+    );
     let thinking = snapshot["snapshot"]["blocks"]
         .as_array()
         .unwrap()
@@ -802,21 +938,30 @@ async fn collapsed_thinking_and_tool_content_is_withheld_until_revealed() {
     watcher
         .send(json!({"request_id":"3","type":"reveal_block","session_id":id,"block_id":block_id}))
         .await;
-    let reply = watcher.until(|v| v["type"] == "reply" && v["request_id"] == "3").await;
+    let reply = watcher
+        .until(|v| v["type"] == "reply" && v["request_id"] == "3")
+        .await;
     assert!(reply.get("error").is_none(), "{reply}");
     let full = &reply["result"]["block"];
     assert_eq!(
         full["tool"]["arguments"],
         serde_json::to_string_pretty(&serde_json::json!({"path": "notes.md"})).unwrap()
     );
-    assert!(full["tool"]["output"].as_str().unwrap().contains("secret tool business"));
+    assert!(
+        full["tool"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("secret tool business")
+    );
     assert!(full["tool"].get("redacted").is_none());
 
     // Unknown blocks are refused.
     watcher
         .send(json!({"request_id":"4","type":"reveal_block","session_id":id,"block_id":"nope"}))
         .await;
-    let reply = watcher.until(|v| v["type"] == "reply" && v["request_id"] == "4").await;
+    let reply = watcher
+        .until(|v| v["type"] == "reply" && v["request_id"] == "4")
+        .await;
     assert_eq!(reply["error"]["code"], "unknown_block");
 
     watcher.socket.close(None).await.unwrap();

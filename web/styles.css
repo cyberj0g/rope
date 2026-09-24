@@ -233,6 +233,11 @@ details.sec > summary .chev { width: 14px; height: 14px; flex: none; transition:
 details.sec[open] > summary .chev { transform: rotate(90deg); }
 details.sec .body { padding: 4px 12px 11px; border-top: 1px solid var(--border); }
 .sec .tag { font-weight: 600; }
+.subagent-card { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 11px; background: var(--panel); }
+.subagent-card span { color: var(--muted); font-size: 12px; }
+.subagent-card small { flex-basis: 100%; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.subagent-card button { border: 1px solid var(--border); border-radius: 7px; background: var(--panel-2); color: var(--text); padding: 5px 9px; cursor: pointer; }
+.agent-row { width: 100%; text-align: left; }
 .sec.thinking .tag { color: var(--purple); }
 .sec.tool .tag { color: var(--green); }
 .sec.tool[data-status="failed"] .tag { color: var(--red); }

@@ -15,18 +15,25 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
 use crate::{
+    agent::{ASSISTANT_ID, Agent, AgentCatalog},
     config::Config,
     project::ProjectState,
     provider::{Provider, ResponseDelta, Usage},
     session::{Session, SessionMeta},
-    tool::{Approval, ExecutionPlan, PlanStatus, ToolDefinition, ToolRegistry},
+    tool::{
+        Approval, DelegationCommand, DelegationRequest, ExecutionPlan, PlanStatus, ToolDefinition,
+        ToolRegistry, ToolResult,
+    },
 };
-pub use message::{FileContent, ImageContent, MAX_FILE_BYTES, Message, ToolCall, guess_mime_type};
+pub use message::{
+    FileContent, ImageContent, MAX_FILE_BYTES, Message, SubagentOutcome, SubagentStatus, ToolCall,
+    bounded_subagent_json, guess_mime_type,
+};
 
 pub const CANCELLED_BY_USER: &str = "cancelled by user";
 /// Tool result recorded for a call still in flight when the user stopped
@@ -119,10 +126,7 @@ pub struct UserPrompt {
 impl UserPrompt {
     /// The user message this prompt starts when no turn is running.
     pub fn user_message(self, plan: Option<&ExecutionPlan>) -> Message {
-        Message::user_with_images(
-            with_runtime_context(self.content, plan),
-            self.images,
-        )
+        Message::user_with_images(with_runtime_context(self.content, plan), self.images)
     }
 
     /// The Steer message this prompt persists as in conversation history:
@@ -161,7 +165,10 @@ fn runtime_context(plan: Option<&ExecutionPlan>) -> String {
     // stays in context un-compacted, so a fully completed plan adds nothing
     // the model does not already have.
     if let Some(plan) = plan
-        && plan.plan.iter().any(|step| step.status != PlanStatus::Completed)
+        && plan
+            .plan
+            .iter()
+            .any(|step| step.status != PlanStatus::Completed)
     {
         context.push_str(&format!(
             "\n- current plan:\n{}",
@@ -210,6 +217,19 @@ pub enum Command {
     Cancel,
     Approve(ApprovalDecision),
     SelectModel(String),
+    SetAgent(String),
+    /// Persists the parent side of one delegation record before the
+    /// child's work starts: `tool_call_id -> child` plus the child in
+    /// `children`. Idempotent per tool call.
+    RecordDelegation {
+        turn_id: String,
+        tool_call_id: String,
+        child: String,
+        agent: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Flush earlier actor events through the core's projection.
+    Observe(oneshot::Sender<()>),
     /// Manually compacts the idle conversation into a continuation summary.
     Compact,
     Shutdown(oneshot::Sender<SessionSummary>),
@@ -270,6 +290,21 @@ pub enum Event {
     SettingsChanged {
         model: String,
         reasoning_effort: Option<ReasoningEffort>,
+        /// The selected agent ID; `None` is the built-in assistant.
+        agent: Option<String>,
+    },
+    /// The session's active delegation (the child a `subagent` call is
+    /// waiting on) and its linked children with terminal states. Applied
+    /// by the core directly to the parent's projection.
+    DelegationChanged {
+        child: Option<String>,
+        children: Vec<crate::core::state::ChildLink>,
+    },
+    /// A steer the user sent from this session was forwarded to a
+    /// descendant; the receipt keeps the origin transcript honest.
+    SteerReceipt {
+        to: String,
+        agent: String,
     },
     ProjectChanged(ProjectState),
     PlanChanged(Option<ExecutionPlan>),
@@ -495,6 +530,10 @@ async fn spawn_turn<P: Provider + ?Sized>(
     tools: &ToolRegistry,
     config: &Config,
     first: Message,
+    agent: &Agent,
+    session_name: String,
+    delegation: &crate::tool::DelegationPort,
+    agents: Arc<AgentCatalog>,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
 ) {
@@ -508,12 +547,28 @@ async fn spawn_turn<P: Provider + ?Sized>(
     let request_messages = request_context(messages, &session.meta);
     let context_tokens = session.meta.context_tokens;
     let generate_title = session.needs_title();
-    let project_prompt = project.prompt().await;
+    // The agent's own instructions extend the project prompt; both travel
+    // as the single system message at the head of every request.
+    let project_prompt = async {
+        let prompt = project.prompt().await?;
+        Ok(prompt
+            .map(|prompt| {
+                if agent.body.is_empty() {
+                    prompt
+                } else {
+                    format!("{prompt}\n\n{}", agent.body)
+                }
+            })
+            .or_else(|| (!agent.body.is_empty()).then(|| agent.body.clone())))
+    }
+    .await;
     *pending_prompts = Arc::new(Mutex::new(Vec::new()));
     let steers = pending_prompts.clone();
     let provider = provider.clone();
     let tools = tools.clone();
     let config = config.clone();
+    let agent = agent.clone();
+    let delegation = delegation.clone();
     let id = uuid::Uuid::new_v4().to_string();
     events
         .send(Event::OperationStarted {
@@ -545,6 +600,11 @@ async fn spawn_turn<P: Provider + ?Sized>(
                         &progress,
                         &events,
                         &internal,
+                        &agent,
+                        &session_name,
+                        &id,
+                        &delegation,
+                        &agents,
                     )
                     .await
                 }
@@ -604,11 +664,14 @@ fn worker_channels(
     (events, internal, forward)
 }
 
-async fn send_settings(events: &mpsc::Sender<Event>, config: &Config) {
+async fn send_settings(events: &mpsc::Sender<Event>, config: &Config, agent: &Agent) {
     events
         .send(Event::SettingsChanged {
             model: config.model_name().to_owned(),
             reasoning_effort: config.effective_reasoning_effort(),
+            // `None` is the built-in assistant, matching how the session
+            // persists its selection.
+            agent: (agent.id != ASSISTANT_ID).then(|| agent.id.clone()),
         })
         .await
         .ok();
@@ -745,6 +808,11 @@ async fn turn<P: Provider + ?Sized>(
     progress: &TurnProgressHandle,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
+    agent: &Agent,
+    session_name: &str,
+    turn_id: &str,
+    delegation: &crate::tool::DelegationPort,
+    agents: &AgentCatalog,
 ) -> Result<TurnResult> {
     let mut compaction = None;
     // The provider's last reported usage is ground truth for everything
@@ -759,7 +827,8 @@ async fn turn<P: Provider + ?Sized>(
             &messages[messages.len().saturating_sub(1)..],
         )
     };
-    let schema_tokens = estimate_tool_tokens(&tools.definitions(config.active_model().vision));
+    let schema_tokens =
+        estimate_tool_tokens(&tools.definitions_for(agent, config.active_model().vision));
     let estimated = known
         .saturating_add(estimate_tokens(unknown))
         .saturating_add(if context_tokens == 0 {
@@ -802,7 +871,7 @@ async fn turn<P: Provider + ?Sized>(
             .await
             .ok();
     }
-    let (completed, mid_turn_compaction) = agent(
+    let (completed, mid_turn_compaction) = self::agent(
         provider.clone(),
         tools,
         config,
@@ -814,6 +883,11 @@ async fn turn<P: Provider + ?Sized>(
         progress,
         events,
         internal,
+        agent,
+        session_name,
+        turn_id,
+        delegation,
+        agents,
     )
     .await?;
     if let Some(mid_turn) = mid_turn_compaction {
@@ -1235,6 +1309,11 @@ async fn agent<P: Provider + ?Sized>(
     progress: &TurnProgressHandle,
     events: &mpsc::Sender<Event>,
     internal: &mpsc::Sender<InternalEvent>,
+    agent: &Agent,
+    session_name: &str,
+    turn_id: &str,
+    delegation: &crate::tool::DelegationPort,
+    agents: &AgentCatalog,
 ) -> Result<(Vec<Message>, Option<Compaction>)> {
     let mut compaction = None;
     let mut used_context_tokens: Option<u64> = None;
@@ -1282,6 +1361,7 @@ async fn agent<P: Provider + ?Sized>(
                 tools,
                 config,
                 project_prompt.as_deref(),
+                agent,
             );
             if available == 0 {
                 bail!("context exhausted: compaction could not free room for the next request");
@@ -1303,7 +1383,7 @@ async fn agent<P: Provider + ?Sized>(
         if let Some(prompt) = &project_prompt {
             request_messages.insert(0, Message::system(prompt.clone()));
         }
-        let tool_definitions = tools.definitions(config.active_model().vision);
+        let tool_definitions = tools.definitions_for(agent, config.active_model().vision);
         let request = CompletionRequest {
             provider: config.provider_name().to_owned(),
             model: config.model_id().to_owned(),
@@ -1327,7 +1407,8 @@ async fn agent<P: Provider + ?Sized>(
             calls.clone(),
             response_items,
         )
-        .with_raw_request(raw_request);
+        .with_raw_request(raw_request)
+        .with_agent(agent.id.clone());
         messages.push(response.clone());
         progress.lock().unwrap().messages.push(response);
         let mut used = usage.map_or_else(
@@ -1340,6 +1421,7 @@ async fn agent<P: Provider + ?Sized>(
                         tools,
                         config,
                         project_prompt.as_deref(),
+                        agent,
                     ))
             },
             |usage| usage.total_tokens,
@@ -1412,13 +1494,17 @@ async fn agent<P: Provider + ?Sized>(
                     tools,
                     config,
                     project_prompt.as_deref(),
+                    agent,
                 ));
                 remaining = max_tokens.saturating_sub(used);
                 if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
                     bail!("context exhausted: compaction could not free room for a tool result");
                 }
             }
-            let approved = match entry.approval {
+            // The effective policy and the approval key are scoped to the
+            // acting agent, so one agent's grants never apply to another.
+            let approved = match agent.effective_policy(&call.name, &entry.category, entry.approval)
+            {
                 Approval::Allow => true,
                 Approval::Deny => false,
                 Approval::Ask => {
@@ -1426,7 +1512,7 @@ async fn agent<P: Provider + ?Sized>(
                     internal
                         .send(InternalEvent::Approval {
                             call: call.clone(),
-                            approval_key: entry.approval_key.clone(),
+                            approval_key: format!("{}|{}", agent.id, entry.approval_key),
                             reply,
                         })
                         .await?;
@@ -1454,20 +1540,36 @@ async fn agent<P: Provider + ?Sized>(
                     })
                     .await
                     .ok();
-                let (delta_tx, delta_rx) = mpsc::unbounded_channel();
-                let forward = tokio::spawn(forward_tool_output_deltas(
-                    call.id.clone(),
-                    delta_rx,
-                    max_streamed_bytes,
-                    events.clone(),
-                ));
-                let result = entry
-                    .tool
-                    .run_streamed(call.arguments.clone(), Some(delta_tx), max_streamed_bytes)
-                    .await;
-                // Let in-flight deltas land before the final result.
-                forward.await.ok();
-                result
+                if call.name == crate::tool::SUBAGENT_TOOL {
+                    // The runtime executes delegations itself: it supplies
+                    // the session, turn, and call identity the core needs
+                    // to link the child.
+                    run_delegation(
+                        delegation,
+                        session_name,
+                        turn_id,
+                        &call,
+                        config.model_name(),
+                        agent,
+                        agents,
+                    )
+                    .await
+                } else {
+                    let (delta_tx, delta_rx) = mpsc::unbounded_channel();
+                    let forward = tokio::spawn(forward_tool_output_deltas(
+                        call.id.clone(),
+                        delta_rx,
+                        max_streamed_bytes,
+                        events.clone(),
+                    ));
+                    let result = entry
+                        .tool
+                        .run_streamed(call.arguments.clone(), Some(delta_tx), max_streamed_bytes)
+                        .await;
+                    // Let in-flight deltas land before the final result.
+                    forward.await.ok();
+                    result
+                }
             } else {
                 bail_tool_denied(&call.name)
             };
@@ -1481,6 +1583,12 @@ async fn agent<P: Provider + ?Sized>(
                 ),
                 Err(error) => (format!("Error: {error:#}"), None, None, None, false),
             };
+            // A delegation result is one JSON document: shrink it within
+            // the content budget while it stays valid JSON, so the control
+            // fields the UI and the model rely on survive the limit.
+            if call.name == crate::tool::SUBAGENT_TOOL {
+                output = bounded_subagent_json(&output, max_streamed_bytes);
+            }
             // The pre-run reservation covered the text, not the image. An
             // image that would crowd the result past its budget is
             // replaced by a note in the content, so the next model
@@ -1558,6 +1666,82 @@ async fn agent<P: Provider + ?Sized>(
     }
 }
 
+/// Flips the delegation's `abandon` flag when the waiting call's future
+/// drops — the turn was cancelled and no one else will — so the core stops
+/// the child's turn and lets it settle.
+struct AbandonGuard(watch::Sender<bool>);
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        self.0.send(true).ok();
+    }
+}
+
+/// Executes one `subagent` call: validates the arguments, hands a
+/// `DelegationRequest` to the core over the delegation port, and waits for
+/// the child's turn to settle. The child's structured outcome is the tool
+/// result's only content; the runtime keeps it valid JSON within its
+/// output budget.
+async fn run_delegation(
+    delegation: &crate::tool::DelegationPort,
+    session_name: &str,
+    turn_id: &str,
+    call: &ToolCall,
+    caller_model: &str,
+    caller: &Agent,
+    agents: &AgentCatalog,
+) -> Result<ToolResult> {
+    if !caller.can_call_subagents {
+        bail!("this agent may not delegate work to subagents");
+    }
+    let agent = call
+        .arguments
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .context("the subagent call is missing its 'agent' argument")?;
+    if !agents
+        .get(agent)
+        .is_some_and(|candidate| candidate.delegable())
+    {
+        bail!("agent '{agent}' is not available for delegation");
+    }
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if prompt.is_empty() {
+        bail!("the subagent call has no prompt");
+    }
+    let (reply, outcome) = oneshot::channel::<SubagentOutcome>();
+    let (abandon, _abandon_rx) = watch::channel(false);
+    let _guard = AbandonGuard(abandon.clone());
+    delegation
+        .send(DelegationCommand::Spawn(DelegationRequest {
+            parent_session: session_name.to_owned(),
+            parent_turn: turn_id.to_owned(),
+            tool_call_id: call.id.clone(),
+            agent: agent.to_owned(),
+            prompt,
+            caller_model: caller_model.to_owned(),
+            reply,
+            abandon,
+        }))
+        .context("core is shutting down")?;
+    let outcome = outcome
+        .await
+        .context("the delegation was dropped before it could settle")?;
+    Ok(ToolResult {
+        is_error: outcome.is_error(),
+        output: outcome.json(),
+        image: None,
+        file: None,
+        diff: None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn compact_mid_turn<P: Provider + ?Sized>(
     provider: Arc<P>,
@@ -1618,6 +1802,7 @@ fn available_context_tokens(
     tools: &ToolRegistry,
     config: &Config,
     project_prompt: Option<&str>,
+    agent: &Agent,
 ) -> u64 {
     let mut context = messages.to_vec();
     strip_display_metadata(&mut context);
@@ -1625,7 +1810,7 @@ fn available_context_tokens(
         context.insert(0, Message::system(prompt.into()));
     }
     let used = estimate_tokens(&context).saturating_add(estimate_tool_tokens(
-        &tools.definitions(config.active_model().vision),
+        &tools.definitions_for(agent, config.active_model().vision),
     ));
     config
         .active_model()
@@ -1930,6 +2115,22 @@ mod tests {
     };
     use async_trait::async_trait;
     use serde_json::{Value, json};
+    /// The built-in assistant, for call sites that pass an agent by hand.
+    fn assistant_agent() -> Agent {
+        crate::agent::assistant()
+    }
+
+    /// A catalog holding only the built-in assistant.
+    fn test_catalog() -> Arc<AgentCatalog> {
+        Arc::new(AgentCatalog::builtin())
+    }
+
+    /// A delegation port whose receiver is dropped immediately: delegation
+    /// calls in these tests fail fast with a clear error, never hang.
+    fn delegation_port() -> crate::tool::DelegationPort {
+        let (port, _rx) = mpsc::unbounded_channel();
+        port
+    }
 
     fn no_steers() -> SteerQueue {
         Arc::new(Mutex::new(Vec::new()))
@@ -2030,6 +2231,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2085,6 +2291,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2144,6 +2355,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2207,6 +2423,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2296,6 +2517,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2368,6 +2594,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2417,6 +2648,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2463,6 +2699,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2531,6 +2772,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2590,6 +2836,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2659,6 +2910,11 @@ mod tests {
             &progress,
             &events,
             &internal,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2751,6 +3007,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2817,6 +3078,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -2903,6 +3169,11 @@ mod tests {
                     &fresh_progress(),
                     &events,
                     &internal,
+                    &assistant_agent(),
+                    "test",
+                    "turn",
+                    &delegation_port(),
+                    &test_catalog(),
                 )
                 .await
             })
@@ -3022,6 +3293,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -3390,6 +3666,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -3461,6 +3742,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -3920,6 +4206,11 @@ mod tests {
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -3945,21 +4236,9 @@ mod tests {
     #[test]
     fn request_context_projects_the_summary_and_drops_markers() {
         let summary = "dense summary";
-        let meta = SessionMeta {
-            project_root: None,
-            settings: None,
-            name: "test".into(),
-            title: None,
-            plan: None,
-            created_at: 0,
-            total_tokens: 0,
-            total_cost: 0.0,
-            cost_complete: true,
-            context_tokens: 0,
-            compaction_summary: Some(summary.into()),
-            compacted_through: 2,
-            approved_tools: Vec::new(),
-        };
+        let mut meta = SessionMeta::test();
+        meta.compaction_summary = Some(summary.into());
+        meta.compacted_through = 2;
         let messages = vec![
             Message::user("old turn".into()),
             Message::system(format!("{COMPACTION_MARKER}\n{summary}")),
@@ -4013,10 +4292,16 @@ mod tests {
             vec![Message::user("run it".into())],
             0,
             0,
-            None,                        &steers,
+            None,
+            &steers,
             &fresh_progress(),
             &event_tx,
             &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
         )
         .await
         .unwrap();
@@ -4067,10 +4352,16 @@ mod tests {
                     vec![Message::user("run it".into())],
                     0,
                     0,
-                    None,                                        &steers,
+                    None,
+                    &steers,
                     &fresh_progress(),
                     &events,
                     &internal,
+                    &assistant_agent(),
+                    "test",
+                    "turn",
+                    &delegation_port(),
+                    &test_catalog(),
                 )
                 .await
             })
@@ -4164,6 +4455,8 @@ mod tests {
                     session,
                     Vec::new(),
                     ProjectState::new().await.unwrap(),
+                    test_catalog(),
+                    delegation_port(),
                     command_rx,
                     event_tx,
                 )
@@ -4273,6 +4566,8 @@ mod tests {
                     session,
                     messages.clone(),
                     ProjectState::new().await.unwrap(),
+                    test_catalog(),
+                    delegation_port(),
                     command_rx,
                     event_tx,
                 )
@@ -4352,6 +4647,8 @@ mod tests {
                     session,
                     Vec::new(),
                     ProjectState::new().await.unwrap(),
+                    test_catalog(),
+                    delegation_port(),
                     command_rx,
                     event_tx,
                 )
@@ -4497,6 +4794,8 @@ mod tests {
                     session,
                     Vec::new(),
                     ProjectState::new().await.unwrap(),
+                    test_catalog(),
+                    delegation_port(),
                     command_rx,
                     event_tx,
                 )
@@ -4567,17 +4866,13 @@ mod tests {
             matches!(&messages[2], Message::Tool { call_id, content, .. }
             if call_id == "call_1" && content == "done")
         );
-        assert!(
-            matches!(&messages[3], Message::Steer { content, .. }
-                if content == "keep going")
-        );
+        assert!(matches!(&messages[3], Message::Steer { content, .. }
+                if content == "keep going"));
         assert!(
             matches!(&messages[4], Message::System { content, .. } if content == CANCELLED_BY_USER)
         );
-        assert!(
-            matches!(&messages[5], Message::User { content, .. }
-                if content.starts_with("continue\n\n<runtime-context>"))
-        );
+        assert!(matches!(&messages[5], Message::User { content, .. }
+                if content.starts_with("continue\n\n<runtime-context>")));
         assert!(
             matches!(&messages[6], Message::Assistant { content, duration_ms, .. }
                 if content == "continued answer" && duration_ms.is_some())
@@ -4601,8 +4896,10 @@ mod tests {
             .expect("the cancellation marker left the next context");
         let seen_continue = next
             .iter()
-            .position(|m| matches!(m, Message::User { content, .. }
-                if content.starts_with("continue\n\n<runtime-context>")))
+            .position(|m| {
+                matches!(m, Message::User { content, .. }
+                if content.starts_with("continue\n\n<runtime-context>"))
+            })
             .expect("the fresh prompt is in the context");
         assert!(seen_tool < seen_marker);
         assert!(seen_marker < seen_continue);
@@ -4658,6 +4955,8 @@ mod tests {
                     session,
                     Vec::new(),
                     ProjectState::new().await.unwrap(),
+                    test_catalog(),
+                    delegation_port(),
                     command_rx,
                     event_tx,
                 )

@@ -58,6 +58,46 @@ impl ScriptedProvider {
                 return text_only("Scripted e2e session");
             }
         }
+        if let Some(Message::Tool { call_id, .. }) = request.messages.last()
+            && call_id == "call-agent-e2e"
+        {
+            return text_only("The review agent finished its task.");
+        }
+        if request
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .is_some_and(|content| content.contains("rope-e2e-agent-child"))
+        {
+            return text_only("Child review is complete.");
+        }
+        if request
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .is_some_and(|content| content.contains("rope-e2e-agent"))
+        {
+            return vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call-agent-e2e".into()),
+                    name: Some("subagent".into()),
+                    arguments: serde_json::json!({
+                        "agent": "review", "prompt": "rope-e2e-agent-child"
+                    })
+                    .to_string(),
+                },
+                ResponseDelta::Completed,
+            ];
+        }
         // send_file regression: a marked prompt starts the turn, and the two
         // tool results that follow each get a scripted reply — none of it
         // consumes the script queue.
@@ -327,6 +367,12 @@ async fn main() -> Result<()> {
     let token = std::env::var("ROPE_E2E_TOKEN").unwrap_or_else(|_| "e2e-token".into());
     let project = tempfile::tempdir().context("temp project")?;
     build_project(project.path())?;
+    let agents = project.path().join(".rope/agents");
+    std::fs::create_dir_all(&agents)?;
+    std::fs::write(
+        agents.join("review.md"),
+        "+++\ndescription = \"Review code\"\nmode = \"all\"\n+++\nReview code carefully.\n",
+    )?;
     let storage = tempfile::tempdir().context("temp storage")?;
 
     let mut config = Config::default();
@@ -371,6 +417,7 @@ async fn main() -> Result<()> {
         web_search: Approval::Ask,
         external: Approval::Ask,
         mcp: Approval::Ask,
+        subagent: Approval::Allow,
     };
 
     let core = Core::new(

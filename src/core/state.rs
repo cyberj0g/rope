@@ -111,6 +111,10 @@ pub struct Block {
     pub tool: Option<ToolView>,
     pub timer: Timer,
     pub queued: bool,
+    /// The agent that produced this assistant block; `None` for the
+    /// built-in assistant and for history written before agents existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Total time the turn took, on the turn's final assistant block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
@@ -120,6 +124,19 @@ pub struct Block {
 pub struct Approval {
     pub id: String,
     pub call: ToolCall,
+}
+
+/// One child session linked to a `subagent` invocation, as shown in the
+/// parent's snapshot. `status` is `running` while the invocation is active,
+/// then the terminal state from the call's structured result.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ChildLink {
+    pub session: String,
+    pub agent: String,
+    #[serde(default)]
+    pub prompt: String,
+    pub tool_call_id: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -142,11 +159,23 @@ pub struct SessionState {
     pub notice: Option<String>,
     pub output_tokens: u64,
     pub generation_ms: u64,
+    /// The selected agent ID; `None` is the built-in assistant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The child session the active `subagent` call is waiting on, if any.
+    /// While set, a user message sent from this session steers that child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<String>,
+    /// Every child session this session created, with terminal state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ChildLink>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Snapshot {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<crate::session::ParentRef>,
     pub seq: u64,
     pub blocks: Vec<Block>,
     pub state: SessionState,
@@ -243,6 +272,7 @@ impl Projection {
             tool: None,
             timer: Timer::default(),
             queued: false,
+            agent: None,
             duration_ms: None,
         }
     }
@@ -330,6 +360,7 @@ impl Projection {
                     model,
                     tool_calls,
                     duration_ms,
+                    agent,
                     ..
                 } => {
                     if !reasoning.is_empty() {
@@ -345,6 +376,7 @@ impl Projection {
                         let mut block = self.block(kind, content.clone());
                         block.model = model.clone();
                         block.duration_ms = *duration_ms;
+                        block.agent = agent.clone();
                         self.push(block, changes);
                     }
                     for call in tool_calls {
@@ -443,9 +475,20 @@ impl Projection {
             Event::SettingsChanged {
                 model,
                 reasoning_effort,
+                agent,
             } => {
                 self.snapshot.state.model = model.clone();
                 self.snapshot.state.reasoning_effort = *reasoning_effort;
+                self.snapshot.state.agent = agent.clone();
+            }
+            Event::DelegationChanged { child, children } => {
+                self.snapshot.state.delegation = child.clone();
+                self.snapshot.state.children = children.clone();
+            }
+            Event::SteerReceipt { to, agent } => {
+                let mut block = self.block(BlockKind::Status, format!("steered to {agent} ({to})"));
+                block.queued = false;
+                self.push(block, &mut changes);
             }
             Event::SettingsRevision(revision) => self.snapshot.state.settings_revision = *revision,
             Event::ProjectChanged(project) => {
@@ -510,6 +553,7 @@ impl Projection {
                             String::new(),
                         );
                         block.model = self.snapshot.state.response_model.clone();
+                        block.agent = self.snapshot.state.agent.clone();
                         if thinking {
                             block.timer.resume();
                         }
@@ -652,6 +696,20 @@ impl Projection {
                 success,
                 diff,
             } => {
+                if let Some(child) = self
+                    .snapshot
+                    .state
+                    .children
+                    .iter_mut()
+                    .find(|child| child.tool_call_id == *call_id)
+                {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output)
+                        && let Some(status) =
+                            value.get("status").and_then(serde_json::Value::as_str)
+                    {
+                        child.status = status.to_owned();
+                    }
+                }
                 if let Some(&index) = self.calls.get(call_id) {
                     let block = &mut self.snapshot.blocks[index];
                     block.timer.pause();

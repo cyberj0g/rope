@@ -13,15 +13,16 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    agent::{Agent, AgentInfo},
     config::Config,
-    runtime::{FileContent, ImageContent},
+    runtime::{FileContent, ImageContent, SubagentOutcome},
 };
 use builtin::{
     EditTool, ListFilesTool, ReadTool, SearchFilesTool, SendFileTool, UpdatePlanTool,
@@ -141,6 +142,11 @@ pub struct ToolEntry {
     pub tool: Arc<dyn Tool>,
     pub approval: Approval,
     pub approval_key: String,
+    /// The policy category an agent `[tools]` override matches on: the
+    /// tool's own name for built-ins, `external` for user tools, `mcp` for
+    /// MCP tools. The exact registered name (including `server:tool` for
+    /// MCP) always outranks the category.
+    pub category: String,
     origin: Option<String>,
 }
 
@@ -169,11 +175,14 @@ impl ToolRegistry {
         approval: Approval,
         approval_key: String,
     ) {
+        // Built-in tools: the tool's own name is its policy category.
+        let name = tool.name().to_owned();
         self.tools.write().unwrap().insert(
-            tool.name().to_owned(),
+            name.clone(),
             ToolEntry {
                 tool: Arc::new(tool),
                 approval,
+                category: name,
                 approval_key,
                 origin: None,
             },
@@ -192,10 +201,11 @@ impl ToolRegistry {
             bail!("duplicate tool name: {name}");
         }
         tools.insert(
-            name,
+            name.clone(),
             ToolEntry {
                 tool: Arc::new(tool),
                 approval,
+                category: name,
                 approval_key,
                 origin: None,
             },
@@ -206,10 +216,10 @@ impl ToolRegistry {
     pub(crate) fn replace_origin<T: Tool + 'static>(
         &self,
         origin: &str,
-        entries: Vec<(T, Approval, String)>,
+        entries: Vec<(T, Approval, String, String)>,
     ) -> Result<usize> {
         let mut replacement = BTreeMap::new();
-        for (tool, approval, approval_key) in entries {
+        for (tool, approval, approval_key, category) in entries {
             let name = tool.name().to_owned();
             if replacement.contains_key(&name) {
                 bail!("duplicate tool name: {name}");
@@ -220,6 +230,7 @@ impl ToolRegistry {
                     tool: Arc::new(tool),
                     approval,
                     approval_key,
+                    category,
                     origin: Some(origin.to_owned()),
                 },
             );
@@ -277,6 +288,50 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// The effective approval for `name` under `agent`: the agent's exact
+    /// tool entry, then its category entry, then the configured policy.
+    /// `None` when the tool is not registered.
+    pub fn effective(&self, agent: &Agent, name: &str) -> Option<Approval> {
+        let tools = self.tools.read().unwrap();
+        let entry = tools.get(name)?;
+        Some(agent.effective_policy(name, &entry.category, entry.approval))
+    }
+
+    /// The approval key stored in session approvals: scoped by the acting
+    /// agent so one agent's grants never apply to another.
+    pub fn approval_key(&self, agent: &Agent, name: &str) -> Option<String> {
+        let tools = self.tools.read().unwrap();
+        let entry = tools.get(name)?;
+        Some(format!("{}|{}", agent.id, entry.approval_key))
+    }
+
+    /// The model-facing schemas for `agent`: tools whose effective policy
+    /// is `deny` are absent, and the `subagent` tool is advertised only to
+    /// agents that may delegate.
+    pub fn definitions_for(&self, agent: &Agent, vision: bool) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .unwrap()
+            .values()
+            .filter(|entry| vision || !entry.tool.vision_only())
+            .filter(|entry| {
+                let name = entry.tool.name();
+                if name == SubagentTool::NAME && !agent.can_call_subagents {
+                    return false;
+                }
+                agent.effective_policy(name, &entry.category, entry.approval) != Approval::Deny
+            })
+            .map(|entry| ToolDefinition {
+                r#type: "function",
+                function: FunctionDefinition {
+                    name: entry.tool.name().to_owned(),
+                    description: entry.tool.description().to_owned(),
+                    parameters: entry.tool.schema(),
+                },
+            })
+            .collect()
+    }
+
     pub async fn cancel_active(&self) {
         let tools = self
             .tools
@@ -310,10 +365,126 @@ impl ToolRegistry {
     }
 }
 
+/// The registered name of the delegation tool.
+pub const SUBAGENT_TOOL: &str = "subagent";
+
+/// The tool-facing schema and description for `subagent` delegation. The
+/// runtime executes `subagent` calls itself — it supplies the
+/// session/turn/call identity the core needs — so `run` is never reached
+/// in normal operation.
+pub struct SubagentTool {
+    description: String,
+    agents: Vec<AgentInfo>,
+}
+
+impl SubagentTool {
+    pub const NAME: &str = SUBAGENT_TOOL;
+
+    /// Builds the tool for the delegable agents in the catalog. An empty
+    /// list still yields a usable schema so a model that calls it gets a
+    /// clear error instead of a crash.
+    pub fn new(agents: Vec<AgentInfo>) -> Self {
+        let description = {
+            let mut text = String::from(
+                "Delegate a self-contained task to a specialized agent and wait for its \
+                 final answer. The agent works in its own session with its own tools and \
+                 instructions; pass everything it needs in the prompt. \
+                 Available agents:",
+            );
+            if agents.is_empty() {
+                text.push_str(" (none)");
+            }
+            for agent in &agents {
+                text.push_str(&format!("\n- {}: {}", agent.id, agent.description));
+            }
+            text
+        };
+        Self {
+            description,
+            agents,
+        }
+    }
+
+    pub fn agent_ids(&self) -> Vec<String> {
+        self.agents.iter().map(|agent| agent.id.clone()).collect()
+    }
+
+    /// Validates a call's agent against the delegable set.
+    pub fn is_delegable(&self, id: &str) -> bool {
+        self.agents.iter().any(|agent| agent.id == id)
+    }
+}
+
+#[async_trait]
+impl Tool for SubagentTool {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "The agent ID to delegate to",
+                    "enum": self.agent_ids(),
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The complete task for the agent, self-contained",
+                },
+            },
+            "required": ["agent", "prompt"],
+            "additionalProperties": false,
+        })
+    }
+    async fn run(&self, _args: Value) -> Result<ToolResult> {
+        bail!("subagent calls are executed by the runtime, not by the tool")
+    }
+}
+
+/// One delegation request from a parent session's runtime to the core. The
+/// runtime supplies the identity of the call that is waiting; the core
+/// creates the child, links both sessions, and resolves `reply` exactly
+/// once when the child's turn settles.
+pub struct DelegationRequest {
+    pub parent_session: String,
+    pub parent_turn: String,
+    pub tool_call_id: String,
+    pub agent: String,
+    pub prompt: String,
+    /// The caller's current model profile: the fallback for a child whose
+    /// agent names no model of its own.
+    pub caller_model: String,
+    pub reply: oneshot::Sender<SubagentOutcome>,
+    /// Flipped when the waiting call stops waiting (its turn was
+    /// cancelled); the core then cancels the child's turn.
+    pub abandon: watch::Sender<bool>,
+}
+
+/// Commands the runtime sends to the core over the delegation port.
+pub enum DelegationCommand {
+    /// Spawn a child session for one `subagent` call.
+    Spawn(DelegationRequest),
+    /// Stop the parent's active delegation (if any) and wait for the
+    /// child to settle before acknowledging: cancellation must stop
+    /// descendant work before the parent reports its terminal result.
+    Cancel {
+        parent_session: String,
+        parent_turn: String,
+        ack: oneshot::Sender<()>,
+    },
+}
+
+/// The channel the runtime sends delegation commands over.
+pub type DelegationPort = mpsc::UnboundedSender<DelegationCommand>;
+
 pub async fn discover(config: &Config) -> Result<ToolRegistry> {
     discover_at(config, &std::env::current_dir()?).await
 }
-
 pub async fn discover_at(config: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
     let cwd = root.to_path_buf();
     let mut registry = ToolRegistry::default();

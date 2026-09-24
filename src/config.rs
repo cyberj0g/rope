@@ -167,6 +167,7 @@ pub struct ToolPolicies {
     pub web_search: Approval,
     pub external: Approval,
     pub mcp: Approval,
+    pub subagent: Approval,
 }
 
 impl Default for ToolPolicies {
@@ -184,6 +185,7 @@ impl Default for ToolPolicies {
             web_search: Approval::Ask,
             external: Approval::Ask,
             mcp: Approval::Ask,
+            subagent: Approval::Allow,
         }
     }
 }

@@ -301,6 +301,12 @@ const COMMANDS: &[SlashCommand] = &[
         argument: false,
     },
     SlashCommand {
+        name: "/agent",
+        title: "Switch agent",
+        hotkey: "Alt+A",
+        argument: false,
+    },
+    SlashCommand {
         name: "/reason",
         title: "Switch reasoning effort",
         hotkey: "Alt+R",
@@ -338,12 +344,14 @@ pub async fn run(
     session_id: String,
     request: Option<String>,
 ) -> Result<SessionSummary> {
+    let agents = core.agents().selectable();
     let (commands, mut events, _connection) =
         client::connect(core, config.clone(), session_id).await?;
     let mut history = PromptHistory::load().await?;
     let mut terminal = TerminalGuard::new()?;
     let mut renders = RenderState::new();
     let mut state = UiState::new();
+    state.agents = agents;
     state.recent_models.clone_from(&config.recent_models);
     state.recent_commands.clone_from(&config.recent_commands);
     let mut request = request;
@@ -558,6 +566,32 @@ async fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(true);
     }
+    if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Down {
+        if let Some(child) = state
+            .delegation
+            .clone()
+            .or_else(|| state.children.last().map(|c| c.session.clone()))
+        {
+            commands.send(Command::ResumeSession(child)).await?;
+        }
+        return Ok(false);
+    }
+    if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Up {
+        if let Some(parent) = &state.parent {
+            commands
+                .send(Command::ResumeSession(parent.session.clone()))
+                .await?;
+        }
+        return Ok(false);
+    }
+    if key.code == KeyCode::Esc && state.parent.is_some() && state.generating {
+        commands
+            .send(Command::Action(Action::Cancel {
+                turn_id: state.turn_id.clone().unwrap_or_default(),
+            }))
+            .await?;
+        return Ok(false);
+    }
     if let Some(view) = &mut state.raw_view {
         if key.code == KeyCode::Esc {
             state.raw_view = None;
@@ -566,10 +600,7 @@ async fn handle_key(
         }
         return Ok(false);
     }
-    if key.code == KeyCode::Char('r')
-        && state.selected().is_some()
-        && key.modifiers.is_empty()
-    {
+    if key.code == KeyCode::Char('r') && state.selected().is_some() && key.modifiers.is_empty() {
         open_raw(state, state.selected().unwrap(), commands).await?;
         return Ok(false);
     }
@@ -580,6 +611,7 @@ async fn handle_key(
         && state.input.is_empty()
         && state.session_picker.is_none()
         && state.model_picker.is_none()
+        && state.agent_picker.is_none()
     {
         let decision = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalDecision::AllowOnce),
@@ -600,6 +632,10 @@ async fn handle_key(
     }
     if state.model_picker.is_some() {
         handle_model_picker_key(key, config, state, commands).await?;
+        return Ok(false);
+    }
+    if state.agent_picker.is_some() {
+        handle_agent_picker_key(key, state, commands).await?;
         return Ok(false);
     }
     if state.session_picker.is_some() {
@@ -1108,11 +1144,13 @@ async fn dispatch(
             let id = state.begin_image_load("Processing file");
             let input_loads = input_loads.clone();
             tokio::spawn(async move {
-                input_loads.send(InputLoad {
-                    id,
-                    action: "attach file",
-                    result: file_from_path(&path).await,
-                }).ok();
+                input_loads
+                    .send(InputLoad {
+                        id,
+                        action: "attach file",
+                        result: file_from_path(&path).await,
+                    })
+                    .ok();
             });
             true
         }
@@ -1133,6 +1171,30 @@ async fn dispatch(
         }
         "/model" if argument.is_empty() => {
             open_model_picker(config, state);
+            true
+        }
+        "/agent" if argument.is_empty() => {
+            open_agent_picker(state);
+            true
+        }
+        "/agent" => {
+            let id = argument.trim().to_owned();
+            if state.agents.iter().any(|agent| agent.id == id) {
+                if state.generating {
+                    state.notice = Some(
+                        "finish or cancel the current response before switching agents".into(),
+                    );
+                } else {
+                    commands
+                        .send(Command::Action(Action::SetAgent {
+                            agent: id,
+                            revision: state.settings_revision,
+                        }))
+                        .await?;
+                }
+            } else {
+                state.set_error(&format!("unknown agent: {id}"));
+            }
             true
         }
         "/reason" if argument.is_empty() => {
@@ -1282,9 +1344,13 @@ async fn file_from_path(path: &Path) -> Result<LoadedInput> {
     let bytes = tokio::fs::read(path).await?;
     if image::guess_format(&bytes).is_ok() {
         let path = path.to_owned();
-        return tokio::task::spawn_blocking(move || image_from_path(&path).map(LoadedInput::Image)).await?;
+        return tokio::task::spawn_blocking(move || image_from_path(&path).map(LoadedInput::Image))
+            .await?;
     }
-    let name = path.file_name().and_then(|name| name.to_str()).context("file name is not UTF-8")?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("file name is not UTF-8")?;
     let prepared = crate::attachment::prepare_file(name.to_owned(), bytes).await?;
     Ok(LoadedInput::Text(prepared.prompt))
 }
@@ -1395,7 +1461,10 @@ async fn handle_mouse(
         view.borrow_mut().mouse(mouse);
         return Ok(());
     }
-    if state.model_picker.is_some() || state.session_picker.is_some() {
+    if state.model_picker.is_some()
+        || state.session_picker.is_some()
+        || state.agent_picker.is_some()
+    {
         return Ok(());
     }
     let MouseAreas {
@@ -1484,14 +1553,27 @@ async fn handle_mouse(
         return Ok(());
     }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && mouse.row == input.y {
-        let model_start = input.x + 2;
+        let agent_name = state.agent_name();
+        let agent_len = agent_name
+            .as_ref()
+            .map_or(0, |name| name.chars().count() as u16);
+        let agent_start = input.x + 2;
+        let agent_end = agent_start + agent_len;
+        let model_start = agent_end + if agent_len > 0 { 3 } else { 0 };
         let model_end = model_start + state.model.chars().count() as u16;
         let reason_start = model_end + 3;
         let reason_end = reason_start
             + state
                 .reasoning_effort
                 .map_or(3, |effort| effort.to_string().chars().count() as u16);
-        if (model_start..model_end).contains(&mouse.column) {
+        if agent_len > 0 && (agent_start..agent_end).contains(&mouse.column) {
+            if state.generating {
+                state.notice =
+                    Some("finish or cancel the current response before switching agents".into());
+            } else {
+                open_agent_picker(state);
+            }
+        } else if (model_start..model_end).contains(&mouse.column) {
             if state.generating {
                 state.notice =
                     Some("finish or cancel the current response before switching models".into());
@@ -1641,6 +1723,24 @@ async fn handle_mouse(
                 .find(|(_, r, c)| *r == row && *c == column)
             {
                 open_raw(state, *index, commands).await?;
+                return Ok(());
+            }
+            if let Some(index) =
+                chat_section_hit_test(state, conversation, mouse.row, &mut renders.chat)
+                && let Some(ChatBlock::Tool {
+                    call_id: Some(call_id),
+                    name,
+                    ..
+                }) = state.blocks.get(index)
+                && name == "subagent"
+                && let Some(child) = state
+                    .children
+                    .iter()
+                    .find(|child| child.tool_call_id == *call_id)
+            {
+                commands
+                    .send(Command::ResumeSession(child.session.clone()))
+                    .await?;
                 return Ok(());
             }
             if let Some(diff) = chat_diff_hit_test(
@@ -1883,12 +1983,14 @@ fn draw(
         }
     }
 
-    let mut title = vec![
-        Span::raw(" "),
-        Span::styled(&state.model, Style::default().fg(Color::Cyan)),
-        Span::raw(" · "),
-        Span::styled(effort, Style::default().fg(Color::Magenta)),
-    ];
+    let mut title = vec![Span::raw(" ")];
+    if let Some(agent) = state.agent_name() {
+        title.push(Span::styled(agent, Style::default().fg(Color::Yellow)));
+        title.push(Span::raw(" · "));
+    }
+    title.push(Span::styled(&state.model, Style::default().fg(Color::Cyan)));
+    title.push(Span::raw(" · "));
+    title.push(Span::styled(effort, Style::default().fg(Color::Magenta)));
     if let Some(call) = &state.approval {
         title.push(Span::styled(
             format!(" · {} approval: y once / n deny / s session", call.name),
@@ -1898,6 +2000,18 @@ fn draw(
     if state.generating {
         title.push(Span::styled(
             " · Enter to steer · Esc to cancel",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if state.parent.is_some() {
+        title.push(Span::styled(
+            " · Alt+↑ parent",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if !state.children.is_empty() {
+        title.push(Span::styled(
+            " · Alt+↓ subagent",
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -1951,6 +2065,7 @@ fn draw(
         }
     }
     draw_model_picker(frame, config, state);
+    draw_agent_picker(frame, state);
     draw_session_picker(frame, state);
     draw_toast(frame, state);
     chat_height
@@ -2038,6 +2153,192 @@ fn model_picker_item(model: &ModelConfig, state: &UiState) -> ListItem<'static> 
             Style::default().fg(Color::White),
         ),
         Span::styled(format!("  {detail}"), Style::default().fg(Color::DarkGray)),
+    ]))
+}
+
+fn open_agent_picker(state: &mut UiState) {
+    if state.generating {
+        state.notice = Some("finish or cancel the current response before switching agents".into());
+        return;
+    }
+    state.agent_picker = Some(state::AgentPicker::default());
+    if let Some(selected) = state
+        .agents
+        .iter()
+        .position(|agent| Some(agent.id.as_str()) == state.agent.as_deref())
+    {
+        state.agent_picker.as_mut().unwrap().selected = selected;
+    }
+}
+
+async fn handle_agent_picker_key(
+    key: KeyEvent,
+    state: &mut UiState,
+    commands: &mpsc::Sender<Command>,
+) -> Result<()> {
+    let indices = filtered_agent_indices(state);
+    match key.code {
+        KeyCode::Esc => state.agent_picker = None,
+        KeyCode::Enter => {
+            let selected = state.agent_picker.as_ref().map(|p| p.selected).unwrap_or(0);
+            let Some(index) = indices.get(selected).copied() else {
+                return Ok(());
+            };
+            let Some(agent) = state.agents.get(index).map(|agent| agent.id.clone()) else {
+                return Ok(());
+            };
+            state.agent_picker = None;
+            commands
+                .send(Command::Action(Action::SetAgent {
+                    agent,
+                    revision: state.settings_revision,
+                }))
+                .await?;
+        }
+        _ => {
+            let picker = state.agent_picker.as_mut().unwrap();
+            match key.code {
+                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    picker.selected = (picker.selected + 1).min(indices.len().saturating_sub(1))
+                }
+                KeyCode::PageUp => picker.selected = picker.selected.saturating_sub(10),
+                KeyCode::PageDown => {
+                    picker.selected = (picker.selected + 10).min(indices.len().saturating_sub(1))
+                }
+                KeyCode::Home => picker.selected = 0,
+                KeyCode::End => picker.selected = indices.len().saturating_sub(1),
+                KeyCode::Backspace => {
+                    if let Some((start, _)) =
+                        picker.query[..picker.cursor].char_indices().next_back()
+                    {
+                        picker.query.replace_range(start..picker.cursor, "");
+                        picker.cursor = start;
+                        picker.selected = 0;
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(character) = picker.query[picker.cursor..].chars().next() {
+                        picker
+                            .query
+                            .replace_range(picker.cursor..picker.cursor + character.len_utf8(), "");
+                        picker.selected = 0;
+                    }
+                }
+                KeyCode::Left => {
+                    if let Some((start, _)) =
+                        picker.query[..picker.cursor].char_indices().next_back()
+                    {
+                        picker.cursor = start;
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(character) = picker.query[picker.cursor..].chars().next() {
+                        picker.cursor += character.len_utf8();
+                    }
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    picker.query.clear();
+                    picker.cursor = 0;
+                    picker.selected = 0;
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    picker.query.insert(picker.cursor, character);
+                    picker.cursor += character.len_utf8();
+                    picker.selected = 0;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn filtered_agent_indices(state: &UiState) -> Vec<usize> {
+    let query = state
+        .agent_picker
+        .as_ref()
+        .map(|picker| picker.query.to_ascii_lowercase())
+        .unwrap_or_default();
+    state
+        .agents
+        .iter()
+        .enumerate()
+        .filter(|(_, agent)| {
+            query.is_empty()
+                || agent.name.to_ascii_lowercase().contains(&query)
+                || agent.id.to_ascii_lowercase().contains(&query)
+                || agent.description.to_ascii_lowercase().contains(&query)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn draw_agent_picker(frame: &mut ratatui::Frame, state: &UiState) {
+    let Some(picker) = &state.agent_picker else {
+        return;
+    };
+    let area = modal_area(frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Select agent · ↑↓ navigate · Enter select · Esc close ")
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [search, list] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .areas(inner);
+    frame.render_widget(
+        Paragraph::new(picker.query.clone()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Filter agents "),
+        ),
+        search,
+    );
+    let indices = filtered_agent_indices(state);
+    let items = indices
+        .iter()
+        .map(|index| agent_picker_item(&state.agents[*index], state))
+        .collect::<Vec<_>>();
+    let mut list_state = ListState::default();
+    if !items.is_empty() {
+        list_state.select(Some(picker.selected.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("› ").highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        list,
+        &mut list_state,
+    );
+    let cursor_column = picker.query[..picker.cursor].chars().count() as u16;
+    frame.set_cursor_position((
+        search.x + 1 + cursor_column.min(search.width.saturating_sub(3)),
+        search.y + 1,
+    ));
+}
+
+fn agent_picker_item(agent: &crate::agent::AgentInfo, state: &UiState) -> ListItem<'static> {
+    let marker = if state.agent.as_deref() == Some(agent.id.as_str()) {
+        "●"
+    } else {
+        " "
+    };
+    ListItem::new(Line::from(vec![
+        Span::styled(
+            format!("{marker} {}", agent.name),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            format!("  {}", agent.description),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]))
 }
 
@@ -2237,6 +2538,7 @@ fn hotkey_command(key: KeyEvent) -> Option<&'static str> {
         (KeyModifiers::CONTROL, KeyCode::Char('n')) => Some("/new"),
         (KeyModifiers::CONTROL, KeyCode::Char('d')) => Some("/diff"),
         (KeyModifiers::ALT, KeyCode::Char('m')) => Some("/model"),
+        (KeyModifiers::ALT, KeyCode::Char('a')) => Some("/agent"),
         (KeyModifiers::ALT, KeyCode::Char('r')) => Some("/reason"),
         (KeyModifiers::ALT, KeyCode::Char('t')) => Some("/thinking"),
         (KeyModifiers::ALT, KeyCode::Char('o')) => Some("/tools"),
@@ -4221,16 +4523,26 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("notes with spaces.txt");
         std::fs::write(&path, "original content").unwrap();
-        let LoadedInput::Text(text) = file_from_path(&path).await.unwrap() else { panic!("expected a file path") };
-        let file: crate::runtime::FileContent = serde_json::from_str(text.strip_prefix("Attached file: ").unwrap()).unwrap();
+        let LoadedInput::Text(text) = file_from_path(&path).await.unwrap() else {
+            panic!("expected a file path")
+        };
+        let file: crate::runtime::FileContent =
+            serde_json::from_str(text.strip_prefix("Attached file: ").unwrap()).unwrap();
         assert_ne!(Path::new(&file.path), path);
         assert_eq!(file.name, "notes with spaces.txt");
-        assert_eq!(std::fs::read_to_string(&file.path).unwrap(), "original content");
+        assert_eq!(
+            std::fs::read_to_string(&file.path).unwrap(),
+            "original content"
+        );
         std::fs::remove_dir_all(Path::new(&file.path).parent().unwrap()).unwrap();
 
         let image_path = directory.path().join("image.png");
-        image::DynamicImage::new_rgb8(2, 3).save(&image_path).unwrap();
-        let LoadedInput::Image(image) = file_from_path(&image_path).await.unwrap() else { panic!("expected image input") };
+        image::DynamicImage::new_rgb8(2, 3)
+            .save(&image_path)
+            .unwrap();
+        let LoadedInput::Image(image) = file_from_path(&image_path).await.unwrap() else {
+            panic!("expected image input")
+        };
         assert_eq!((image.width, image.height), (2, 3));
     }
 

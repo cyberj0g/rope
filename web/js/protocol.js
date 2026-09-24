@@ -78,7 +78,7 @@ function receive(message) {
   switch (message.type) {
     case "hello":
       S.clientId = message.client_id; S.serverId = message.server_id;
-      S.models = message.models; S.projectRoot = message.project_root;
+      S.models = message.models; S.agents = message.agents || []; S.projectRoot = message.project_root;
       events.dispatchEvent(new Event("render"));
       if (S.selected) request({ type: "subscribe", session_id: S.selected }, () => {});
       break;

@@ -15,8 +15,13 @@ pub async fn prepare_file(name: String, bytes: Vec<u8>) -> Result<PreparedFile> 
     let mut prompt = file_prompt(&file);
     if let Some(preview) = crate::file_processing::preview(
         Path::new(&file.path),
-        &[&crate::file_processing::ArchiveListing, &crate::file_processing::PdfText],
-    ).await {
+        &[
+            &crate::file_processing::ArchiveListing,
+            &crate::file_processing::PdfText,
+        ],
+    )
+    .await
+    {
         prompt.push_str("\n");
         prompt.push_str(&preview);
     }
@@ -34,7 +39,9 @@ pub fn store_file(name: &str, bytes: &[u8]) -> Result<FileContent> {
     let root = Path::new("/tmp").to_path_buf();
     #[cfg(not(unix))]
     let root = std::env::temp_dir();
-    let directory = tempfile::Builder::new().prefix("rope-upload-").tempdir_in(root)?;
+    let directory = tempfile::Builder::new()
+        .prefix("rope-upload-")
+        .tempdir_in(root)?;
     let path = directory.path().join(name);
     std::fs::write(&path, bytes).context("store uploaded file")?;
     let file = FileContent {
@@ -71,7 +78,15 @@ mod tests {
 
     #[test]
     fn uploads_reject_paths() {
-        for name in ["", ".", "..", "../file", "/tmp/file", "C:\\file", "bad\0name"] {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../file",
+            "/tmp/file",
+            "C:\\file",
+            "bad\0name",
+        ] {
             assert!(store_file(name, b"data").is_err(), "{name:?}");
         }
     }

@@ -3,7 +3,7 @@ import { LS, S, prefs, savePrefs, draft } from "./state.js";
 import { request, command, commandTo, select } from "./protocol.js";
 import { updateSendBtn, newSession } from "./status.js";
 import { clearAttachments, uploadAttachment, closeCamera } from "./attachments.js";
-import { openSheet, closeSheet, fillPlanBody } from "./panels.js";
+import { openSheet, closeSheet, fillPlanBody, openAgentPicker } from "./panels.js";
 import { openSearch, closeSearch } from "./search.js";
 import { renderChat } from "./chat.js";
 
@@ -20,6 +20,9 @@ input.addEventListener("input", () => {
   updateSendBtn();
 });
 input.addEventListener("keydown", e => {
+  if (e.key === "Escape" && S.sessions.get(S.selected)?.parent && S.sessions.get(S.selected)?.state?.turn_id) {
+    e.preventDefault(); e.stopPropagation(); cancelTurn(true); return;
+  }
   if (e.key === "Escape" && palIndex >= 0) {
     e.preventDefault();
     // Dismissing the palette must not bubble up to the document handler,
@@ -72,6 +75,9 @@ $("sendBtn").onclick = pressEnter;
 $("cancelBtn").onclick = () => cancelTurn(false);
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
+    if (S.sessions.get(S.selected)?.parent && S.sessions.get(S.selected)?.state?.turn_id) {
+      e.preventDefault(); cancelTurn(true); return;
+    }
     // One priority order: close the topmost overlay first, otherwise cancel
     // the active turn — even while the composer has focus.
     if ($("viewer").classList.contains("on")) { $("viewer").classList.remove("on"); return; }
@@ -124,6 +130,7 @@ const COMMANDS = [
   { c: "/new", d: "Start a new conversation (/new my name names it)" },
   { c: "/compact", d: "Compact the conversation context" },
   { c: "/model", d: "Choose model & reasoning effort" },
+  { c: "/agent", d: "Switch active agent" },
   { c: "/thinking", d: "Toggle thinking blocks (/thinking off)" },
   { c: "/tools", d: "Toggle tool blocks (/tools off)" },
   { c: "/plan", d: "Show the plan" },
@@ -184,6 +191,16 @@ async function runSlash(cmd, rest) {
     else command({ type: "compact" }).catch(e => toast(e.message, "err"));
   }
   else if (cmd === "/model") $("chipModel").click();
+  else if (cmd === "/agent") {
+    if (!arg) openAgentPicker();
+    else {
+      const st = S.selected && S.sessions.get(S.selected)?.state;
+      if (!st) toast("Open a conversation first", "err");
+      else if (!S.agents.some(a => a.id === arg)) toast(`Unknown agent: ${arg}`, "err");
+      else command({ type: "set_agent", agent: arg, revision: st.settings_revision })
+        .catch(e => toast(e.message, "err"));
+    }
+  }
   else if (cmd === "/thinking") prefs.showThinking = arg === "off" ? false : !prefs.showThinking;
   else if (cmd === "/tools") prefs.showTools = arg === "off" ? false : !prefs.showTools;
   else if (cmd === "/sound") prefs.sound = arg === "off" ? false : !prefs.sound;

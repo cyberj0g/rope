@@ -64,7 +64,10 @@ impl CatalogView {
     }
 
     /// The rows this view currently shows, newest first.
-    fn page<'a>(&self, sessions: &'a [crate::protocol::CatalogEntry]) -> Vec<&'a crate::protocol::CatalogEntry> {
+    fn page<'a>(
+        &self,
+        sessions: &'a [crate::protocol::CatalogEntry],
+    ) -> Vec<&'a crate::protocol::CatalogEntry> {
         let filtered = filter_sessions(sessions, self.query.as_deref());
         filtered.into_iter().take(self.offset).collect()
     }
@@ -284,9 +287,7 @@ impl Server {
             .route("/ws", get(upgrade))
             .route(
                 "/",
-                get(|| async {
-                    axum::response::Html(include_str!("../web/index.html"))
-                }),
+                get(|| async { axum::response::Html(include_str!("../web/index.html")) }),
             )
             .route("/assets/{*path}", get(web_asset))
             .merge(attachments)
@@ -492,10 +493,19 @@ struct UploadQuery {
     filename: Option<String>,
 }
 
-async fn upload(State(app): State<App>, Path(session): Path<String>, Query(query): Query<UploadQuery>, bytes: Bytes) -> Response {
+async fn upload(
+    State(app): State<App>,
+    Path(session): Path<String>,
+    Query(query): Query<UploadQuery>,
+    bytes: Bytes,
+) -> Response {
     let result = match query.filename {
         Some(name) => app.core.upload(&session, &name, &bytes).await,
-        None => app.core.attach(&session, &bytes).await.and_then(|image| Ok(serde_json::to_value(image)?)),
+        None => app
+            .core
+            .attach(&session, &bytes)
+            .await
+            .and_then(|image| Ok(serde_json::to_value(image)?)),
     };
     match result {
         Ok(attachment) => axum::Json(attachment).into_response(),
@@ -658,7 +668,8 @@ async fn connection(mut socket: WebSocket, app: App) -> Result<()> {
     enqueue(
         &output,
         &json!({"type":"hello","protocol":protocol::VERSION,"server_id":app.server_id,
-        "client_id":client_id,"models":app.core.models(),"project_root":app.core.project_root()}),
+        "client_id":client_id,"models":app.core.models(),"agents":app.core.agents().selectable(),
+        "project_root":app.core.project_root()}),
     )
     .await?;
     let redactor = Arc::new(Mutex::new(Redactor::new()));

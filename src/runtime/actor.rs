@@ -11,11 +11,13 @@ pub fn spawn_session<P: Provider + ?Sized>(
     session: Session,
     messages: Vec<Message>,
     project: ProjectState,
+    agents: Arc<crate::agent::AgentCatalog>,
+    delegation: crate::tool::DelegationPort,
 ) -> (mpsc::Sender<Command>, mpsc::Receiver<Event>, JoinHandle<()>) {
     let (commands, receiver) = mpsc::channel(16);
     let (events, output) = mpsc::channel(64);
     let task = tokio::spawn(run(
-        config, provider, tools, session, messages, project, receiver, events,
+        config, provider, tools, session, messages, project, agents, delegation, receiver, events,
     ));
     (commands, output, task)
 }
@@ -28,6 +30,8 @@ pub(super) async fn run<P: Provider + ?Sized>(
     mut session: Session,
     mut messages: Vec<Message>,
     project: ProjectState,
+    agents: Arc<crate::agent::AgentCatalog>,
+    delegation: crate::tool::DelegationPort,
     mut commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<Event>,
 ) {
@@ -38,6 +42,50 @@ pub(super) async fn run<P: Provider + ?Sized>(
     let mut pending_prompts: SteerQueue = Arc::new(Mutex::new(Vec::new()));
 
     let mut settings_revision = 0;
+
+    // Resolve the session's agent: the saved selection when it is still
+    // available, otherwise the built-in assistant. A vanished custom agent
+    // keeps the transcript inspectable but blocks new turns.
+    let mut agent_missing: Option<String> = None;
+    let mut agent = match &session.meta.settings {
+        Some(settings) if settings.agent.is_some() => {
+            let id = settings.agent.clone().unwrap();
+            match agents.get(&id) {
+                Some(agent)
+                    if agent.selectable()
+                        || session
+                            .meta
+                            .parent
+                            .as_ref()
+                            .is_some_and(|parent| parent.agent == id && agent.delegable()) =>
+                {
+                    agent.clone()
+                }
+                _ => {
+                    agent_missing = Some(id.clone());
+                    agents
+                        .get(crate::agent::ASSISTANT_ID)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            // The catalog always contains the built-in.
+                            unreachable!()
+                        })
+                }
+            }
+        }
+        _ => agents
+            .get(crate::agent::ASSISTANT_ID)
+            .cloned()
+            .unwrap_or_else(|| unreachable!()),
+    };
+    if let Some(id) = &agent_missing {
+        events
+            .send(Event::Notice(format!(
+                "saved agent '{id}' is no longer available; select an agent to continue"
+            )))
+            .await
+            .ok();
+    }
 
     if let Some(settings) = &session.meta.settings {
         if config.select_model(&settings.model).is_ok() {
@@ -62,7 +110,7 @@ pub(super) async fn run<P: Provider + ?Sized>(
         .await
         .ok();
     send_usage(&events, &session).await;
-    send_settings(&events, &config).await;
+    send_settings(&events, &config, &agent).await;
     send_context(&events, &session, &config).await;
     events
         .send(Event::ProjectChanged(project.clone()))
@@ -94,7 +142,12 @@ pub(super) async fn run<P: Provider + ?Sized>(
                 let mut error = None;
                 match command {
                     Command::Submit(prompt) | Command::Steer(prompt) => {
-                        if compacting.is_some() {
+                        if let Some(missing) = &agent_missing {
+                            error = Some(CommandError::new(
+                                "agent_unavailable",
+                                format!("saved agent '{missing}' is no longer available; select an agent first"),
+                            ));
+                        } else if compacting.is_some() {
                             error = Some(CommandError::new("busy", "manual compaction is running"));
                         } else if generation.is_some() {
                             // The steer message is the raw prompt — no
@@ -107,8 +160,10 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         } else {
                             let first = prompt.user_message(session.meta.plan.as_ref());
                             events.send(Event::MessageAccepted(first.clone())).await.ok();
+                            let session_name = session.meta.name.clone();
                             spawn_turn(&mut generation, &mut pending_prompts, &mut messages,
                                 &mut session, &project, &provider, &tools, &config, first,
+                                &agent, session_name, &delegation, agents.clone(),
                                 &events, &internal_tx).await;
                         }
                     }
@@ -116,6 +171,22 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         if let Some(active) = generation.take() {
                             active.task.abort();
                             active.task.await.ok();
+                            // Stop the delegation this turn was waiting on,
+                            // and wait for the descendants to settle before
+                            // the cancellation is reported.
+                            let (ack, ack_rx) = oneshot::channel();
+                            delegation
+                                .send(crate::tool::DelegationCommand::Cancel {
+                                    parent_session: session.meta.name.clone(),
+                                    parent_turn: active.id.clone(),
+                                    ack,
+                                })
+                                .ok();
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                ack_rx,
+                            )
+                            .await;
                             tools.cancel_active().await;
                             pending_approval = None;
                             if let Err(failure) = persist_interrupted_turn(&mut messages, &mut session,
@@ -144,7 +215,7 @@ pub(super) async fn run<P: Provider + ?Sized>(
                             pending.reply.send(decision).ok();
                         }
                     }
-                    Command::SelectModel(_) | Command::SetReasoning(_)
+                    Command::SelectModel(_) | Command::SetReasoning(_) | Command::SetAgent(_)
                         if generation.is_some() || compacting.is_some() => {
                             error = Some(CommandError::new("busy", "finish or cancel the active operation before changing settings"));
                         }
@@ -161,17 +232,96 @@ pub(super) async fn run<P: Provider + ?Sized>(
                             error = Some(CommandError::new("invalid_settings", failure.to_string()));
                         } else {
                             let old_settings = session.meta.settings.clone();
-                            session.meta.settings = Some(SessionSettings { model: config.model_name().into(), reasoning_effort: config.effective_reasoning_effort() });
+                            // Model/reasoning changes keep the selected agent;
+                            // its ID is persisted so a reload restores it.
+                            session.meta.settings = Some(SessionSettings { model: config.model_name().into(), reasoning_effort: config.effective_reasoning_effort(), agent: (agent.id != crate::agent::ASSISTANT_ID).then(|| agent.id.clone()) });
                             if let Err(failure) = session.save().await {
                                 config = old; session.meta.settings = old_settings;
                                 error = Some(CommandError::new("persistence", format!("save settings: {failure:#}")));
                             } else {
                                 settings_revision += 1;
                                 events.send(Event::SettingsRevision(settings_revision)).await.ok();
-                                send_settings(&events, &config).await;
+                                send_settings(&events, &config, &agent).await;
                                 send_context(&events, &session, &config).await;
                             }
                         }
+                    }
+                    Command::SetAgent(id) => {
+                        let selected = agents.get(&id).filter(|candidate| {
+                            candidate.selectable() || candidate.id == agent.id
+                        });
+                        if selected.is_none() {
+                            error = Some(CommandError::new("invalid_settings", format!("unknown agent: {id}")));
+                        }
+                        if let Some(selected) = selected {
+                            let selected = selected.clone();
+                            let old = config.clone();
+                            let old_agent = agent.clone();
+                            let old_settings = session.meta.settings.clone();
+                            // Switching agents applies the agent's default
+                            // model and its reasoning defaults atomically.
+                            let model = selected.default_model(&config).to_owned();
+                            let changed = config.select_model(&model).map(|()| {
+                                config.reasoning_effort = config.active_model().reasoning_effort;
+                            });
+                            if let Err(failure) = changed {
+                                error = Some(CommandError::new("invalid_settings", failure.to_string()));
+                            } else {
+                                session.meta.settings = Some(SessionSettings {
+                                    model: config.model_name().into(),
+                                    reasoning_effort: config.effective_reasoning_effort(),
+                                    agent: (id != crate::agent::ASSISTANT_ID).then(|| id.clone()),
+                                });
+                                if let Err(failure) = session.save().await {
+                                    config = old;
+                                    agent = old_agent;
+                                    session.meta.settings = old_settings;
+                                    error = Some(CommandError::new("persistence", format!("save settings: {failure:#}")));
+                                } else {
+                                    agent = selected;
+                                    agent_missing = None;
+                                    settings_revision += 1;
+                                    events.send(Event::SettingsRevision(settings_revision)).await.ok();
+                                    send_settings(&events, &config, &agent).await;
+                                    send_context(&events, &session, &config).await;
+                                }
+                            }
+                        }
+                    }
+                    Command::RecordDelegation {
+                        turn_id,
+                        tool_call_id,
+                        child,
+                        agent: _agent_id,
+                        reply,
+                    } => {
+                        // The reciprocal record is persisted before the
+                        // child's work starts, so a restart always knows
+                        // which child a parent call belongs to.
+                        let mut record_error = None;
+                        if generation.as_ref().map(|turn| turn.id.clone()) != Some(turn_id) {
+                            record_error = Some("the turn is no longer active".to_owned());
+                        } else if session
+                            .meta
+                            .delegations
+                            .insert(tool_call_id.clone(), child.clone())
+                            .is_none()
+                        {
+                            if !session.meta.children.contains(&child) {
+                                session.meta.children.push(child.clone());
+                            }
+                            if let Err(failure) = session.save().await {
+                                session.meta.delegations.remove(&tool_call_id);
+                                session.meta.children.retain(|name| name != &child);
+                                record_error = Some(format!("save delegation record: {failure:#}"));
+                            }
+                        }
+                        reply
+                            .send(record_error.map_or(Ok(()), Err))
+                            .ok();
+                    }
+                    Command::Observe(reply) => {
+                        events.send(Event::Barrier(Arc::new(Mutex::new(Some(reply))))).await.ok();
                     }
                     Command::Compact if generation.is_none() && compacting.is_none() => {
                         let context = request_context(&messages, &session.meta);
@@ -195,6 +345,15 @@ pub(super) async fn run<P: Provider + ?Sized>(
                     Command::Shutdown(reply) => {
                         if let Some(active) = generation.take() {
                             active.task.abort(); active.task.await.ok();
+                            let (ack, ack_rx) = oneshot::channel();
+                            delegation
+                                .send(crate::tool::DelegationCommand::Cancel {
+                                    parent_session: session.meta.name.clone(),
+                                    parent_turn: active.id.clone(),
+                                    ack,
+                                })
+                                .ok();
+                            let _ = tokio::time::timeout(std::time::Duration::from_secs(60), ack_rx).await;
                             if let Err(failure) = persist_interrupted_turn(&mut messages, &mut session, active.progress, &pending_prompts, CANCELLED_BY_USER).await {
                                 error = Some(CommandError::new("persistence", format!("save interrupted turn: {failure:#}")));
                             }
@@ -218,7 +377,7 @@ pub(super) async fn run<P: Provider + ?Sized>(
                     reply.send(match error {
                         Some(error) => Err(error),
                         None => Ok(Accepted { turn_id: generation.as_ref().map(|turn| turn.id.clone())
-                            .or_else(|| compacting.as_ref().map(|(id, _)| id.clone())), settings_revision }),
+                            .or_else(|| compacting.as_ref().map(|(id, _)| id.clone())), settings_revision, routed_to: None }),
                     }).ok();
                 } else if let Some(error) = error {
                     events.send(Event::Error(error.message)).await.ok();
@@ -296,8 +455,11 @@ pub(super) async fn run<P: Provider + ?Sized>(
                         if !steered.is_empty() {
                             let first = steered.remove(0);
                             events.send(Event::SteersDelivered(1)).await.ok();
+                            let session_name = session.meta.name.clone();
                             spawn_turn(&mut generation, &mut pending_prompts, &mut messages, &mut session,
-                                &project, &provider, &tools, &config, first, &events, &internal_tx).await;
+                                &project, &provider, &tools, &config, first,
+                                &agent, session_name, &delegation, agents.clone(),
+                                &events, &internal_tx).await;
                             pending_prompts.lock().unwrap().extend(steered);
                         }
                     }
@@ -434,6 +596,14 @@ fn validate(
                 ));
             }
             Command::SetReasoning(effort)
+        }
+        Action::SetAgent {
+            agent,
+            revision: expected,
+        } => {
+            idle()?;
+            same_settings(expected)?;
+            Command::SetAgent(agent)
         }
         Action::Compact => {
             idle()?;

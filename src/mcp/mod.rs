@@ -112,7 +112,7 @@ pub async fn add_tools(registry: &mut ToolRegistry, config: &Config, root: &Path
                         let approval = tool.approval;
                         let approval_key =
                             format!("{}:{}", connected.connection.approval_prefix, tool.original);
-                        (tool, approval, approval_key)
+                        (tool, approval, approval_key, "mcp".to_owned())
                     })
                     .collect();
                 let count = match registry.replace_origin(&connected.connection.origin, entries) {
@@ -369,7 +369,7 @@ impl McpConnection {
                         let approval = tool.approval;
                         let approval_key =
                             format!("{}:{}", connection.approval_prefix, tool.original);
-                        (tool, approval, approval_key)
+                        (tool, approval, approval_key, "mcp".to_owned())
                     })
                     .collect();
                 registry.replace_origin(&connection.origin, entries).ok();

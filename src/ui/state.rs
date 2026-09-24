@@ -182,6 +182,15 @@ pub struct UiState {
     pub max_context_tokens: u64,
     pub model: String,
     pub reasoning_effort: Option<crate::runtime::ReasoningEffort>,
+    /// The session's selected agent ID; `None` is the built-in assistant.
+    pub agent: Option<String>,
+    /// The selectable agents, for the picker and display names.
+    pub agents: Vec<crate::agent::AgentInfo>,
+    /// The child session the active `subagent` call is waiting on, if any.
+    pub delegation: Option<String>,
+    /// The child sessions this session created, with terminal state.
+    pub children: Vec<crate::core::state::ChildLink>,
+    pub parent: Option<crate::session::ParentRef>,
     pub project: ProjectState,
     pub approval: Option<ToolCall>,
     pub palette_selected: usize,
@@ -201,6 +210,7 @@ pub struct UiState {
     pub plan_scroll: u16,
     pub search: Option<ChatSearch>,
     pub model_picker: Option<ModelPicker>,
+    pub agent_picker: Option<AgentPicker>,
     pub session_picker: Option<SessionPicker>,
     pub recent_models: Vec<String>,
     pub recent_commands: Vec<String>,
@@ -236,6 +246,13 @@ pub struct ChatSearch {
 
 #[derive(Default)]
 pub struct ModelPicker {
+    pub query: String,
+    pub cursor: usize,
+    pub selected: usize,
+}
+
+#[derive(Default)]
+pub struct AgentPicker {
     pub query: String,
     pub cursor: usize,
     pub selected: usize,
@@ -352,6 +369,11 @@ impl UiState {
             max_context_tokens: 0,
             model: String::new(),
             reasoning_effort: None,
+            agent: None,
+            agents: Vec::new(),
+            delegation: None,
+            children: Vec::new(),
+            parent: None,
             project: ProjectState::default(),
             approval: None,
             palette_selected: 0,
@@ -371,6 +393,7 @@ impl UiState {
             plan_scroll: 0,
             search: None,
             model_picker: None,
+            agent_picker: None,
             session_picker: None,
             recent_models: Vec::new(),
             recent_commands: Vec::new(),
@@ -399,6 +422,25 @@ impl UiState {
             diff_generation: 0,
             layout_generation: 0,
         }
+    }
+
+    /// The display name of the selected agent; the ID when the agent is no
+    /// longer in the catalog.
+    pub fn agent_name(&self) -> Option<String> {
+        let id = self.agent.as_deref().unwrap_or("assistant");
+        Some(
+            self.agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.name.clone())
+                .unwrap_or_else(|| {
+                    if id == "assistant" {
+                        "Assistant".into()
+                    } else {
+                        id.into()
+                    }
+                }),
+        )
     }
 
     /// Appends a block with a fresh render revision.
@@ -1259,9 +1301,27 @@ impl UiState {
             Event::SettingsChanged {
                 model,
                 reasoning_effort,
+                agent,
             } => {
                 self.model = model;
                 self.reasoning_effort = reasoning_effort;
+                self.agent = agent;
+            }
+            Event::DelegationChanged { child, children } => {
+                self.delegation = child;
+                self.children = children;
+            }
+            Event::SteerReceipt { to, agent } => {
+                self.push_block(ChatBlock::Message {
+                    label: "System".into(),
+                    content: format!("steered to {agent} ({to})"),
+                    images: Vec::new(),
+                    model: String::new(),
+                    kind: MessageKind::System,
+                    expanded: true,
+                    summary: None,
+                    duration: None,
+                });
             }
             Event::ProjectChanged(project) => {
                 self.project.cwd = project.cwd;
@@ -1765,7 +1825,11 @@ impl UiState {
                         _ => ("System", MessageKind::System),
                     };
                     ChatBlock::Message {
-                        label: label.into(),
+                        label: if block.kind == BlockKind::Assistant {
+                            block.agent.clone().unwrap_or_else(|| label.into())
+                        } else {
+                            label.into()
+                        },
                         kind,
                         content: block.content.clone(),
                         model: block.model.clone(),
@@ -1790,6 +1854,7 @@ impl UiState {
                 self.tool_drafts.insert(draft, index);
             }
         }
+        self.parent = snapshot.parent;
         let state = snapshot.state;
         self.session_id = snapshot.session_id;
         self.session = state.title;
@@ -1802,6 +1867,9 @@ impl UiState {
         self.model = state.model;
         self.response_model = state.response_model;
         self.reasoning_effort = state.reasoning_effort;
+        self.agent = state.agent;
+        self.delegation = state.delegation;
+        self.children = state.children;
         self.settings_revision = state.settings_revision;
         self.total_tokens = state.total_tokens;
         self.total_cost = state.total_cost;

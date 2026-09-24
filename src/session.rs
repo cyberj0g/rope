@@ -18,6 +18,23 @@ use crate::{
 pub struct SessionSettings {
     pub model: String,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The selected agent ID (`None` = the built-in assistant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// The link from one session to the subagent invocation that created it.
+/// Together with the parent's `delegations` map this is the durable,
+/// structured parent/child record: it survives compaction, restart, and
+/// transcript reconstruction.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ParentRef {
+    pub session: String,
+    pub turn: String,
+    pub tool_call_id: String,
+    pub agent: String,
+    #[serde(default)]
+    pub prompt: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -46,6 +63,46 @@ pub struct SessionMeta {
     pub compacted_through: usize,
     #[serde(default)]
     pub approved_tools: Vec<String>,
+    /// Set on child sessions: the session and tool call that created this
+    /// one. Child sessions stay out of the root session list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ParentRef>,
+    /// Parent-side reciprocal references: `subagent` tool call ID -> child
+    /// session name, persisted before the child's work starts.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub delegations: std::collections::BTreeMap<String, String>,
+    /// The child sessions this session created, in creation order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
+    /// Delegation depth: 0 for root sessions, one more than the parent's.
+    #[serde(default)]
+    pub depth: u8,
+}
+
+#[cfg(test)]
+impl SessionMeta {
+    /// A fully-populated meta for tests; override fields at the call site.
+    pub fn test() -> Self {
+        Self {
+            project_root: None,
+            settings: None,
+            name: "test".into(),
+            title: None,
+            plan: None,
+            created_at: 0,
+            total_tokens: 0,
+            total_cost: 0.0,
+            cost_complete: true,
+            context_tokens: 0,
+            compaction_summary: None,
+            compacted_through: 0,
+            approved_tools: Vec::new(),
+            parent: None,
+            delegations: std::collections::BTreeMap::new(),
+            children: Vec::new(),
+            depth: 0,
+        }
+    }
 }
 
 pub struct Session {
@@ -196,6 +253,10 @@ impl Session {
                 compaction_summary: None,
                 compacted_through: 0,
                 approved_tools: Vec::new(),
+                parent: None,
+                delegations: std::collections::BTreeMap::new(),
+                children: Vec::new(),
+                depth: 0,
             },
         };
         session.save().await?;
@@ -217,6 +278,17 @@ impl Session {
                 _ => {}
             }
         }
+        // Approvals were session-global before agents existed; scope the
+        // legacy keys to the assistant so another agent never inherits an
+        // earlier approval. This is the one-time migration.
+        let migrated = meta.approved_tools.iter().any(|tool| !tool.contains('|'));
+        if migrated {
+            for tool in &mut meta.approved_tools {
+                if !tool.contains('|') {
+                    *tool = format!("assistant|{tool}");
+                }
+            }
+        }
         let data = tokio::fs::read_to_string(directory.join("messages.jsonl"))
             .await
             .unwrap_or_default();
@@ -228,14 +300,92 @@ impl Session {
         for message in &mut messages {
             hydrate_images(&directory, message).await?;
         }
-        Ok((
-            Self {
-                root,
-                meta,
-                creation_lock: None,
-            },
-            messages,
-        ))
+        // Reconcile invocations an interrupted process left half-done: the
+        // trailing assistant message may name tool calls whose results were
+        // never written. Each open call gets a terminal result so the
+        // transcript is a valid sequence again; a `subagent` call carries
+        // its structured `interrupted` outcome from the persisted
+        // delegation record. Nothing is restarted.
+        let before = messages.len();
+        let repaired = Self::close_unanswered_tool_calls(&meta, &mut messages);
+        let session = Self {
+            root,
+            meta,
+            creation_lock: None,
+        };
+        if repaired {
+            session.append(&messages[before..]).await?;
+        }
+        if migrated {
+            session.save().await?;
+        }
+        Ok((session, messages))
+    }
+
+    /// Reconcile an interrupted turn: the trailing assistant message may name
+    /// tool calls whose results were never written (the process died
+    /// mid-turn). Each open call gets a terminal result so the transcript is
+    /// a valid sequence again; a `subagent` call is recorded with its
+    /// structured `interrupted` outcome and its persisted child session.
+    /// Nothing is restarted. Returns true if any result was appended.
+    fn close_unanswered_tool_calls(meta: &SessionMeta, messages: &mut Vec<Message>) -> bool {
+        use std::collections::HashSet;
+
+        use crate::runtime::{SubagentOutcome, SubagentStatus};
+
+        let answered: HashSet<&str> = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Collect the open calls first; pushing while iterating the same
+        // vector would be an overlapping borrow.
+        let mut open: Vec<(String, Option<String>)> = Vec::new();
+        for message in messages.iter() {
+            let Message::Assistant { tool_calls, .. } = message else {
+                continue;
+            };
+            for call in tool_calls {
+                if !answered.contains(call.id.as_str()) {
+                    let agent = if call.name == "subagent" {
+                        Some(
+                            call.arguments
+                                .get("agent")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("assistant")
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    };
+                    open.push((call.id.clone(), agent));
+                }
+            }
+        }
+        if open.is_empty() {
+            return false;
+        }
+        for (call_id, agent) in open {
+            let output = match agent {
+                Some(agent) => SubagentOutcome {
+                    session_id: meta.delegations.get(&call_id).cloned(),
+                    agent,
+                    status: SubagentStatus::Interrupted,
+                    response: None,
+                    error: None,
+                    message: Some(
+                        "Interrupted by a process restart; the child session was kept.".to_string(),
+                    ),
+                    tokens: None,
+                }
+                .json(),
+                None => "Interrupted by a process restart.".to_string(),
+            };
+            messages.push(Message::tool(call_id, output, None, None));
+        }
+        true
     }
 
     pub async fn append(&self, messages: &[Message]) -> Result<()> {
@@ -364,21 +514,36 @@ async fn hydrate_images(directory: &Path, message: &mut Message) -> Result<()> {
 
 pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 
-pub async fn store_file_upload(directory: &Path, name: &str, bytes: Vec<u8>) -> Result<FileContent> {
+pub async fn store_file_upload(
+    directory: &Path,
+    name: &str,
+    bytes: Vec<u8>,
+) -> Result<FileContent> {
     let prepared = crate::attachment::prepare_file(name.to_owned(), bytes).await?;
     let uploads = directory.join("uploads");
     tokio::fs::create_dir_all(&uploads).await?;
     let id = format!("uploads/{}.json", uuid::Uuid::new_v4());
     tokio::fs::write(directory.join(&id), serde_json::to_vec(&prepared)?).await?;
-    Ok(FileContent { path: id, ..prepared.file })
+    Ok(FileContent {
+        path: id,
+        ..prepared.file
+    })
 }
 
-pub async fn load_file_upload(directory: &Path, id: &str) -> Result<crate::attachment::PreparedFile> {
-    let name = id.strip_prefix("uploads/").and_then(|s| s.strip_suffix(".json"))
+pub async fn load_file_upload(
+    directory: &Path,
+    id: &str,
+) -> Result<crate::attachment::PreparedFile> {
+    let name = id
+        .strip_prefix("uploads/")
+        .and_then(|s| s.strip_suffix(".json"))
         .context("invalid file attachment ID")?;
     uuid::Uuid::parse_str(name).context("invalid file attachment ID")?;
-    let prepared: crate::attachment::PreparedFile = serde_json::from_slice(&tokio::fs::read(directory.join(id)).await?)?;
-    let metadata = tokio::fs::metadata(&prepared.file.path).await.context("uploaded file is no longer available")?;
+    let prepared: crate::attachment::PreparedFile =
+        serde_json::from_slice(&tokio::fs::read(directory.join(id)).await?)?;
+    let metadata = tokio::fs::metadata(&prepared.file.path)
+        .await
+        .context("uploaded file is no longer available")?;
     if !metadata.is_file() || metadata.len() > crate::runtime::MAX_FILE_BYTES {
         bail!("invalid uploaded file");
     }
@@ -555,19 +720,9 @@ mod tests {
             root: PathBuf::new(),
             creation_lock: None,
             meta: SessionMeta {
-                project_root: None,
-                settings: None,
                 name: "session-123".into(),
-                title: None,
-                plan: None,
                 created_at: 1,
-                total_tokens: 0,
-                total_cost: 0.0,
-                cost_complete: true,
-                context_tokens: 0,
-                compaction_summary: None,
-                compacted_through: 0,
-                approved_tools: Vec::new(),
+                ..SessionMeta::test()
             },
         };
         assert!(session.needs_title());
@@ -588,19 +743,9 @@ mod tests {
             root: PathBuf::new(),
             creation_lock: None,
             meta: SessionMeta {
-                project_root: None,
-                settings: None,
                 name: "priced".into(),
-                title: None,
-                plan: None,
                 created_at: 1,
-                total_tokens: 0,
-                total_cost: 0.0,
-                cost_complete: true,
-                context_tokens: 0,
-                compaction_summary: None,
-                compacted_through: 0,
-                approved_tools: Vec::new(),
+                ..SessionMeta::test()
             },
         };
 
@@ -675,7 +820,11 @@ mod tests {
 
         assert_eq!(
             loaded.meta.approved_tools,
-            ["shell", "search_files", "list_files"]
+            [
+                "assistant|shell",
+                "assistant|search_files",
+                "assistant|list_files"
+            ]
         );
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
