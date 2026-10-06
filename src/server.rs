@@ -184,6 +184,10 @@ impl Redactor {
                             Some(value)
                         }
                     }
+                    crate::core::state::Change::Remove { block_id } => {
+                        self.kinds.remove(block_id);
+                        Some(value)
+                    }
                     crate::core::state::Change::State { .. }
                     | crate::core::state::Change::Plan { .. }
                     | crate::core::state::Change::Project { .. } => Some(value),

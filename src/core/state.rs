@@ -196,6 +196,9 @@ pub enum Change {
     Replace {
         block: Block,
     },
+    Remove {
+        block_id: String,
+    },
     Append {
         block_id: String,
         field: String,
@@ -218,6 +221,9 @@ pub struct Projection {
     reasoning: Option<usize>,
     drafts: HashMap<usize, usize>,
     calls: HashMap<String, usize>,
+    /// Where the current model response's blocks start, so a broken
+    /// reply can be dropped whole when its request is retried.
+    response_blocks: usize,
     next_id: u64,
     raw_request: Option<String>,
     pending_raw: Vec<usize>,
@@ -248,6 +254,7 @@ impl Projection {
             reasoning: None,
             drafts: HashMap::new(),
             calls: HashMap::new(),
+            response_blocks: 0,
             next_id: 0,
             raw_request: None,
             pending_raw: Vec::new(),
@@ -515,6 +522,7 @@ impl Projection {
                 self.pause_reasoning(&mut changes);
                 self.assistant = None;
                 self.drafts.clear();
+                self.response_blocks = self.snapshot.blocks.len();
                 self.snapshot.state.response_model = model.clone();
                 self.snapshot.state.phase = "connecting".into();
             }
@@ -523,6 +531,21 @@ impl Projection {
                 self.snapshot.state.notice = None;
             }
             Event::ResponseStarted => self.snapshot.state.phase = "generating".into(),
+            Event::ResponseDiscarded => {
+                // The response stream broke and the request starts over:
+                // drop the pending blocks of the unfinished reply so the
+                // retry replaces them instead of appending to them.
+                while self.snapshot.blocks.len() > self.response_blocks {
+                    let block = self.snapshot.blocks.pop().unwrap();
+                    changes.push(Change::Remove {
+                        block_id: block.id.clone(),
+                    });
+                }
+                self.assistant = None;
+                self.reasoning = None;
+                self.drafts.clear();
+                state_changed = false;
+            }
             Event::ModelResponseFinished {
                 output_tokens,
                 duration,

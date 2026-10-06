@@ -224,6 +224,9 @@ pub struct UiState {
     reasoning: Option<usize>,
     response_model: String,
     tool_drafts: BTreeMap<usize, usize>,
+    /// Where the current model response's blocks start in `blocks`, so a
+    /// broken reply can be dropped whole when the request is retried.
+    response_blocks: usize,
     tool_calls: BTreeMap<String, usize>,
     selected: Option<usize>,
     input_cursor: usize,
@@ -407,6 +410,7 @@ impl UiState {
             reasoning: None,
             response_model: String::new(),
             tool_drafts: BTreeMap::new(),
+            response_blocks: 0,
             tool_calls: BTreeMap::new(),
             selected: None,
             input_cursor: 0,
@@ -1358,6 +1362,7 @@ impl UiState {
                 self.tool_drafts.clear();
                 self.assistant = None;
                 self.reasoning = None;
+                self.response_blocks = self.blocks.len();
                 self.generation_started = None;
                 self.generated_bytes = 0;
             }
@@ -1580,6 +1585,23 @@ impl UiState {
                 // One batch may hold several calls; a finished result does
                 // not stop the others from running.
                 self.tool_running = self.any_tool_running();
+            }
+            Event::ResponseDiscarded => {
+                // A broken response is being retried from scratch: drop
+                // every block the unfinished reply added so the chat
+                // shows only what the model's context will carry.
+                if self.blocks.len() > self.response_blocks {
+                    self.blocks.truncate(self.response_blocks);
+                    self.render_revisions.truncate(self.response_blocks);
+                    self.layout_generation = self.layout_generation.wrapping_add(1);
+                }
+                self.reasoning = None;
+                self.assistant = None;
+                self.tool_drafts.clear();
+                if matches!(&self.selected, Some(index) if *index >= self.blocks.len()) {
+                    self.selected = None;
+                }
+                self.generated_bytes = 0;
             }
             Event::Retrying { seconds } => {
                 self.connecting = true;
@@ -2433,6 +2455,46 @@ mod tests {
         assert!(state.notice.is_none());
         assert!(!state.connecting);
         assert!(state.waiting);
+    }
+
+    #[test]
+    fn a_discarded_response_leaves_no_blocks_of_the_broken_reply() {
+        let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
+        state.push_user("go".into());
+        state.apply(Event::ModelRequestStarted("model".into()));
+        state.apply(Event::ResponseStarted);
+        state.apply(Event::ReasoningDelta("half a thought".into()));
+        state.apply(Event::TextDelta("half an answer".into()));
+        state.apply(Event::ToolCallDelta {
+            index: 0,
+            name: Some("shell".into()),
+            arguments: "{\"command\"".into(),
+        });
+
+        state.apply(Event::ResponseDiscarded);
+
+        // Nothing of the unfinished reply survives: only the user
+        // message is left, so the retried answer takes its place without
+        // duplication.
+        assert_eq!(state.blocks.len(), 1);
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Message {
+                kind: MessageKind::User,
+                ..
+            }
+        ));
+        state.apply(Event::TextDelta("clean answer".into()));
+        assert_eq!(state.blocks.len(), 2);
+        assert!(matches!(
+            state.blocks.last(),
+            Some(ChatBlock::Message {
+                content,
+                kind: MessageKind::Assistant,
+                ..
+            }) if content == "clean answer"
+        ));
     }
 
     #[test]

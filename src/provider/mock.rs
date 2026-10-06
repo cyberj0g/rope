@@ -8,12 +8,25 @@ use super::{Provider, ResponseDelta, ResponseStream};
 use crate::runtime::CompletionRequest;
 
 pub struct MockProvider {
-    responses: Mutex<VecDeque<Vec<ResponseDelta>>>,
+    responses: Mutex<VecDeque<Vec<Result<ResponseDelta>>>>,
     requests: Mutex<Vec<CompletionRequest>>,
 }
 
 impl MockProvider {
     pub fn new(responses: Vec<Vec<ResponseDelta>>) -> Self {
+        Self {
+            responses: Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|response| response.into_iter().map(Ok).collect())
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Responses whose streams may carry errors partway through.
+    pub fn falling(responses: Vec<Vec<Result<ResponseDelta>>>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
@@ -35,6 +48,6 @@ impl Provider for MockProvider {
             .unwrap()
             .pop_front()
             .expect("mock response exhausted");
-        Ok(Box::pin(stream::iter(response.into_iter().map(Ok))))
+        Ok(Box::pin(stream::iter(response)))
     }
 }

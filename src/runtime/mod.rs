@@ -353,6 +353,10 @@ pub enum Event {
     Retrying {
         seconds: u64,
     },
+    /// A response stream broke before finishing: the partial reply is
+    /// dropped from the transcript before the request starts over, so the
+    /// chat never shows text the model's context will not carry.
+    ResponseDiscarded,
     CompactionStarted,
     ContextCompacted {
         summary: String,
@@ -1399,10 +1403,45 @@ async fn agent<P: Provider + ?Sized>(
             stream: true,
             tools: tool_definitions,
         };
-        let (stream, raw_request) =
-            stream_with_retry(&provider, request, events, true, Some(progress)).await?;
-        let (reasoning, text, mut calls, usage, response_items, truncated) =
-            collect(stream, events, internal).await?;
+        // A stream can break partway through a response — the connection
+        // drops, or a chunk or a tool call arrives that cannot be decoded.
+        // Such a response is discarded and the request starts over, like a
+        // connection failure before the first byte: only complete responses
+        // reach the transcript, and the retry pacing is the same capped
+        // backoff. A response with a permanent error propagates unchanged.
+        let (reasoning, text, mut calls, usage, response_items, truncated, raw_request) = {
+            let mut attempt = 0;
+            loop {
+                let (stream, raw_request) =
+                    stream_with_retry(&provider, request.clone(), events, true, Some(progress))
+                        .await?;
+                match collect(stream, events, internal).await {
+                    Ok((reasoning, text, calls, usage, response_items, truncated)) => {
+                        break (
+                            reasoning,
+                            text,
+                            calls,
+                            usage,
+                            response_items,
+                            truncated,
+                            raw_request,
+                        );
+                    }
+                    Err(error) if is_retryable(&error) => {
+                        let seconds = retry_delay(attempt);
+                        events.send(Event::ResponseDiscarded).await.ok();
+                        events.send(Event::Retrying { seconds }).await.ok();
+                        tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                        attempt += 1;
+                        events
+                            .send(Event::ModelRequestStarted(config.model_id().to_owned()))
+                            .await
+                            .ok();
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
         // The tool call cap applies between assistant messages, not per turn.
         calls.truncate(MAX_TOOL_CALLS_PER_MESSAGE);
         let response = Message::assistant_response(
@@ -1502,12 +1541,15 @@ async fn agent<P: Provider + ?Sized>(
         // what an interrupted turn preserves: a call that already wrote a
         // file or ran a command is not reported as cancelled.
         let batch = Mutex::new(TurnBatch::new(calls.len()));
-        // A call the turn cannot run at all — it names no tool, or the
-        // events of a closing client could not be delivered — answers with
-        // its error, so the batch stays a complete answer to the model's
-        // tool calls and the calls that did run keep their place. The turn
-        // still stops with the first such error, in the order the model
-        // made the calls.
+        // A call the turn cannot run at all — the events of a closing
+        // client could not be delivered, so not even an approval could
+        // reach the user — answers with its error, so the batch stays a
+        // complete answer to the model's tool calls and the calls that did
+        // run keep their place. The turn still stops with the first such
+        // error, in the order the model made the calls. A call that names
+        // no tool is not one of these: its error answers as a failed tool
+        // result and the turn goes on, leaving the model to correct the
+        // name it used.
         let failures: Mutex<Vec<Option<Error>>> =
             Mutex::new((0..calls.len()).map(|_| None).collect());
         let guard = BatchGuard {
@@ -1650,31 +1692,39 @@ async fn run_tool_call(
     call: &ToolCall,
     budget: ToolBudget,
 ) -> Result<Message> {
-    let entry = lane.tools.get(&call.name)?;
+    // A call that names no tool answers with its error like any other
+    // failed tool: the model sees the name it got wrong and the turn
+    // goes on, instead of the whole turn stopping on the unknown name.
+    let entry = lane.tools.get(&call.name);
     // The effective policy and the approval key are scoped to the acting
     // agent, so one agent's grants never apply to another.
-    let approved = match lane
-        .agent
-        .effective_policy(&call.name, &entry.category, entry.approval)
-    {
-        Approval::Allow => true,
-        Approval::Deny => false,
-        Approval::Ask => {
-            // A session carries one pending approval at a time, so calls
-            // take turns asking while the rest of the batch keeps working.
-            let _gate = lane.approval.lock().await;
-            let (reply, decision) = oneshot::channel();
-            lane.internal
-                .send(InternalEvent::Approval {
-                    call: call.clone(),
-                    approval_key: format!("{}|{}", lane.agent.id, entry.approval_key),
-                    reply,
-                })
-                .await?;
-            decision.await.unwrap_or(ApprovalDecision::Deny) != ApprovalDecision::Deny
-        }
+    let approved = match &entry {
+        Ok(entry) => match lane
+            .agent
+            .effective_policy(&call.name, &entry.category, entry.approval)
+        {
+            Approval::Allow => true,
+            Approval::Deny => false,
+            Approval::Ask => {
+                // A session carries one pending approval at a time, so calls
+                // take turns asking while the rest of the batch keeps working.
+                let _gate = lane.approval.lock().await;
+                let (reply, decision) = oneshot::channel();
+                lane.internal
+                    .send(InternalEvent::Approval {
+                        call: call.clone(),
+                        approval_key: format!("{}|{}", lane.agent.id, entry.approval_key),
+                        reply,
+                    })
+                    .await
+                    .with_context(|| format!("deliver approval for {}", call.name))?;
+                decision.await.unwrap_or(ApprovalDecision::Deny) != ApprovalDecision::Deny
+            }
+        },
+        Err(_) => false,
     };
     let result = if approved {
+        let entry = entry.expect("approval implies a known tool");
         // A parent session waits on at most one direct child: the core
         // links one child per parent and routes steers down that single
         // chain, so a batch delegates one child at a time instead of
@@ -1726,6 +1776,8 @@ async fn run_tool_call(
             forward.await.ok();
             result
         }
+    } else if let Err(error) = entry {
+        Err(error)
     } else {
         bail_tool_denied(&call.name)
     };
@@ -2290,9 +2342,17 @@ fn is_retryable(error: &anyhow::Error) -> bool {
     let error = format!("{error:#}").to_ascii_lowercase();
     [
         "send completion request",
+        "send responses api request",
         "connection",
         "timed out",
         "timeout",
+        // an SSE stream that broke mid-response: a transport failure, a
+        // corrupted event, or a chunk or tool call that does not decode
+        "transport error",
+        "parse error",
+        "utf8 error",
+        "decode response chunk",
+        "decode tool arguments",
         "server returned 408",
         "server returned 429",
         "server returned 500",
@@ -2885,27 +2945,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_batch_with_an_unknown_tool_keeps_the_results_that_ran() {
-        let provider = Arc::new(MockProvider::new(vec![vec![
-            ResponseDelta::ToolCall {
-                index: 0,
-                id: Some("call_1".into()),
-                name: Some("echo".into()),
-                arguments: r#"{"value":"one"}"#.into(),
-            },
-            ResponseDelta::ToolCall {
-                index: 1,
-                id: Some("call_2".into()),
-                name: Some("not_registered".into()),
-                arguments: json!({}).to_string(),
-            },
-            ResponseDelta::ToolCall {
-                index: 2,
-                id: Some("call_3".into()),
-                name: Some("echo".into()),
-                arguments: r#"{"value":"three"}"#.into(),
-            },
-        ]]));
+    async fn an_unknown_tool_answers_the_model_and_the_turn_goes_on() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("echo".into()),
+                    arguments: r#"{"value":"one"}"#.into(),
+                },
+                ResponseDelta::ToolCall {
+                    index: 1,
+                    id: Some("call_2".into()),
+                    name: Some("not_registered".into()),
+                    arguments: json!({}).to_string(),
+                },
+                ResponseDelta::ToolCall {
+                    index: 2,
+                    id: Some("call_3".into()),
+                    name: Some("echo".into()),
+                    arguments: r#"{"value":"three"}"#.into(),
+                },
+            ],
+            vec![ResponseDelta::Text("recovered".into())],
+        ]));
         let mut tools = ToolRegistry::default();
         tools.insert(Echo, Approval::Allow);
         let (event_tx, event_rx) = mpsc::channel(16);
@@ -2914,8 +2977,8 @@ mod tests {
         drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(16);
         let progress = fresh_progress();
-        let error = agent(
-            provider,
+        let (completed, _) = agent(
+            provider.clone(),
             &tools,
             &Config::default(),
             vec![Message::user("go".into())],
@@ -2933,16 +2996,12 @@ mod tests {
             &test_catalog(),
         )
         .await
-        .err()
-        .expect("an unknown tool fails the turn");
-        assert!(error.to_string().contains("unknown tool"));
+        .expect("an unknown tool answers as a failed result, not a failed turn");
 
-        // The whole batch was still run and recorded, in call order, so the
-        // interrupted turn preserves the work the two known tools did; the
-        // call that names no tool answers with its error and is what stops
-        // the turn.
-        let transcript = progress.lock().unwrap().messages.clone();
-        let results = transcript
+        // The whole batch is answered in call order; the call that names
+        // no tool answers with its error like any other failed tool, and
+        // the turn keeps going so the model can correct the name.
+        let results = completed
             .iter()
             .filter_map(|message| match message {
                 Message::Tool {
@@ -2961,35 +3020,41 @@ mod tests {
         );
         assert_eq!(results[0].1, "one");
         assert_eq!(results[2].1, "three");
-        assert!(results[1].1.starts_with("Error: unknown tool"));
+        assert!(
+            results[1]
+                .1
+                .starts_with("Error: unknown tool: not_registered")
+        );
+        // The model saw the failure: the retried request carried the
+        // error result, and the follow-up response finished the turn.
+        assert_eq!(provider.requests().len(), 2);
+        let requests = provider.requests();
+        assert!(
+            requests[1].messages.iter().any(|message| matches!(
+                message,
+                Message::Tool { content, .. } if content.starts_with("Error: unknown tool")
+            )),
+            "the retried request carries the failed call's error result"
+        );
+        assert!(
+            matches!(&completed[completed.len() - 1], Message::Assistant { content, .. }
+            if content == "recovered")
+        );
     }
 
     #[tokio::test]
-    async fn a_batch_reports_the_first_call_the_turn_could_not_run() {
-        // Two calls name tools this session does not have, and a client is
-        // waiting for an answer to every call of the batch.
-        let provider = Arc::new(MockProvider::new(vec![vec![
-            ResponseDelta::ToolCall {
-                index: 0,
-                id: Some("call_1".into()),
-                name: Some("missing_one".into()),
-                arguments: json!({}).to_string(),
-            },
-            ResponseDelta::ToolCall {
-                index: 1,
-                id: Some("call_2".into()),
-                name: Some("echo".into()),
-                arguments: r#"{"value":"ran"}"#.into(),
-            },
-            ResponseDelta::ToolCall {
-                index: 2,
-                id: Some("call_3".into()),
-                name: Some("missing_two".into()),
-                arguments: json!({}).to_string(),
-            },
-        ]]));
-        let mut tools = ToolRegistry::default();
-        tools.insert(Echo, Approval::Allow);
+    async fn a_broken_response_stream_retries_from_scratch() {
+        let provider = Arc::new(MockProvider::falling(vec![
+            vec![
+                Ok(ResponseDelta::Text("half a thought".into())),
+                Err(anyhow::anyhow!("transport error: connection closed")),
+            ],
+            vec![
+                Ok(ResponseDelta::Text("clean answer".into())),
+                Ok(ResponseDelta::Completed),
+            ],
+        ]));
+        let tools = ToolRegistry::default();
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let collected = tokio::spawn(async move {
             let mut events = Vec::new();
@@ -2998,6 +3063,73 @@ mod tests {
             }
             events
         });
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let (completed, _) = agent(
+            provider.clone(),
+            &tools,
+            &Config::default(),
+            vec![Message::user("go".into())],
+            0,
+            0,
+            None,
+            &no_steers(),
+            &fresh_progress(),
+            &event_tx,
+            &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
+        )
+        .await
+        .expect("a broken stream is retried, not a failed turn");
+        drop(event_tx);
+        let events = collected.await.unwrap();
+
+        // The partial response is discarded where the stream broke and
+        // the request starts over with the same backoff a connection
+        // failure gets.
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::ResponseDiscarded)),
+            "the client is told the partial response is dropped"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Retrying { seconds: 2 })),
+            "the retry keeps the capped backoff notice"
+        );
+        // The retry asks from scratch: the broken answer is in no message
+        // of the transcript, and the retried request carries only the
+        // prompt it started with.
+        assert_eq!(provider.requests().len(), 2);
+        assert_eq!(provider.requests()[1].messages.len(), 1);
+        assert!(
+            completed.iter().all(|message| !matches!(
+                message,
+                Message::Assistant { content, .. }
+                    if content.contains("half a thought")
+            )),
+            "the partial answer never reaches the conversation"
+        );
+        assert!(
+            matches!(&completed[completed.len() - 1], Message::Assistant { content, .. }
+            if content == "clean answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecoverable_response_error_still_fails_the_turn() {
+        let provider = Arc::new(MockProvider::falling(vec![vec![
+            Ok(ResponseDelta::Text("thinking out loud".into())),
+            Err(anyhow::anyhow!("server returned 400: invalid request")),
+        ]]));
+        let tools = ToolRegistry::default();
+        let (event_tx, event_rx) = mpsc::channel(16);
+        drop(event_rx);
         let (internal_tx, _internal_rx) = mpsc::channel(16);
         let error = agent(
             provider,
@@ -3019,15 +3151,74 @@ mod tests {
         )
         .await
         .err()
-        .expect("a batch with calls that cannot run fails the turn");
+        .expect("a permanent response error still fails the turn");
+        assert!(error.to_string().contains("server returned 400"));
+    }
+
+    #[tokio::test]
+    async fn a_batch_reports_the_first_call_the_turn_could_not_run() {
+        // A call needing approval and a call that can run. The client is
+        // gone, so the approval cannot be delivered: a call the turn
+        // cannot run at all, which still stops the turn even though
+        // unknown tool names no longer do.
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("asking".into()),
+                arguments: json!({}).to_string(),
+            },
+            ResponseDelta::ToolCall {
+                index: 1,
+                id: Some("call_2".into()),
+                name: Some("echo".into()),
+                arguments: r#"{"value":"ran"}"#.into(),
+            },
+        ]]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Asking, Approval::Ask);
+        tools.insert(Echo, Approval::Allow);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let collected = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (internal_tx, internal_rx) = mpsc::channel(16);
+        // The internal events go nowhere: the approval send fails, and the
+        // turn names the call it could not run.
+        drop(internal_rx);
+        let error = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("go".into())],
+            0,
+            0,
+            None,
+            &no_steers(),
+            &fresh_progress(),
+            &event_tx,
+            &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
+        )
+        .await
+        .err()
+        .expect("a call whose approval cannot be delivered fails the turn");
         drop(event_tx);
         let events = collected.await.unwrap();
 
-        // The turn stops with the first call it could not run, in the order
-        // the model made them, not with whichever finished last.
+        // The turn stops with the first call it could not run, in the
+        // order the model made them, not with whichever finished last.
         let reported = error.to_string();
         assert!(
-            reported.contains("missing_one"),
+            reported.contains("asking"),
             "the reported error names the first call: {reported}"
         );
         // Every call of the batch is answered exactly once, so a client
@@ -3044,11 +3235,7 @@ mod tests {
         answered.sort();
         assert_eq!(
             answered,
-            [
-                ("call_1".to_string(), false),
-                ("call_2".to_string(), true),
-                ("call_3".to_string(), false)
-            ],
+            [("call_1".to_string(), false), ("call_2".to_string(), true)],
             "one result per call, the ones that could not run marked failed"
         );
     }
@@ -3125,6 +3312,26 @@ mod tests {
         }
         async fn run(&self, _args: Value) -> Result<ToolResult> {
             unreachable!("a denied call never reaches the tool")
+        }
+    }
+
+    /// A call whose approval can never be delivered, used to make a call
+    /// the turn cannot run at all.
+    struct Asking;
+
+    #[async_trait]
+    impl Tool for Asking {
+        fn name(&self) -> &str {
+            "asking"
+        }
+        fn description(&self) -> &str {
+            "always asks first"
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(&self, _args: Value) -> Result<ToolResult> {
+            unreachable!("the approval never arrives")
         }
     }
 
@@ -4572,8 +4779,20 @@ mod tests {
         assert!(is_retryable(&anyhow::anyhow!(
             "send completion request: connection refused"
         )));
+        assert!(is_retryable(&anyhow::anyhow!(
+            "stream response: transport error: connection closed"
+        )));
+        assert!(is_retryable(&anyhow::anyhow!(
+            "decode response chunk: expected value at line 1"
+        )));
+        assert!(is_retryable(&anyhow::anyhow!(
+            "decode tool arguments: trailing characters"
+        )));
         assert!(!is_retryable(&anyhow::anyhow!(
             "server returned 400: invalid request"
+        )));
+        assert!(!is_retryable(&anyhow::anyhow!(
+            "deliver approval for shell: channel closed"
         )));
         assert_eq!(
             (0..6).map(retry_delay).collect::<Vec<_>>(),
