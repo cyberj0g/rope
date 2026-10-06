@@ -125,9 +125,10 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
 - Persistent sessions as JSONL under `~/.local/share/harness/sessions`,
   with auto-generated titles, token totals, and resume via
   `rope --session NAME`, `/new`, or the `/session` picker.
-- Iterative model → tool → model execution with immediate cancellation
-  that preserves completed work, and automatic retry with backoff on
-  transient failures.
+- Iterative model → tool → model execution: the tool calls one reply
+  batches run at the same time and their results reach the model in call
+  order, with immediate cancellation that preserves completed work, and
+  automatic retry with backoff on transient failures.
 - Steering: send a message while a turn is in progress and it is injected
   into the conversation at the next model request, shown as a `Steer` message.
 - Per-tool `allow` / `ask` / `deny` approval policies in `config.toml`,

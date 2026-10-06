@@ -397,13 +397,6 @@ impl Config {
         self.persist_settings()
     }
 
-    pub fn remember_model_choice(&mut self, model: &str) -> Result<()> {
-        self.recent_models.retain(|name| name != model);
-        self.recent_models.insert(0, model.to_owned());
-        self.recent_models.truncate(12);
-        self.persist_settings()
-    }
-
     pub(crate) fn select_model(&mut self, value: &str) -> Result<()> {
         let model = self
             .models

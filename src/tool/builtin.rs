@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fmt::Write as _,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -16,7 +16,7 @@ use similar::TextDiff;
 use tokio::{
     io::AsyncReadExt,
     process::{Child, ChildStderr, ChildStdout, Command},
-    sync::{Notify, mpsc, watch},
+    sync::{Mutex as AsyncMutex, Notify, mpsc, watch},
 };
 
 use super::{ExecutionPlan, PlanStatus, Tool, ToolResult};
@@ -42,8 +42,8 @@ use windows_sys::Win32::{
 };
 
 pub struct ReadTool(pub PathBuf);
-pub struct WriteTool(pub PathBuf);
-pub struct EditTool(pub PathBuf);
+pub struct WriteTool(pub PathBuf, pub FileLocks);
+pub struct EditTool(pub PathBuf, pub FileLocks);
 pub struct ShellTool(pub Arc<ShellJobManager>);
 pub struct ShellPollTool(pub Arc<ShellJobManager>);
 pub struct ShellCancelTool(pub Arc<ShellJobManager>);
@@ -77,6 +77,41 @@ pub(crate) fn path(root: &Path, value: &str) -> PathBuf {
         path
     } else {
         root.join(path)
+    }
+}
+
+/// The per-file locks `write` and `edit` share. Both are read-modify-write
+/// calls, so two of them landing on one file at the same moment could each
+/// read the content as it was and the last write would win while both
+/// reported success. The lock covers one call's read-and-write of one
+/// target, keyed on the resolved path, so calls on different files still
+/// run side by side. Entries stay in the map for the registry's lifetime:
+/// a project's worth of idle mutexes costs less than removing one another
+/// call may still be holding.
+#[derive(Clone, Default)]
+pub struct FileLocks(Arc<Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>>);
+
+impl FileLocks {
+    fn lock_for(&self, target: &Path) -> Arc<AsyncMutex<()>> {
+        // The key folds `.` segments and `name/..` pairs away, so different
+        // spellings of one target share a lock. Symlinks are not resolved:
+        // the lock orders the calls this session runs, not every writer on
+        // the machine.
+        let mut key = PathBuf::new();
+        for component in target.components() {
+            match component {
+                Component::ParentDir if key.file_name().is_some_and(|name| name != "..") => {
+                    key.pop();
+                }
+                component => key.push(component),
+            }
+        }
+        let mut locks = self.0.lock().unwrap();
+        Arc::clone(
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
     }
 }
 
@@ -181,6 +216,10 @@ impl Tool for WriteTool {
         }
         let args: Args = serde_json::from_value(args)?;
         let target = path(&self.0, &args.path);
+        // The whole read-diff-write of one file stays ordered against any
+        // other call that touches it.
+        let lock = self.1.lock_for(&target);
+        let _guard = lock.lock().await;
         let before = match tokio::fs::read_to_string(&target).await {
             Ok(content) => Some(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -226,6 +265,10 @@ impl Tool for EditTool {
         }
         let args: Args = serde_json::from_value(args)?;
         let target = path(&self.0, &args.path);
+        // Reading, matching, and writing stay one critical section: an
+        // earlier edit to the same file is seen, never overwritten.
+        let lock = self.1.lock_for(&target);
+        let _guard = lock.lock().await;
         let content = tokio::fs::read_to_string(&target).await?;
         let matches = content.matches(&args.old).count();
         if matches != 1 {
@@ -1667,7 +1710,7 @@ mod tests {
             .await
             .unwrap();
 
-        let edit = EditTool(root.clone())
+        let edit = EditTool(root.clone(), FileLocks::default())
             .run(json!({
                 "path": "existing.txt",
                 "old": "two",
@@ -1681,7 +1724,7 @@ mod tests {
         assert!(edit_diff.contains("-two"));
         assert!(edit_diff.contains("+three"));
 
-        let write = WriteTool(root.clone())
+        let write = WriteTool(root.clone(), FileLocks::default())
             .run(json!({ "path": "new.txt", "content": "new file\n" }))
             .await
             .unwrap();
@@ -1689,6 +1732,49 @@ mod tests {
         assert!(write_diff.contains("--- /dev/null"));
         assert!(write_diff.contains("+++ b/new.txt"));
         assert!(write_diff.contains("+new file"));
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parallel_edits_of_one_file_are_both_applied() {
+        let root = std::env::temp_dir().join(format!(
+            "rope-tool-file-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        tokio::fs::create_dir_all(root.join("sub")).await.unwrap();
+        tokio::fs::write(root.join("notes.txt"), "one\ntwo\n")
+            .await
+            .unwrap();
+
+        // A model may batch two changes to the same file, spelled
+        // differently. Without the shared per-file lock both calls would
+        // read the original content, and only the last write would survive
+        // while both reported success.
+        let files = FileLocks::default();
+        let first = EditTool(root.clone(), files.clone());
+        let second = EditTool(root.clone(), files);
+        let (first, second) = tokio::join!(
+            first.run(json!({ "path": "notes.txt", "old": "one", "new": "ONE" })),
+            second.run(json!({
+                "path": "sub/../notes.txt",
+                "old": "two",
+                "new": "TWO"
+            })),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("notes.txt"))
+                .await
+                .unwrap(),
+            "ONE\nTWO\n"
+        );
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

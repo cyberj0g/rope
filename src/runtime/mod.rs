@@ -11,11 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use anyhow::{Context, Error, Result, bail};
+use futures_util::{StreamExt, future::join_all};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -504,14 +504,19 @@ fn close_open_tool_calls(tail: &mut Vec<Message>, output: &str) {
     let Message::Assistant { tool_calls, .. } = &tail[start] else {
         return;
     };
+    // The calls of one message run at the same time, so the results already
+    // in the transcript are the ones whose calls finished — not a prefix of
+    // them. What is left is every call id none of them answered.
     let answered = tail[start + 1..]
         .iter()
-        .take_while(|message| matches!(message, Message::Tool { .. }))
-        .count();
-    // The results arrive in call order, so the open calls are the suffix
-    // after the answered prefix.
-    let open = tool_calls[answered..]
+        .filter_map(|message| match message {
+            Message::Tool { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let open = tool_calls
         .iter()
+        .filter(|call| !answered.contains(call.id.as_str()))
         .map(|call| call.id.clone())
         .collect::<Vec<_>>();
     for call_id in open {
@@ -1454,216 +1459,512 @@ async fn agent<P: Provider + ?Sized>(
                 .ok();
         }
 
-        for call in calls {
-            let entry = tools.get(&call.name)?;
-            // The result is one Tool message: reserve its framing (role,
-            // call id) and per-message overhead up front, so the budget
-            // bounds the next model request, not just the content.
-            let overhead = tool_message_overhead(&call);
-            let max_tokens = config.active_model().max_context_tokens;
-            let mut remaining = max_tokens.saturating_sub(used);
-            if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
-                // keep the pending batch and its preceding prompts together
-                let mut boundary = messages
-                    .iter()
-                    .rposition(|message| matches!(message, Message::Assistant { .. }))
-                    .unwrap();
-                while boundary > 0
-                    && matches!(
-                        messages[boundary - 1],
-                        Message::User { .. } | Message::Steer { .. }
-                    )
-                {
-                    boundary -= 1;
-                }
-                compaction = Some(
-                    compact_mid_turn(
-                        provider.clone(),
-                        config,
-                        &mut messages,
-                        boundary,
-                        user_full_index,
-                        progress,
-                        events,
-                        internal,
-                    )
-                    .await?,
-                );
-                used = max_tokens.saturating_sub(available_context_tokens(
-                    &messages,
-                    tools,
-                    config,
-                    project_prompt.as_deref(),
-                    agent,
-                ));
-                remaining = max_tokens.saturating_sub(used);
-                if remaining.saturating_sub(overhead) < MIN_TOOL_OUTPUT_TOKENS {
-                    bail!("context exhausted: compaction could not free room for a tool result");
-                }
-            }
-            // The effective policy and the approval key are scoped to the
-            // acting agent, so one agent's grants never apply to another.
-            let approved = match agent.effective_policy(&call.name, &entry.category, entry.approval)
-            {
-                Approval::Allow => true,
-                Approval::Deny => false,
-                Approval::Ask => {
-                    let (reply, decision) = oneshot::channel();
-                    internal
-                        .send(InternalEvent::Approval {
-                            call: call.clone(),
-                            approval_key: format!("{}|{}", agent.id, entry.approval_key),
-                            reply,
-                        })
-                        .await?;
-                    decision.await.unwrap_or(ApprovalDecision::Deny) != ApprovalDecision::Deny
-                }
-            };
-            // The streaming cap bounds the final truncation in raw bytes,
-            // so the chat never shows more output than the model keeps
-            // (the final truncation may keep less once JSON escaping of
-            // the content is counted). The floor keeps the control
-            // envelope intact near the limit; after the framing
-            // reservation, the whole result — content, role, and call id
-            // — fits the remaining context.
-            let available = remaining.saturating_sub(overhead);
-            let output_tokens = (available / 5).max(MIN_TOOL_OUTPUT_TOKENS).min(available);
-            // The whole Tool message — framing, image, and content — is
-            // what the next model request must absorb.
-            let message_budget = overhead.saturating_add(output_tokens);
-            let max_streamed_bytes =
-                output_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
-            let result = if approved {
-                events
-                    .send(Event::ToolStarted {
-                        call_id: call.id.clone(),
-                    })
-                    .await
-                    .ok();
-                if call.name == crate::tool::SUBAGENT_TOOL {
-                    // The runtime executes delegations itself: it supplies
-                    // the session, turn, and call identity the core needs
-                    // to link the child.
-                    run_delegation(
-                        delegation,
-                        session_name,
-                        turn_id,
-                        &call,
-                        config.model_name(),
-                        agent,
-                        agents,
-                    )
-                    .await
-                } else {
-                    let (delta_tx, delta_rx) = mpsc::unbounded_channel();
-                    let forward = tokio::spawn(forward_tool_output_deltas(
-                        call.id.clone(),
-                        delta_rx,
-                        max_streamed_bytes,
-                        events.clone(),
-                    ));
-                    let result = entry
-                        .tool
-                        .run_streamed(call.arguments.clone(), Some(delta_tx), max_streamed_bytes)
-                        .await;
-                    // Let in-flight deltas land before the final result.
-                    forward.await.ok();
-                    result
-                }
-            } else {
-                bail_tool_denied(&call.name)
-            };
-            let (mut output, mut image, file, diff, success) = match result {
-                Ok(result) => (
-                    result.output,
-                    result.image,
-                    result.file,
-                    result.diff,
-                    !result.is_error,
-                ),
-                Err(error) => (format!("Error: {error:#}"), None, None, None, false),
-            };
-            // A delegation result is one JSON document: shrink it within
-            // the content budget while it stays valid JSON, so the control
-            // fields the UI and the model rely on survive the limit.
-            if call.name == crate::tool::SUBAGENT_TOOL {
-                output = bounded_subagent_json(&output, max_streamed_bytes);
-            }
-            // The pre-run reservation covered the text, not the image. An
-            // image that would crowd the result past its budget is
-            // replaced by a note in the content, so the next model
-            // request still fits.
-            if let Some(reserved) = image.as_ref() {
-                let with_image = Message::tool(
-                    call.id.clone(),
-                    String::new(),
-                    Some(reserved.clone()),
-                    diff.clone(),
-                );
-                if estimate_tokens(std::slice::from_ref(&with_image)) + MIN_TOOL_OUTPUT_TOKENS
-                    > message_budget
-                {
-                    output.push_str("\n[image omitted: no room left in the context]");
-                    image = None;
+        // The calls one assistant message batches are independent by
+        // construction: the model cannot have seen any of their results
+        // yet. They run side by side, and the turn waits for the whole
+        // batch before asking the model again, so the results the model
+        // receives are one consistent snapshot, in the order the calls
+        // were made. Those results share the context that is left, so the
+        // budgets — and any mid-turn compaction they require — are planned
+        // for the whole batch before the first tool starts.
+        let budgets = tool_output_budgets(
+            provider.clone(),
+            tools,
+            config,
+            &mut messages,
+            user_full_index,
+            progress,
+            events,
+            internal,
+            project_prompt.as_deref(),
+            agent,
+            &mut compaction,
+            &mut used,
+            &calls,
+        )
+        .await?;
+        let lane = ToolLane {
+            tools,
+            config,
+            events,
+            internal,
+            agent,
+            session_name,
+            turn_id,
+            delegation,
+            agents,
+            approval: AsyncMutex::new(()),
+            child: AsyncMutex::new(()),
+        };
+        // The calls finish whenever their work does; the turn's transcript
+        // takes their results in call order as soon as the calls before them
+        // have theirs. Recording each result when its call finishes is also
+        // what an interrupted turn preserves: a call that already wrote a
+        // file or ran a command is not reported as cancelled.
+        let batch = Mutex::new(TurnBatch::new(calls.len()));
+        // A call the turn cannot run at all — it names no tool, or the
+        // events of a closing client could not be delivered — answers with
+        // its error, so the batch stays a complete answer to the model's
+        // tool calls and the calls that did run keep their place. The turn
+        // still stops with the first such error, in the order the model
+        // made the calls.
+        let failures: Mutex<Vec<Option<Error>>> =
+            Mutex::new((0..calls.len()).map(|_| None).collect());
+        let guard = BatchGuard {
+            batch: &batch,
+            transcript: progress.clone(),
+        };
+        join_all(calls.iter().enumerate().map(|(index, call)| {
+            let batch = &batch;
+            let lane = &lane;
+            let transcript = progress.clone();
+            let failures = &failures;
+            let budget = budgets[index];
+            async move {
+                let message = match run_tool_call(lane, call, budget).await {
+                    Ok(message) => message,
+                    Err(error) => {
+                        // The answer of a call the turn cannot run is
+                        // a tool result like any other, with the
+                        // budget the batch was planned with.
+                        let text = truncate_tool_output(
+                            &call.id,
+                            None,
+                            None,
+                            format!("Error: {error:#}"),
+                            budget.message_budget,
+                        );
+                        failures.lock().unwrap()[index] = Some(error);
+                        // The call asked for nothing further, but the
+                        // client is waiting for its answer too.
+                        lane.events
+                            .send(Event::ToolResult {
+                                call_id: call.id.clone(),
+                                output: text.clone(),
+                                success: false,
+                                diff: None,
+                            })
+                            .await
+                            .ok();
+                        Message::tool(call.id.clone(), text, None, None)
+                    }
+                };
+                let ready = batch.lock().unwrap().record(index, &message);
+                if !ready.is_empty() {
+                    transcript.lock().unwrap().messages.extend(ready);
                 }
             }
-            let output = truncate_tool_output(
-                &call.id,
-                image.clone(),
-                diff.clone(),
-                output,
-                message_budget,
-            );
-            if let Some(image) = &image {
-                events
-                    .send(Event::ToolImage {
-                        call_id: call.id.clone(),
-                        image: image.clone(),
-                    })
-                    .await
-                    .ok();
-            }
-            if let Some(file) = &file {
-                events
-                    .send(Event::ToolFile {
-                        call_id: call.id.clone(),
-                        file: file.clone(),
-                    })
-                    .await
-                    .ok();
-            }
-            events
-                .send(Event::ToolResult {
-                    call_id: call.id.clone(),
-                    output: output.clone(),
-                    success,
-                    diff: diff.clone(),
-                })
-                .await
-                .ok();
-            if approved {
-                // The working tree may have changed; the runtime coalesces these refreshes.
-                internal.send(InternalEvent::ProjectRefresh).await.ok();
-            }
-            if success && call.name == "update_plan" {
-                let plan: ExecutionPlan =
-                    serde_json::from_str(&output).context("decode normalized execution plan")?;
-                internal.send(InternalEvent::PlanUpdated(plan)).await?;
-            }
-            let message = Message::Tool {
-                call_id: call.id,
-                content: output,
-                image,
-                file,
-                diff,
-            };
+        }))
+        .await;
+        drop(guard);
+        // The whole batch is awaited before the turn continues.
+        let failure = failures
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find_map(|failure| failure.take());
+        // The working conversation and the context accounting take the whole
+        // batch at once, before the next model request.
+        for message in batch.lock().unwrap().results() {
             used = used.saturating_add(estimate_tokens(std::slice::from_ref(&message)));
-            messages.push(message.clone());
-            progress.lock().unwrap().messages.push(message);
+            messages.push(message);
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         recovered_truncation = false;
         used_context_tokens = Some(used);
     }
+}
+
+/// The results of one batch of tool calls, held so they can be recorded in
+/// call order. Calls finish in whatever order their work takes, while the
+/// conversation — the next model request, and the work an interrupted turn
+/// keeps — follows the order the model made them in.
+struct TurnBatch {
+    /// One slot per call of the batch, filled as its result arrives.
+    slots: Vec<Option<Message>>,
+    /// The first result the transcript is still waiting for.
+    next: usize,
+}
+
+impl TurnBatch {
+    fn new(count: usize) -> Self {
+        Self {
+            slots: (0..count).map(|_| None).collect(),
+            next: 0,
+        }
+    }
+
+    /// Records one call's result and returns the results the transcript can
+    /// take now: the run of finished calls starting at its cursor.
+    fn record(&mut self, index: usize, message: &Message) -> Vec<Message> {
+        self.slots[index] = Some(message.clone());
+        let mut ready = Vec::new();
+        while matches!(self.slots.get(self.next), Some(Some(_))) {
+            ready.push(self.slots[self.next].clone().unwrap());
+            self.next += 1;
+        }
+        ready
+    }
+
+    /// The results that are in but were held back behind a call that never
+    /// answered. An interrupted turn takes them: what a call already did
+    /// happened, whatever the calls around it were doing when the user
+    /// stopped it.
+    fn unreleased(&self) -> Vec<Message> {
+        self.slots[self.next..].iter().flatten().cloned().collect()
+    }
+
+    /// Every result of the batch, in call order.
+    fn results(&mut self) -> Vec<Message> {
+        self.slots.iter_mut().filter_map(Option::take).collect()
+    }
+}
+
+/// Takes the results a batch holds back when its future is dropped
+/// mid-flight — a turn the user stopped — so a call that finished is not
+/// written off as one that never answered. The results still land in call
+/// order, because the slots are ordered by the calls.
+struct BatchGuard<'a> {
+    batch: &'a Mutex<TurnBatch>,
+    transcript: TurnProgressHandle,
+}
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        let unreleased = self.batch.lock().unwrap().unreleased();
+        if !unreleased.is_empty() {
+            self.transcript.lock().unwrap().messages.extend(unreleased);
+        }
+    }
+}
+
+/// Runs one tool call of a batch to completion: policy and approval, the
+/// tool itself or a delegation, the budgeted truncation, and the events
+/// the clients render. The Tool message it returns is appended to the
+/// conversation by the caller, in call order, once every call in the batch
+/// has finished.
+async fn run_tool_call(
+    lane: &ToolLane<'_>,
+    call: &ToolCall,
+    budget: ToolBudget,
+) -> Result<Message> {
+    let entry = lane.tools.get(&call.name)?;
+    // The effective policy and the approval key are scoped to the acting
+    // agent, so one agent's grants never apply to another.
+    let approved = match lane
+        .agent
+        .effective_policy(&call.name, &entry.category, entry.approval)
+    {
+        Approval::Allow => true,
+        Approval::Deny => false,
+        Approval::Ask => {
+            // A session carries one pending approval at a time, so calls
+            // take turns asking while the rest of the batch keeps working.
+            let _gate = lane.approval.lock().await;
+            let (reply, decision) = oneshot::channel();
+            lane.internal
+                .send(InternalEvent::Approval {
+                    call: call.clone(),
+                    approval_key: format!("{}|{}", lane.agent.id, entry.approval_key),
+                    reply,
+                })
+                .await?;
+            decision.await.unwrap_or(ApprovalDecision::Deny) != ApprovalDecision::Deny
+        }
+    };
+    let result = if approved {
+        // A parent session waits on at most one direct child: the core
+        // links one child per parent and routes steers down that single
+        // chain, so a batch delegates one child at a time instead of
+        // growing a sibling scheduler. The call is only marked as started
+        // once it holds the lane, so the chat never shows several children
+        // working at once.
+        let _child = if call.name == crate::tool::SUBAGENT_TOOL {
+            Some(lane.child.lock().await)
+        } else {
+            None
+        };
+        lane.events
+            .send(Event::ToolStarted {
+                call_id: call.id.clone(),
+            })
+            .await
+            .ok();
+        if call.name == crate::tool::SUBAGENT_TOOL {
+            // The runtime executes delegations itself: it supplies the
+            // session, turn, and call identity the core needs to link the
+            // child.
+            run_delegation(
+                lane.delegation,
+                lane.session_name,
+                lane.turn_id,
+                call,
+                lane.config.model_name(),
+                lane.agent,
+                lane.agents,
+            )
+            .await
+        } else {
+            let (delta_tx, delta_rx) = mpsc::unbounded_channel();
+            let forward = tokio::spawn(forward_tool_output_deltas(
+                call.id.clone(),
+                delta_rx,
+                budget.max_streamed_bytes,
+                lane.events.clone(),
+            ));
+            let result = entry
+                .tool
+                .run_streamed(
+                    call.arguments.clone(),
+                    Some(delta_tx),
+                    budget.max_streamed_bytes,
+                )
+                .await;
+            // Let in-flight deltas land before the final result.
+            forward.await.ok();
+            result
+        }
+    } else {
+        bail_tool_denied(&call.name)
+    };
+    let (mut output, mut image, file, diff, success) = match result {
+        Ok(result) => (
+            result.output,
+            result.image,
+            result.file,
+            result.diff,
+            !result.is_error,
+        ),
+        Err(error) => (format!("Error: {error:#}"), None, None, None, false),
+    };
+    // A plan document is session state, not prose: read it from the full
+    // result, so a call budget short enough to cut the model's copy of it
+    // never breaks the plan the pane and the pinned runtime context keep.
+    let plan = if success && call.name == "update_plan" {
+        Some(
+            serde_json::from_str::<ExecutionPlan>(&output)
+                .context("decode normalized execution plan")?,
+        )
+    } else {
+        None
+    };
+    // A delegation result is one JSON document: shrink it within the
+    // content budget while it stays valid JSON, so the control fields the
+    // UI and the model rely on survive the limit.
+    if call.name == crate::tool::SUBAGENT_TOOL {
+        output = bounded_subagent_json(&output, budget.max_streamed_bytes);
+    }
+    // The pre-run reservation covered the text, not the image. An image
+    // that would crowd the result past its budget is replaced by a note in
+    // the content, so the next model request still fits.
+    if let Some(reserved) = image.as_ref() {
+        let with_image = Message::tool(
+            call.id.clone(),
+            String::new(),
+            Some(reserved.clone()),
+            diff.clone(),
+        );
+        if estimate_tokens(std::slice::from_ref(&with_image)) + MIN_TOOL_OUTPUT_TOKENS
+            > budget.message_budget
+        {
+            output.push_str("\n[image omitted: no room left in the context]");
+            image = None;
+        }
+    }
+    let output = truncate_tool_output(
+        &call.id,
+        image.clone(),
+        diff.clone(),
+        output,
+        budget.message_budget,
+    );
+    if let Some(image) = &image {
+        lane.events
+            .send(Event::ToolImage {
+                call_id: call.id.clone(),
+                image: image.clone(),
+            })
+            .await
+            .ok();
+    }
+    if let Some(file) = &file {
+        lane.events
+            .send(Event::ToolFile {
+                call_id: call.id.clone(),
+                file: file.clone(),
+            })
+            .await
+            .ok();
+    }
+    // A plan is session state the panes keep, so it is delivered before the
+    // result event: if the client is already gone and this send fails, the
+    // turn ends with one failed result for the call, not two.
+    if let Some(plan) = plan {
+        lane.internal.send(InternalEvent::PlanUpdated(plan)).await?;
+    }
+    lane.events
+        .send(Event::ToolResult {
+            call_id: call.id.clone(),
+            output: output.clone(),
+            success,
+            diff: diff.clone(),
+        })
+        .await
+        .ok();
+    if approved {
+        // The working tree may have changed; the runtime coalesces these refreshes.
+        lane.internal.send(InternalEvent::ProjectRefresh).await.ok();
+    }
+    Ok(Message::Tool {
+        call_id: call.id.clone(),
+        content: output,
+        image,
+        file,
+        diff,
+    })
+}
+
+/// The context one call of a batch may use. `message_budget` bounds the
+/// whole Tool message — framing, image, and content, counted on the
+/// populated message — and `max_streamed_bytes` is the matching byte cap
+/// for streamed output: it bounds the final truncation in raw bytes, so
+/// the chat never shows more output than the model keeps (the final
+/// truncation may keep less once JSON escaping of the content is
+/// counted), while the floor keeps a control envelope — a shell job's
+/// status and job_id — intact near the context limit.
+#[derive(Clone, Copy)]
+struct ToolBudget {
+    message_budget: u64,
+    max_streamed_bytes: usize,
+}
+
+/// Shares the context left among the calls of one batch, before any of
+/// them runs: their results arrive together, so the room they may fill is
+/// divided up front instead of call by call. Each call keeps its message
+/// framing and gets the smaller of one fifth of the room that is left —
+/// the cap a single call has always been given — and an equal share of the
+/// context a turn keeps before it would compact, which is what stops a
+/// batch from spending the reserve the next model request needs. That
+/// second bound applies only while the batch can still fit inside that
+/// window; a turn already at its compaction point shares the room, since
+/// its next request compacts whatever the results cost. Either way the
+/// results of a batch never cost more context than the room, and no call
+/// is cut below one control envelope. When framing plus those envelopes no
+/// longer fit the model context, the conversation is compacted mid-turn
+/// first, keeping the pending batch and the prompts that precede it, and
+/// the turn fails with a clear error if compaction cannot free the room.
+#[allow(clippy::too_many_arguments)]
+async fn tool_output_budgets<P: Provider + ?Sized>(
+    provider: Arc<P>,
+    tools: &ToolRegistry,
+    config: &Config,
+    messages: &mut Vec<Message>,
+    user_full_index: usize,
+    progress: &TurnProgressHandle,
+    events: &mpsc::Sender<Event>,
+    internal: &mpsc::Sender<InternalEvent>,
+    project_prompt: Option<&str>,
+    agent: &Agent,
+    compaction: &mut Option<Compaction>,
+    used: &mut u64,
+    calls: &[ToolCall],
+) -> Result<Vec<ToolBudget>> {
+    let max_tokens = config.active_model().max_context_tokens;
+    // The result is one Tool message per call: reserve its framing (role,
+    // call id) and per-message overhead up front, so the budget bounds the
+    // next model request, not just the content.
+    let framing = calls.iter().map(tool_message_overhead).collect::<Vec<_>>();
+    let framing_total = framing.iter().sum::<u64>();
+    // Every call of the batch keeps at least one control envelope.
+    let envelope = calls.len() as u64 * MIN_TOOL_OUTPUT_TOKENS;
+    let floor = framing_total.saturating_add(envelope);
+    if floor > max_tokens.saturating_sub(*used) {
+        // keep the pending batch and its preceding prompts together
+        let mut boundary = messages
+            .iter()
+            .rposition(|message| matches!(message, Message::Assistant { .. }))
+            .unwrap();
+        while boundary > 0
+            && matches!(
+                messages[boundary - 1],
+                Message::User { .. } | Message::Steer { .. }
+            )
+        {
+            boundary -= 1;
+        }
+        *compaction = Some(
+            compact_mid_turn(
+                provider,
+                config,
+                messages,
+                boundary,
+                user_full_index,
+                progress,
+                events,
+                internal,
+            )
+            .await?,
+        );
+        *used = max_tokens.saturating_sub(available_context_tokens(
+            messages,
+            tools,
+            config,
+            project_prompt,
+            agent,
+        ));
+        if floor > max_tokens.saturating_sub(*used) {
+            bail!("context exhausted: compaction could not free room for a tool result");
+        }
+    }
+    // A batch is never empty: this runs only for a message that asked for
+    // tools. The room is the context that is left.
+    let room = max_tokens
+        .saturating_sub(*used)
+        .saturating_sub(framing_total);
+    // The window is the part of the context a turn keeps before it would
+    // compact. Measuring a batch against the whole room lets its results
+    // spend that reserve, so the next model request stops to summarize
+    // before the model has read them. The measure only means anything while
+    // the batch can still fit inside the window: a turn already at its
+    // compaction point compacts on the next request whatever this batch
+    // does, so there the calls share the room instead, and their results
+    // stay worth reading rather than being cut to a control envelope.
+    let window = ((max_tokens as f64 * config.compaction_threshold as f64) as u64)
+        .saturating_sub(*used)
+        .saturating_sub(framing_total);
+    let share = if window >= envelope { window } else { room } / calls.len() as u64;
+    // A fifth of the room is the ceiling one tool result has always had; an
+    // equal share of the window is the ceiling a batch has. Whichever is
+    // smaller bounds a call — and the control floor keeps a result an
+    // envelope, not only prose.
+    let cap = (room / 5).min(share).max(MIN_TOOL_OUTPUT_TOKENS);
+    Ok(framing
+        .into_iter()
+        .map(|overhead| ToolBudget {
+            message_budget: overhead.saturating_add(cap),
+            max_streamed_bytes: cap.saturating_mul(4).min(usize::MAX as u64) as usize,
+        })
+        .collect())
+}
+
+/// What a tool call needs from the turn that owns it, borrowed. The two
+/// lanes keep the session's guarantees intact while calls run side by
+/// side: a session protocol carries one pending approval at a time, and a
+/// parent session waits on at most one direct child.
+struct ToolLane<'a> {
+    tools: &'a ToolRegistry,
+    config: &'a Config,
+    events: &'a mpsc::Sender<Event>,
+    internal: &'a mpsc::Sender<InternalEvent>,
+    agent: &'a Agent,
+    session_name: &'a str,
+    turn_id: &'a str,
+    delegation: &'a crate::tool::DelegationPort,
+    agents: &'a AgentCatalog,
+    approval: AsyncMutex<()>,
+    child: AsyncMutex<()>,
 }
 
 /// Flips the delegation's `abandon` flag when the waiting call's future
@@ -2115,6 +2416,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use serde_json::{Value, json};
+    use tokio::sync::Barrier;
     /// The built-in assistant, for call sites that pass an agent by hand.
     fn assistant_agent() -> Agent {
         crate::agent::assistant()
@@ -2390,6 +2692,730 @@ mod tests {
             event_rx.recv().await,
             Some(Event::ToolCallFinished { .. })
         ));
+    }
+
+    /// Finishes only once both of its calls are in flight, and then in the
+    /// reverse of the order they were made: a batch runs at the same time,
+    /// while its results stay in the order the model asked for.
+    struct Raced(Arc<Barrier>);
+
+    #[async_trait]
+    impl Tool for Raced {
+        fn name(&self) -> &str {
+            "raced"
+        }
+        fn description(&self) -> &str {
+            "wait for the batch, then answer after a delay"
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(&self, args: Value) -> Result<ToolResult> {
+            self.0.wait().await;
+            tokio::time::sleep(Duration::from_millis(
+                args["delay"].as_u64().unwrap_or_default(),
+            ))
+            .await;
+            Ok(ToolResult {
+                is_error: false,
+                output: args["value"].as_str().unwrap_or_default().to_owned(),
+                image: None,
+                file: None,
+                diff: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_tool_calls_runs_at_once_and_reports_in_call_order() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("raced".into()),
+                    arguments: r#"{"value":"first","delay":60}"#.into(),
+                },
+                ResponseDelta::ToolCall {
+                    index: 1,
+                    id: Some("call_2".into()),
+                    name: Some("raced".into()),
+                    arguments: r#"{"value":"second","delay":0}"#.into(),
+                },
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Raced(Arc::new(Barrier::new(2))), Approval::Allow);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast instead
+        // of blocking once the buffer fills.
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+
+        // Neither call passes its barrier before the other one starts, so a
+        // loop that ran the calls one at a time would wait forever.
+        let (completed, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            agent(
+                provider,
+                &tools,
+                &Config::default(),
+                vec![Message::user("go".into())],
+                0,
+                0,
+                None,
+                &no_steers(),
+                &fresh_progress(),
+                &event_tx,
+                &internal_tx,
+                &assistant_agent(),
+                "test",
+                "turn",
+                &delegation_port(),
+                &test_catalog(),
+            ),
+        )
+        .await
+        .expect("both calls run at the same time")
+        .unwrap();
+
+        // The second call answered first, yet the transcript and the next
+        // model request keep the order the calls were made in.
+        assert_eq!(completed.len(), 5);
+        assert!(
+            matches!(&completed[2], Message::Tool { call_id, content, .. }
+                if call_id == "call_1" && content == "first")
+        );
+        assert!(
+            matches!(&completed[3], Message::Tool { call_id, content, .. }
+                if call_id == "call_2" && content == "second")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_asking_calls_is_approved_one_at_a_time() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("echo".into()),
+                    arguments: r#"{"value":"one"}"#.into(),
+                },
+                ResponseDelta::ToolCall {
+                    index: 1,
+                    id: Some("call_2".into()),
+                    name: Some("echo".into()),
+                    arguments: r#"{"value":"two"}"#.into(),
+                },
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Ask);
+        let root = std::env::temp_dir().join(format!(
+            "rope-parallel-approvals-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create_in(root.clone(), "ask".into())
+            .await
+            .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                run(
+                    Config::default(),
+                    provider,
+                    tools,
+                    session,
+                    Vec::new(),
+                    ProjectState::new().await.unwrap(),
+                    test_catalog(),
+                    delegation_port(),
+                    command_rx,
+                    event_tx,
+                )
+                .await
+            }
+        });
+        command_tx
+            .send(Command::Submit(UserPrompt {
+                content: "go".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+
+        // A session carries one pending approval at a time, so calls that
+        // need asking take turns asking: none of them is silently denied
+        // because another call happened to be asking already.
+        let mut asked = 0;
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                Event::ApprovalRequested { .. } => {
+                    asked += 1;
+                    command_tx
+                        .send(Command::Approve(ApprovalDecision::AllowOnce))
+                        .await
+                        .unwrap();
+                }
+                Event::GenerationFinished { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(asked, 2, "every call in the batch was asked about");
+
+        let (reply, _summary) = oneshot::channel();
+        command_tx.send(Command::Shutdown(reply)).await.unwrap();
+        task.await.unwrap();
+        let (_, messages) = Session::resume_in(root.clone(), "ask").await.unwrap();
+        assert!(matches!(&messages[2], Message::Tool { content, .. } if content == "one"));
+        assert!(matches!(&messages[3], Message::Tool { content, .. } if content == "two"));
+
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_an_unknown_tool_keeps_the_results_that_ran() {
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("echo".into()),
+                arguments: r#"{"value":"one"}"#.into(),
+            },
+            ResponseDelta::ToolCall {
+                index: 1,
+                id: Some("call_2".into()),
+                name: Some("not_registered".into()),
+                arguments: json!({}).to_string(),
+            },
+            ResponseDelta::ToolCall {
+                index: 2,
+                id: Some("call_3".into()),
+                name: Some("echo".into()),
+                arguments: r#"{"value":"three"}"#.into(),
+            },
+        ]]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast instead
+        // of blocking once the buffer fills.
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let progress = fresh_progress();
+        let error = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("go".into())],
+            0,
+            0,
+            None,
+            &no_steers(),
+            &progress,
+            &event_tx,
+            &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
+        )
+        .await
+        .err()
+        .expect("an unknown tool fails the turn");
+        assert!(error.to_string().contains("unknown tool"));
+
+        // The whole batch was still run and recorded, in call order, so the
+        // interrupted turn preserves the work the two known tools did; the
+        // call that names no tool answers with its error and is what stops
+        // the turn.
+        let transcript = progress.lock().unwrap().messages.clone();
+        let results = transcript
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    call_id, content, ..
+                } => Some((call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .map(|(call_id, _)| *call_id)
+                .collect::<Vec<_>>(),
+            ["call_1", "call_2", "call_3"],
+            "every call of the batch is answered, in call order"
+        );
+        assert_eq!(results[0].1, "one");
+        assert_eq!(results[2].1, "three");
+        assert!(results[1].1.starts_with("Error: unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn a_batch_reports_the_first_call_the_turn_could_not_run() {
+        // Two calls name tools this session does not have, and a client is
+        // waiting for an answer to every call of the batch.
+        let provider = Arc::new(MockProvider::new(vec![vec![
+            ResponseDelta::ToolCall {
+                index: 0,
+                id: Some("call_1".into()),
+                name: Some("missing_one".into()),
+                arguments: json!({}).to_string(),
+            },
+            ResponseDelta::ToolCall {
+                index: 1,
+                id: Some("call_2".into()),
+                name: Some("echo".into()),
+                arguments: r#"{"value":"ran"}"#.into(),
+            },
+            ResponseDelta::ToolCall {
+                index: 2,
+                id: Some("call_3".into()),
+                name: Some("missing_two".into()),
+                arguments: json!({}).to_string(),
+            },
+        ]]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let collected = tokio::spawn(async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            events
+        });
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let error = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("go".into())],
+            0,
+            0,
+            None,
+            &no_steers(),
+            &fresh_progress(),
+            &event_tx,
+            &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
+        )
+        .await
+        .err()
+        .expect("a batch with calls that cannot run fails the turn");
+        drop(event_tx);
+        let events = collected.await.unwrap();
+
+        // The turn stops with the first call it could not run, in the order
+        // the model made them, not with whichever finished last.
+        let reported = error.to_string();
+        assert!(
+            reported.contains("missing_one"),
+            "the reported error names the first call: {reported}"
+        );
+        // Every call of the batch is answered exactly once, so a client
+        // shows no call still waiting after the turn has ended.
+        let mut answered = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolResult {
+                    call_id, success, ..
+                } => Some((call_id.clone(), *success)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        answered.sort();
+        assert_eq!(
+            answered,
+            [
+                ("call_1".to_string(), false),
+                ("call_2".to_string(), true),
+                ("call_3".to_string(), false)
+            ],
+            "one result per call, the ones that could not run marked failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_in_a_batch_does_not_stop_the_others() {
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                ResponseDelta::ToolCall {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("denied".into()),
+                    arguments: json!({}).to_string(),
+                },
+                ResponseDelta::ToolCall {
+                    index: 1,
+                    id: Some("call_2".into()),
+                    name: Some("echo".into()),
+                    arguments: r#"{"value":"ran"}"#.into(),
+                },
+            ],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        tools.insert(Denied, Approval::Deny);
+        tools.insert(Echo, Approval::Allow);
+        let (event_tx, event_rx) = mpsc::channel(16);
+        // Never read: drop the receiver so event sends fail fast instead
+        // of blocking once the buffer fills.
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let (completed, _) = agent(
+            provider,
+            &tools,
+            &Config::default(),
+            vec![Message::user("go".into())],
+            0,
+            0,
+            None,
+            &no_steers(),
+            &fresh_progress(),
+            &event_tx,
+            &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
+        )
+        .await
+        .unwrap();
+
+        // A denied call is a failed result for that call alone.
+        assert!(matches!(&completed[2], Message::Tool { content, .. }
+            if content == "Error: tool denied was denied"));
+        assert!(matches!(&completed[3], Message::Tool { content, .. } if content == "ran"));
+        assert_eq!(completed[4].content(), "finished");
+    }
+
+    /// A call the user refuses: it answers with a failed result, and the
+    /// tool itself is never reached.
+    struct Denied;
+
+    #[async_trait]
+    impl Tool for Denied {
+        fn name(&self) -> &str {
+            "denied"
+        }
+        fn description(&self) -> &str {
+            "never allowed"
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(&self, _args: Value) -> Result<ToolResult> {
+            unreachable!("a denied call never reaches the tool")
+        }
+    }
+
+    /// A tool that answers at once with more output than a small context
+    /// can hold, so a batch of it shows what each call's share of the
+    /// context allows.
+    struct Loud;
+
+    #[async_trait]
+    impl Tool for Loud {
+        fn name(&self) -> &str {
+            "loud"
+        }
+        fn description(&self) -> &str {
+            "answer with a long fixed output"
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object" })
+        }
+        async fn run(&self, _args: Value) -> Result<ToolResult> {
+            Ok(ToolResult {
+                is_error: false,
+                output: "a".repeat(4_000),
+                image: None,
+                file: None,
+                diff: None,
+            })
+        }
+    }
+
+    /// The budgets one batch would be planned with, without running it.
+    async fn planned_budgets(
+        config: &Config,
+        tools: &ToolRegistry,
+        calls: &[ToolCall],
+        used: u64,
+    ) -> Vec<ToolBudget> {
+        let provider = Arc::new(MockProvider::new(Vec::new()));
+        let (event_tx, event_rx) = mpsc::channel(16);
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let mut messages = vec![Message::user("go".into())];
+        messages.extend(calls.iter().map(|call| {
+            Message::assistant_response(
+                String::new(),
+                config.model_id().to_owned(),
+                String::new(),
+                vec![call.clone()],
+                Vec::new(),
+            )
+        }));
+        let mut compaction = None;
+        let mut used = used;
+        tool_output_budgets(
+            provider,
+            tools,
+            config,
+            &mut messages,
+            0,
+            &fresh_progress(),
+            &event_tx,
+            &internal_tx,
+            None,
+            &assistant_agent(),
+            &mut compaction,
+            &mut used,
+            calls,
+        )
+        .await
+        .expect("the batch fits the context it was planned for")
+    }
+
+    fn loud_calls(count: usize) -> Vec<ToolCall> {
+        (1..=count)
+            .map(|index| ToolCall {
+                id: format!("call_{index}"),
+                name: "loud".into(),
+                arguments: "{}".into(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_whole_batch_cannot_spend_the_context_the_turn_keeps_free() {
+        let mut tools = ToolRegistry::default();
+        tools.insert(Loud, Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 1_024;
+        // The context is the same in both cases; only the number of calls
+        // in the batch differs. Six calls is well past the point where one
+        // fifth of the room for each would add up to more than the turn
+        // keeps free, so their equal share is the smaller bound.
+        let small = planned_budgets(&config, &tools, &loud_calls(2), 100).await;
+        let large = planned_budgets(&config, &tools, &loud_calls(6), 100).await;
+        let framing = tool_message_overhead(&loud_calls(1)[0]);
+        let max = config.active_model().max_context_tokens;
+        // The room is the context that is left; the window is the part of it
+        // a turn keeps before it would compact. Both are counted after the
+        // framing of the batch's own result messages.
+        let room = |count: u64| max - 100 - framing * count;
+        let window = |count: u64| {
+            ((max as f64 * config.compaction_threshold as f64) as u64)
+                .saturating_sub(100)
+                .saturating_sub(framing * count)
+        };
+        let plan = |budgets: &[ToolBudget]| {
+            budgets
+                .iter()
+                .map(|budget| budget.message_budget)
+                .collect::<Vec<_>>()
+        };
+
+        // Two calls each keep one fifth of the room, the cap one call has
+        // always been given: the share of a batch is not what bounds them.
+        assert_eq!(plan(&small), [framing + room(2) / 5; 2]);
+        // Six calls divide the window the turn keeps free between them.
+        assert_eq!(plan(&large), [framing + window(6) / 6; 6]);
+        assert!(window(6) / 6 < room(6) / 5, "the share is the bound");
+        // Which is what keeps the whole batch inside the window: a fifth of
+        // the room for each of them would have been more than that.
+        let whole: u64 = plan(&large).iter().sum();
+        assert!(whole <= window(6) + framing * 6);
+    }
+
+    #[tokio::test]
+    async fn a_batch_in_a_full_context_still_gets_a_share_of_the_room() {
+        let mut tools = ToolRegistry::default();
+        tools.insert(Loud, Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 1_024;
+        // The turn is already at the point where its next request would
+        // compact, so no truncation can keep this batch under that line.
+        // Dividing the compaction reserve then leaves every call a control
+        // envelope and nothing else, for no benefit: the calls share the
+        // room that is left instead.
+        let calls = loud_calls(6);
+        let framing = tool_message_overhead(&calls[0]);
+        let used = 700;
+        let budgets = planned_budgets(&config, &tools, &calls, used).await;
+        let room = config.active_model().max_context_tokens - used - framing * 6;
+        assert_eq!(
+            budgets
+                .iter()
+                .map(|budget| budget.message_budget)
+                .collect::<Vec<_>>(),
+            [framing + room / 6; 6]
+        );
+        assert!(
+            budgets
+                .iter()
+                .all(|budget| budget.message_budget > framing + MIN_TOOL_OUTPUT_TOKENS),
+            "a divided room is more than the control floor"
+        );
+        let whole: u64 = budgets.iter().map(|budget| budget.message_budget).sum();
+        assert!(used + whole <= config.active_model().max_context_tokens);
+    }
+
+    #[tokio::test]
+    async fn the_largest_allowed_batch_stays_under_the_compaction_point() {
+        let mut tools = ToolRegistry::default();
+        tools.insert(Loud, Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 128_000;
+        let calls = loud_calls(MAX_TOOL_CALLS_PER_MESSAGE);
+        let used = 10_000;
+        let budgets = planned_budgets(&config, &tools, &calls, used).await;
+        assert_eq!(budgets.len(), calls.len());
+        let whole: u64 = budgets.iter().map(|budget| budget.message_budget).sum();
+        // Every call of the batch at the ceiling it was given still leaves
+        // the next model request under the point where the turn compacts.
+        assert!(
+            used + whole
+                <= (config.active_model().max_context_tokens as f64
+                    * config.compaction_threshold as f64) as u64
+        );
+        // And no call is cut below what it needs to be actionable.
+        assert!(
+            budgets
+                .iter()
+                .all(|budget| budget.message_budget >= MIN_TOOL_OUTPUT_TOKENS)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_does_not_fit_the_context_is_compacted_once_first() {
+        // Three envelope-shaped results, and a context with room for none of
+        // them: the older history is summarized first, once, and the whole
+        // batch is then planned against the room that frees.
+        let mut first = Vec::new();
+        for index in 0..3u8 {
+            first.push(ResponseDelta::ToolCall {
+                index: usize::from(index),
+                id: Some(format!("call_{}", index + 1)),
+                name: Some("shell".into()),
+                arguments: r#"{"command":"sleep 5","yield_time_ms":50}"#.into(),
+            });
+        }
+        first.push(ResponseDelta::Usage(Usage {
+            prompt_tokens: 0,
+            total_tokens: 1_014,
+        }));
+        let provider = Arc::new(MockProvider::new(vec![
+            first,
+            // The mid-turn compaction request: summarize the earlier
+            // conversation.
+            vec![ResponseDelta::Text("Old work done.".into())],
+            vec![ResponseDelta::Text("finished".into())],
+        ]));
+        let mut tools = ToolRegistry::default();
+        let jobs = ShellJobManager::new(std::env::temp_dir());
+        tools.insert(ShellTool(jobs.clone()), Approval::Allow);
+        tools.insert(ShellPollTool(jobs), Approval::Allow);
+        let mut config = Config::default();
+        config.models[0].max_context_tokens = 1_024;
+        let (event_tx, event_rx) = mpsc::channel(16);
+        drop(event_rx);
+        let (internal_tx, _internal_rx) = mpsc::channel(16);
+        let (completed, compaction) = agent(
+            provider.clone(),
+            &tools,
+            &config,
+            vec![
+                Message::user("old request".into()),
+                Message::assistant(
+                    "old reply".into(),
+                    "model".into(),
+                    String::new(),
+                    Vec::new(),
+                ),
+                Message::user("run them".into()),
+            ],
+            2,
+            7,
+            None,
+            &no_steers(),
+            &fresh_progress(),
+            &event_tx,
+            &internal_tx,
+            &assistant_agent(),
+            "test",
+            "turn",
+            &delegation_port(),
+            &test_catalog(),
+        )
+        .await
+        .unwrap();
+
+        let compaction = compaction.expect("the batch is planned after one compaction");
+        assert_eq!(compaction.summary, "Old work done.");
+        // The summary request is the model request right after the batch was
+        // asked for, and it does not carry the batch itself: the room was
+        // made before any of the calls ran, not after their results arrived.
+        let requests = provider.requests();
+        assert!(
+            !requests[1]
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::Tool { .. })),
+            "the context was made for the batch after it had already run"
+        );
+        // The prompts and the call the turn is waiting on stay together:
+        // what is summarized is the older conversation only.
+        assert!(matches!(&completed[0], Message::User { content, .. }
+            if content == "run them"));
+        // Every call kept its control envelope, which is what the floor of
+        // a share is there for: a backgrounded job whose job_id was cut off
+        // is a job the model cannot poll.
+        for (index, message) in completed[2..5].iter().enumerate() {
+            assert!(
+                matches!(message, Message::Tool { call_id, content, .. }
+                    if *call_id == format!("call_{}", index + 1)
+                        && content.starts_with("status: running\n")
+                        && content.contains("job_id: shell-")),
+                "call {} lost the control fields of its result: {message:?}",
+                index + 1
+            );
+        }
+        // The whole batch fits the context it was planned for, counted the
+        // way a request is counted: with the tool definitions it carries.
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "the batch, the summary, and the answer: no second compaction"
+        );
+        let last = requests.last().expect("the batch was answered");
+        assert!(
+            available_context_tokens(&last.messages, &tools, &config, None, &assistant_agent(),)
+                > 0,
+            "the next model request must fit the context"
+        );
     }
 
     #[tokio::test]
@@ -4058,6 +5084,54 @@ mod tests {
     }
 
     #[test]
+    fn close_open_tool_calls_answers_only_the_calls_without_a_result() {
+        // The calls of one message run at the same time, so an interrupted
+        // turn can already hold the result of the last call while a middle
+        // one is still open. Matching calls by position would duplicate a
+        // result and leave one call unanswered for the provider.
+        let mut tail = vec![
+            Message::user("go".into()),
+            Message::assistant(
+                "working".into(),
+                "model".into(),
+                String::new(),
+                vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                ],
+            ),
+            Message::tool("a".into(), "first".into(), None, None),
+            Message::tool("c".into(), "third".into(), None, None),
+        ];
+
+        close_open_tool_calls(&mut tail, CANCELLED_TOOL_OUTPUT);
+
+        assert_eq!(
+            tail.iter()
+                .filter_map(|message| match message {
+                    Message::Tool { call_id, .. } => Some(call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["a", "c", "b"],
+            "one result per call, the open last one closed after them"
+        );
+    }
+
+    #[test]
     fn drop_oldest_message_removes_tool_results_with_their_call() {
         let call = ToolCall {
             id: "call_1".into(),
@@ -4939,8 +6013,8 @@ mod tests {
         let session = Session::create_in(root.clone(), "open".into())
             .await
             .unwrap();
-        // 40 chunks x 2ms keeps the first tool running long enough to
-        // cancel while it is in flight.
+        // 40 chunks x 2ms keeps both tools running long enough to be
+        // cancelled while they are in flight.
         let mut tools = ToolRegistry::default();
         tools.insert(SlowEcho(vec!["x".into(); 40]), Approval::Allow);
         let (command_tx, command_rx) = mpsc::channel(16);
@@ -4975,7 +6049,7 @@ mod tests {
                 break;
             }
         }
-        // The first tool is still running; the second never starts.
+        // Both calls are in flight; the turn is stopped while they run.
         tokio::time::sleep(Duration::from_millis(20)).await;
         command_tx.send(Command::Cancel).await.unwrap();
         while let Some(event) = event_rx.recv().await {
@@ -5006,5 +6080,158 @@ mod tests {
         );
 
         tokio::fs::remove_dir_all(&root).await.unwrap();
+    }
+
+    /// Runs a turn that asks for one call that answers at once and one that
+    /// keeps streaming, and stops it after the quick call has answered and
+    /// while the other is still running. `quick_first` is the order the
+    /// model made the calls in; what the transcript keeps must not depend
+    /// on it. Returns the messages the interrupted turn persisted.
+    async fn messages_after_cancelling_a_half_finished_batch(quick_first: bool) -> Vec<Message> {
+        let quick = || ResponseDelta::ToolCall {
+            index: 0,
+            id: Some("call_quick".into()),
+            name: Some("echo".into()),
+            arguments: r#"{"value":"written"}"#.into(),
+        };
+        let slow = || ResponseDelta::ToolCall {
+            index: 1,
+            id: Some("call_slow".into()),
+            name: Some("slow_echo".into()),
+            arguments: "{}".into(),
+        };
+        let provider = Arc::new(MockProvider::new(vec![
+            vec![
+                if quick_first { quick() } else { slow() },
+                if quick_first { slow() } else { quick() },
+            ],
+            vec![ResponseDelta::Text("never reached".into())],
+        ]));
+        let root = std::env::temp_dir().join(format!(
+            "rope-cancel-half-done-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let session = Session::create_in(root.clone(), "half".to_string())
+            .await
+            .unwrap();
+        // 200 chunks x 2ms keeps the streaming call in flight long after
+        // the quick one has answered.
+        let mut tools = ToolRegistry::default();
+        tools.insert(Echo, Approval::Allow);
+        tools.insert(SlowEcho(vec!["x".into(); 200]), Approval::Allow);
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let run_task = tokio::spawn({
+            let provider = provider.clone();
+            async move {
+                run(
+                    Config::default(),
+                    provider,
+                    tools,
+                    session,
+                    Vec::new(),
+                    ProjectState::new().await.unwrap(),
+                    test_catalog(),
+                    delegation_port(),
+                    command_rx,
+                    event_tx,
+                )
+                .await
+            }
+        });
+        command_tx
+            .send(Command::Submit(UserPrompt {
+                content: "go".into(),
+                images: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        loop {
+            match event_rx.recv().await {
+                Some(Event::ToolResult {
+                    call_id: id,
+                    output,
+                    ..
+                }) if id == "call_quick" && output == "written" => break,
+                Some(_) => {}
+                None => panic!("the turn ended before the quick call answered"),
+            }
+        }
+        // The batch is still waiting for the call that streams; stop it now.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        command_tx.send(Command::Cancel).await.unwrap();
+        while let Some(event) = event_rx.recv().await {
+            if matches!(event, Event::GenerationCancelled) {
+                break;
+            }
+        }
+        let (reply, _summary) = tokio::sync::oneshot::channel();
+        command_tx.send(Command::Shutdown(reply)).await.unwrap();
+        run_task.await.unwrap();
+
+        let (_, messages) = Session::resume_in(root.clone(), "half").await.unwrap();
+        tokio::fs::remove_dir_all(&root).await.ok();
+        messages
+    }
+
+    /// What an interrupted batch must leave behind: every call answered
+    /// exactly once, the finished one by its real result, the running one
+    /// as cancelled, and the marker last.
+    fn assert_batch_interrupted_as(messages: &[Message]) {
+        assert_eq!(messages.len(), 5);
+        assert!(matches!(&messages[0], Message::User { content, .. }
+            if content.starts_with("go")));
+        assert!(matches!(&messages[1], Message::Assistant { tool_calls, .. }
+            if tool_calls.len() == 2
+                && tool_calls.iter().any(|call| call.id == "call_quick")
+                && tool_calls.iter().any(|call| call.id == "call_slow")));
+        let answered = messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Tool {
+                    call_id, content, ..
+                } => Some((call_id.as_str(), content.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answered.len(), 2, "every call of the batch is answered");
+        assert!(
+            answered.contains(&("call_quick", "written")),
+            "work the turn already completed is not reported as cancelled: {answered:?}"
+        );
+        assert!(answered.contains(&("call_slow", CANCELLED_TOOL_OUTPUT)));
+        assert!(matches!(&messages[4], Message::System { content, .. }
+            if content == CANCELLED_BY_USER));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_batch_keeps_the_results_that_finished() {
+        let messages = tokio::time::timeout(
+            Duration::from_secs(20),
+            messages_after_cancelling_a_half_finished_batch(true),
+        )
+        .await
+        .expect("the turn was stopped");
+        assert_batch_interrupted_as(&messages);
+    }
+
+    /// The case the order of the calls should not change: the finished call
+    /// is the second one, so its result is held back while the turn waits
+    /// for the call before it — and the user stops the turn in that moment.
+    #[tokio::test]
+    async fn a_cancelled_batch_keeps_a_result_the_order_held_back() {
+        let messages = tokio::time::timeout(
+            Duration::from_secs(20),
+            messages_after_cancelling_a_half_finished_batch(false),
+        )
+        .await
+        .expect("the turn was stopped");
+        assert_batch_interrupted_as(&messages);
     }
 }

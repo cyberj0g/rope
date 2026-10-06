@@ -1548,7 +1548,6 @@ impl UiState {
                 success,
                 diff,
             } => {
-                self.tool_running = false;
                 let changed = if let Some(block) = self.tool_calls.get(&call_id).copied()
                     && let ChatBlock::Tool {
                         output: block_output,
@@ -1578,6 +1577,9 @@ impl UiState {
                 if let Some(block) = changed {
                     self.bump_render(block);
                 }
+                // One batch may hold several calls; a finished result does
+                // not stop the others from running.
+                self.tool_running = self.any_tool_running();
             }
             Event::Retrying { seconds } => {
                 self.connecting = true;
@@ -1962,6 +1964,24 @@ impl UiState {
                 _ => {}
             }
         }
+    }
+
+    /// Whether any of the turn's calls is still running: one assistant
+    /// message may hold several, and they run side by side, so a single
+    /// finished result does not mean the turn stopped working.
+    fn any_tool_running(&self) -> bool {
+        self.tool_calls
+            .values()
+            .filter_map(|block| self.blocks.get(*block))
+            .any(|block| {
+                matches!(
+                    block,
+                    ChatBlock::Tool {
+                        status: ToolStatus::Running,
+                        ..
+                    }
+                )
+            })
     }
 
     fn finish_reasoning(&mut self) {
@@ -2959,6 +2979,57 @@ mod tests {
             &state.blocks[0],
             ChatBlock::Tool { output: Some(output), .. } if output == "final\nresult"
         ));
+    }
+
+    #[test]
+    fn a_finished_result_keeps_the_other_calls_of_a_batch_running() {
+        let mut state = UiState::new();
+        state.apply(Event::GenerationStarted);
+        for (index, id) in [(0, "call_1"), (1, "call_2")] {
+            state.apply(Event::ToolCallDelta {
+                index,
+                name: Some("shell".into()),
+                arguments: "{}".into(),
+            });
+            state.apply(Event::ToolCallFinished {
+                index,
+                call: ToolCall {
+                    id: id.into(),
+                    name: "shell".into(),
+                    arguments: json!({}),
+                },
+            });
+            state.apply(Event::ToolStarted { call_id: id.into() });
+        }
+
+        state.apply(Event::ToolResult {
+            call_id: "call_2".into(),
+            output: "done".into(),
+            success: true,
+            diff: None,
+        });
+
+        // The calls of one assistant message run together, so one finished
+        // result leaves the other call running, with its timer still going.
+        assert!(state.tool_running);
+        assert!(matches!(
+            &state.blocks[0],
+            ChatBlock::Tool { status: ToolStatus::Running, elapsed, .. }
+                if elapsed.started.is_some()
+        ));
+        assert!(matches!(
+            &state.blocks[1],
+            ChatBlock::Tool { status: ToolStatus::Done, elapsed, .. }
+                if elapsed.started.is_none()
+        ));
+
+        state.apply(Event::ToolResult {
+            call_id: "call_1".into(),
+            output: "done".into(),
+            success: true,
+            diff: None,
+        });
+        assert!(!state.tool_running);
     }
 
     #[test]

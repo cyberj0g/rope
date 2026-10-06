@@ -25,7 +25,7 @@ use crate::{
     runtime::{FileContent, ImageContent, SubagentOutcome},
 };
 use builtin::{
-    EditTool, ListFilesTool, ReadTool, SearchFilesTool, SendFileTool, UpdatePlanTool,
+    EditTool, FileLocks, ListFilesTool, ReadTool, SearchFilesTool, SendFileTool, UpdatePlanTool,
     ViewImageTool, WriteTool,
 };
 use external::ExternalTool;
@@ -488,9 +488,13 @@ pub async fn discover(config: &Config) -> Result<ToolRegistry> {
 pub async fn discover_at(config: &Config, root: &std::path::Path) -> Result<ToolRegistry> {
     let cwd = root.to_path_buf();
     let mut registry = ToolRegistry::default();
+    // Writes and edits share one set of per-file locks: a model that
+    // batches two changes to the same file gets both applied, not the last
+    // one alone.
+    let files = FileLocks::default();
     registry.insert(ReadTool(cwd.clone()), config.tools.read);
-    registry.insert(WriteTool(cwd.clone()), config.tools.write);
-    registry.insert(EditTool(cwd.clone()), config.tools.edit);
+    registry.insert(WriteTool(cwd.clone(), files.clone()), config.tools.write);
+    registry.insert(EditTool(cwd.clone(), files), config.tools.edit);
     let shell_jobs = ShellJobManager::new(cwd.clone());
     registry.insert(ShellTool(shell_jobs.clone()), config.tools.shell);
     // Polling and cancelling can only observe or stop already-approved

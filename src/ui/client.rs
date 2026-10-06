@@ -80,7 +80,7 @@ pub async fn connect(
                             Command::Action(action) => {
                                 core.command(&selected, action.clone()).await?;
                                 if let Action::SetModel { model, .. } = action {
-                                    preferences.remember_model_choice(&model)?;
+                                    preferences.set_model(&model)?;
                                 }
                             }
                             Command::NextReasoning { model, current, revision } => {
