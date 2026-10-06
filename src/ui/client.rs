@@ -84,12 +84,17 @@ pub async fn connect(
                                 }
                             }
                             Command::NextReasoning { model, current, revision } => {
-                                let model = preferences.models.iter().find(|entry| entry.name == model || entry.id == model)
-                                    .ok_or_else(|| anyhow::anyhow!("unknown model"))?;
-                                let efforts = &model.reasoning_efforts;
-                                let next = current.and_then(|effort| efforts.iter().position(|value| *value == effort))
-                                    .map_or(0, |i| (i + 1) % efforts.len().max(1));
-                                core.command(&selected, Action::SetReasoning { effort: efforts.get(next).copied(), revision }).await?;
+                                let (model_name, effort) = {
+                                    let model = preferences.models.iter().find(|entry| entry.name == model || entry.id == model)
+                                        .ok_or_else(|| anyhow::anyhow!("unknown model"))?;
+                                    let efforts = &model.reasoning_efforts;
+                                    let next = current.and_then(|effort| efforts.iter().position(|value| *value == effort))
+                                        .map_or(0, |i| (i + 1) % efforts.len().max(1));
+                                    (model.name.clone(), efforts.get(next).copied())
+                                };
+                                core.command(&selected, Action::SetReasoning { effort, revision }).await?;
+                                preferences.set_model(&model_name)?;
+                                preferences.set_reasoning_effort(effort)?;
                             }
                             Command::NewSession(name) => {
                                 selected = core.create(name).await?;

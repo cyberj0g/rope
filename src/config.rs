@@ -376,6 +376,11 @@ impl Config {
         self.persist_settings()
     }
 
+    pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) -> Result<()> {
+        self.reasoning_effort = effort;
+        self.persist_settings()
+    }
+
     pub fn next_reasoning_effort(&mut self) -> Result<()> {
         let efforts = &self.active_model().reasoning_efforts;
         if efforts.is_empty() {

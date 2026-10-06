@@ -19,7 +19,7 @@
 - minimal `[[models]]` entries use neutral omitted-field defaults (no vision, temperature, or reasoning) instead of inheriting the built-in default model's profile
 - stale saved model selections fall back to the config's model with a startup warning instead of failing to start
 - built-in defaults for popular OpenAI-compatible model families, including Qwen3.8
-- searchable recent-first model picker shared by `/model`, Alt+M, and the clickable model status; model selections in the terminal UI persist as the next startup default
+- searchable recent-first model picker shared by `/model`, Alt+M, and the clickable model status; model and reasoning selections in the terminal UI persist as the next startup defaults
 - current time pinned as a hidden `<runtime-context>` block at the end of every user message — invisible in the chat but visible in the raw request inspector, with the session plan riding in the block only while any plan step is still open (a fully completed plan is already fully present as un-compacted `update_plan` calls) — built once at send time and never rewritten afterwards, like the rest of history; steer messages carry no runtime context; the working directory included in the system prompt alongside global and project instructions
 - automatic global and project `AGENTS.md` instructions
 
