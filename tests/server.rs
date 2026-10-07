@@ -853,6 +853,7 @@ async fn collapsed_thinking_and_tool_content_is_withheld_until_revealed() {
     let mut saw_tool_insert = false;
     let mut saw_hidden_append = false;
     let mut saw_visible_append = false;
+    let mut turn_started = false;
     loop {
         let value = watcher.next().await;
         if value["type"] != "event" || value["update"]["session_id"] != id {
@@ -875,10 +876,18 @@ async fn collapsed_thinking_and_tool_content_is_withheld_until_revealed() {
                 _ => {}
             }
         }
-        if changes
-            .iter()
-            .any(|c| c["type"] == "state" && c["state"]["phase"] == "idle")
-        {
+        // A freshly subscribed watcher can snapshot an already settled session
+        // before the turn's own updates land, so only an idle that follows a
+        // running phase ends the collection.
+        let phase = changes.iter().find_map(|change| {
+            (change["type"] == "state")
+                .then(|| change["state"]["phase"].as_str())
+                .flatten()
+        });
+        if phase.is_some_and(|phase| phase != "idle") {
+            turn_started = true;
+        }
+        if turn_started && phase == Some("idle") {
             break;
         }
     }
