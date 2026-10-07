@@ -83,8 +83,14 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
   execution, approvals, context fill, cost) is projected into the UI in
   real time, with recorded provider requests inspectable in either UI.
 - **Integrated web search and web browsing** - built-in `web_search` and
-  `web_browser` tools run against a local headless browser, so all web
-  traffic stays under your control for improved privacy. Cookie popups are
+  `web_browser` tools run against a local browser, so all web
+  traffic stays under your control for improved privacy. The browser profile is
+  persistent (`~/.local/share/rope/browser-profile`, relocate with
+  `ROPE_BROWSER_PROFILE`), so logins and cookies survive between sessions;
+  `rope browser-login [URL]` opens a visible window to sign in to sites, and
+  `--browser-headed` (or `headless = false` under `[browser]`) runs the web
+  tools in a visible window, which bot-shielded sites like Reddit treat as a
+  real visitor. Cookie popups are
   automatically opted out through [DuckDuckGo AutoConsent](https://github.com/duckduckgo/autoconsent).
   No need for extra providers. Powered by embedded [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright).
 - **Vision models** - the chat supports pasting and displaying images, if terminal emulator supports it.
@@ -141,7 +147,9 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
   images and downloads in the web UI and clickable file paths in the TUI.
 - Web tools: `web_search` (DuckDuckGo with Bing fallback) and
   `web_browser` (JavaScript-rendered, visible page content) over a shared
-  headless browser session.
+  browser session with a persistent profile. `rope browser-login [URL]`
+  signs in through a visible window; `--browser-headed` or
+  `[browser] headless = false` keeps tool sessions visible.
 - External tools: any executable that reads JSON on stdin and returns
   `{"output": "..."}` on stdout, discovered from `./.rope/tools/` and
   `~/.config/rope/tools/`.

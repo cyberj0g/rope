@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,18 @@ pub struct Args {
     pub token_file: Option<PathBuf>,
     #[arg(long, help = "Allow this exact browser Origin; may be repeated")]
     pub allow_origin: Vec<String>,
+    #[arg(long, help = "Run web tools in a visible browser window")]
+    pub browser_headed: bool,
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Open a visible browser on the persistent profile to sign in to sites
+    /// (default: reddit.com); later web tool sessions reuse the logins.
+    #[command(name = "browser-login")]
+    BrowserLogin { url: Option<String> },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -49,6 +61,7 @@ pub struct Config {
     pub paste_collapse_chars: usize,
     pub compaction_threshold: f32,
     pub tools: ToolPolicies,
+    pub browser: BrowserSettings,
     pub mcp: McpConfig,
     #[serde(skip)]
     pub recent_models: Vec<String>,
@@ -147,6 +160,21 @@ impl Default for ModelConfig {
             price_per_token: None,
             vision: true,
         }
+    }
+}
+
+/// Headless vs visible browser windows for the web tools. The browser profile
+/// itself is always persistent (`~/.local/share/rope/browser-profile`,
+/// `ROPE_BROWSER_PROFILE` to relocate).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BrowserSettings {
+    pub headless: bool,
+}
+
+impl Default for BrowserSettings {
+    fn default() -> Self {
+        Self { headless: true }
     }
 }
 
@@ -265,6 +293,7 @@ impl Default for Config {
             paste_collapse_chars: 200,
             compaction_threshold: 0.75,
             tools: ToolPolicies::default(),
+            browser: BrowserSettings::default(),
             mcp: McpConfig::default(),
             recent_models: Vec::new(),
             recent_commands: Vec::new(),
@@ -724,6 +753,32 @@ mod tests {
         assert_eq!(args.request.as_deref(), Some("fix the tests"));
         assert!(Args::try_parse_from(["rope", "one", "two"]).is_err());
         assert!(Args::try_parse_from(["rope", "--model", "qwen"]).is_err());
+    }
+
+    #[test]
+    fn browser_login_subcommand_and_headed_flag_parse() {
+        let args = Args::try_parse_from(["rope", "browser-login"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::BrowserLogin { url: None })
+        ));
+        let args =
+            Args::try_parse_from(["rope", "browser-login", "https://old.reddit.com/"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::BrowserLogin { url: Some(url) }) if url == "https://old.reddit.com/"
+        ));
+        let args = Args::try_parse_from(["rope", "--browser-headed", "hello"]).unwrap();
+        assert!(args.browser_headed);
+        assert_eq!(args.request.as_deref(), Some("hello"));
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn browser_headless_defaults_true_and_config_overridable() {
+        let config: Config = toml::from_str("[browser]\nheadless = false\n").unwrap();
+        assert!(!config.browser.headless);
+        assert!(Config::default().browser.headless);
     }
 
     #[test]

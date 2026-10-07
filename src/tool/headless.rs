@@ -38,6 +38,7 @@ type Waiters = Arc<StdMutex<HashMap<u64, oneshot::Sender<Reply>>>>;
 
 pub struct HeadlessBrowser {
     executable: PathBuf,
+    headless: bool,
     next_id: AtomicU64,
     state: Mutex<BrowserState>,
 }
@@ -86,12 +87,13 @@ struct CancelGuard {
 }
 
 impl HeadlessBrowser {
-    pub fn discover() -> Option<Self> {
+    pub fn discover(headless: bool) -> Option<Self> {
         if !runtime_available() {
             return None;
         }
         find_browser().map(|executable| Self {
             executable,
+            headless,
             next_id: AtomicU64::new(1),
             state: Mutex::new(BrowserState::default()),
         })
@@ -129,7 +131,8 @@ impl HeadlessBrowser {
                     .await
                     .context("prepare Patchright runtime task")??;
                 let profile = state.profile.as_ref().unwrap().path();
-                state.sidecar = Some(Sidecar::start(&runtime, profile, &self.executable).await?);
+                state.sidecar =
+                    Some(Sidecar::start(&runtime, profile, &self.executable, self.headless).await?);
             }
             let sidecar = state.sidecar.as_ref().unwrap();
             receiver = sidecar.request(id, "load", Some(url.as_str()))?;
@@ -165,6 +168,54 @@ pub fn browser_executable() -> Option<PathBuf> {
     find_browser()
 }
 
+/// The durable Chrome profile reused across sessions: cookies, logins, and
+/// site storage survive so sites like Reddit see a browser with a past.
+/// `ROPE_BROWSER_PROFILE` overrides the location (used by tests).
+pub fn persistent_profile() -> PathBuf {
+    if let Some(path) = std::env::var_os("ROPE_BROWSER_PROFILE").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.data_dir().join("rope/browser-profile"))
+        .unwrap_or_else(|| PathBuf::from("rope-browser-profile"))
+}
+
+/// Open a visible browser on the persistent profile for interactive sign-in
+/// (the `rope browser-login` command). Whatever is logged in there is reused
+/// by all later web tool sessions.
+pub async fn browser_login(url: Option<&str>) -> Result<()> {
+    let url = url.unwrap_or("https://www.reddit.com/");
+    let url = Url::parse(url).context("invalid sign-in URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("sign-in URL must use http or https");
+    }
+    let executable =
+        find_browser().context("no Chrome-compatible browser found; set ROPE_BROWSER")?;
+    let profile = persistent_profile();
+    fs::create_dir_all(&profile).context("create persistent browser profile")?;
+    let runtime = tokio::task::spawn_blocking(ensure_runtime)
+        .await
+        .context("prepare Patchright runtime task")??;
+    let status = Command::new(runtime.join(node_name()))
+        .arg(runtime.join("sidecar.cjs"))
+        .arg(&profile)
+        .arg(&executable)
+        .arg(&profile)
+        .arg("--headful")
+        .arg("--login")
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        .status()
+        .await
+        .context("start browser sign-in helper")?;
+    if !status.success() {
+        bail!("browser sign-in helper exited with {status}");
+    }
+    println!("browser profile saved: {}", profile.display());
+    println!("web tools now reuse its cookies and site logins");
+    Ok(())
+}
+
 pub async fn prepare_runtime() -> Result<Option<PathBuf>> {
     if !runtime_available() {
         return Ok(None);
@@ -176,12 +227,14 @@ pub async fn prepare_runtime() -> Result<Option<PathBuf>> {
 }
 
 impl Sidecar {
-    async fn start(runtime: &Path, profile: &Path, browser: &Path) -> Result<Self> {
+    async fn start(runtime: &Path, profile: &Path, browser: &Path, headless: bool) -> Result<Self> {
         let mut command = Command::new(runtime.join(node_name()));
         command
             .arg(runtime.join("sidecar.cjs"))
             .arg(profile)
             .arg(browser)
+            .arg(persistent_profile())
+            .arg(if headless { "--headless" } else { "--headful" })
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

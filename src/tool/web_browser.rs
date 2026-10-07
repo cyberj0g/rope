@@ -193,7 +193,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a Chromium-family browser and network access"]
     async fn live_headless_page_read() {
-        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let browser = Arc::new(HeadlessBrowser::discover(true).expect("browser runtime not found"));
         let tool = WebBrowserTool::new(browser);
         let result = tool
             .run(json!({ "url": "https://example.com" }))
@@ -205,7 +205,7 @@ mod tests {
             output["content"]
                 .as_str()
                 .unwrap()
-                .contains("Example Domain")
+                .contains("documentation examples")
         );
         assert!(output.get("truncated").is_none());
         tool.shutdown().await;
@@ -255,7 +255,7 @@ mod tests {
             }
         });
 
-        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let browser = Arc::new(HeadlessBrowser::discover(true).expect("browser runtime not found"));
         let tool = WebBrowserTool::new(browser);
         let result = tool
             .run(json!({ "url": format!("http://{address}") }))
@@ -315,7 +315,7 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
 
-        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let browser = Arc::new(HeadlessBrowser::discover(true).expect("browser runtime not found"));
         let tool = WebBrowserTool::new(browser);
         let result = tool
             .run(json!({ "url": format!("http://{address}") }))

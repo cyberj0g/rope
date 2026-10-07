@@ -1,18 +1,21 @@
 use anyhow::Result;
 use clap::Parser;
 use rope::{
-    config::{Args, Config},
+    config::{Args, Command, Config},
     core::Core,
     logging, onboarding,
     provider::openai::OpenAiProvider,
     server::Server,
-    session, ui,
+    session, tool, ui,
 };
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::BrowserLogin { url }) = &args.command {
+        return tool::browser_login(url.as_deref()).await;
+    }
     logging::init(args.headless);
     if !Config::global_exists()? {
         if args.headless {
@@ -22,7 +25,10 @@ async fn main() -> Result<()> {
         }
         onboarding::run().await?;
     }
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    if args.browser_headed {
+        config.browser.headless = false;
+    }
     for notice in config.notices() {
         if args.headless {
             logging::write("WARN", "server", notice);

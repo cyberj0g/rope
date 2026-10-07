@@ -290,7 +290,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a Chromium-family browser and network access"]
     async fn live_headless_search() {
-        let browser = Arc::new(HeadlessBrowser::discover().expect("browser runtime not found"));
+        let browser = Arc::new(HeadlessBrowser::discover(true).expect("browser runtime not found"));
         let tool = WebSearchTool::new(browser);
         let result = tool
             .run(json!({ "query": "Rust programming language", "max_results": 3 }))

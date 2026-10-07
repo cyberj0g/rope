@@ -29,6 +29,63 @@ const autoconsentConfig = {
 
 const profilePath = process.argv[2];
 const browserPath = process.argv[3];
+const persistentPath = process.argv[4] || null;
+const flags = process.argv.slice(5);
+const headful = flags.includes("--headful");
+const loginUrl = flags.includes("--login") ? flags[flags.indexOf("--login") + 1] : null;
+
+// State worth keeping in the persistent profile: site storage and
+// preferences. Cookies travel separately as a Playwright jar snapshot
+// (see saveCookies), and everything else (caches, crash data) stays
+// per-session.
+const persistentFiles = ["Default/Preferences"];
+const persistentDirs = ["Default/Local Storage"];
+
+async function syncProfile(from, to, label) {
+  if (!persistentPath) return;
+  try {
+    for (const name of persistentFiles) {
+      const source = path.join(from, name);
+      if (!fs.existsSync(source)) continue;
+      const target = path.join(to, name);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(source, target);
+    }
+    for (const name of persistentDirs) {
+      const source = path.join(from, name);
+      if (!fs.existsSync(source)) continue;
+      fs.cpSync(source, path.join(to, name), { recursive: true });
+    }
+  } catch (error) {
+    console.error(`${label} failed: ${errorText(error)}`);
+  }
+}
+
+// Session cookies (e.g. a Reddit login session) never reach the on-disk
+// profile: a graceful browser close deletes them. Serialize the full cookie
+// jar through Playwright instead and re-inject it on the next launch.
+const cookieStore = () => persistentPath && path.join(persistentPath, "rope-cookies.json");
+
+async function saveCookies(context) {
+  const store = cookieStore();
+  if (!store) return;
+  try {
+    fs.writeFileSync(store, JSON.stringify(await context.cookies()));
+  } catch (error) {
+    console.error(`cookie export failed: ${errorText(error)}`);
+  }
+}
+
+async function loadCookies(context) {
+  const store = cookieStore();
+  if (!store || !fs.existsSync(store)) return;
+  try {
+    await context.addCookies(JSON.parse(fs.readFileSync(store, "utf8")));
+  } catch (error) {
+    console.error(`cookie import failed: ${errorText(error)}`);
+  }
+}
+
 const active = new Map();
 const pending = new Set();
 const cancelled = new Set();
@@ -203,19 +260,55 @@ async function load(context, request) {
 async function close(context, id) {
   if (closing) return;
   closing = true;
+  await saveCookies(context);
   await Promise.all([...active.values()].map(page => page.close().catch(() => {})));
   await context.close().catch(() => {});
-  send({ id, result: true });
+  syncProfile(profilePath, persistentPath, "profile export");
+  if (id !== undefined) send({ id, result: true });
   process.exit(0);
 }
 
-async function main() {
-  const context = await chromium.launchPersistentContext(profilePath, {
+async function browserOptions() {
+  return {
     executablePath: browserPath,
-    headless: true,
+    headless: !headful,
     userAgent: chromeUserAgent(),
     viewport: null,
-  });
+  };
+}
+
+async function runLogin() {
+  // Sign-in mode operates directly on the persistent profile: whatever the
+  // user does in the window (logins, cookies) is saved by closing it.
+  const context = await chromium.launchPersistentContext(profilePath, await browserOptions());
+  // The window can die at any moment and the graceful close drops session
+  // cookies, so keep a fresh jar snapshot while the browser is alive.
+  const snapshot = setInterval(() => void saveCookies(context), 1_000);
+  const closeBrowser = () => void context.close().catch(() => {});
+  process.on("SIGINT", closeBrowser);
+  process.on("SIGTERM", closeBrowser);
+  await loadCookies(context);
+  try {
+    const page = context.pages()[0] ?? (await context.newPage());
+    await page
+      .goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 30_000 })
+      .catch(error => console.error(`login page warning: ${errorText(error)}`));
+    console.error("Browser is open. Sign in, then close the browser window (or press Ctrl-C) to save the profile and exit.");
+    await new Promise(resolve => context.once("close", resolve));
+  } finally {
+    clearInterval(snapshot);
+    await context.close().catch(() => {});
+  }
+}
+
+async function main() {
+  if (loginUrl) {
+    await runLogin();
+    return;
+  }
+  syncProfile(persistentPath, profilePath, "profile import");
+  const context = await chromium.launchPersistentContext(profilePath, await browserOptions());
+  await loadCookies(context);
   browserHooks.push(await context.exposeBinding("autoconsentSendMessage", handleAutoconsentMessage));
   send({ ready: true });
 

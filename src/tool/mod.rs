@@ -35,7 +35,10 @@ use web_browser::WebBrowserTool;
 use web_search::WebSearchTool;
 
 pub use builtin::{ShellCancelTool, ShellJobManager, ShellPollTool, ShellTool};
-pub use headless::{browser_executable, prepare_runtime as prepare_browser_runtime};
+pub use headless::{
+    browser_executable, browser_login, persistent_profile,
+    prepare_runtime as prepare_browser_runtime,
+};
 
 pub fn ripgrep_available() -> bool {
     std::process::Command::new("rg")
@@ -516,7 +519,7 @@ pub async fn discover_at(config: &Config, root: &std::path::Path) -> Result<Tool
     add_web_tools(
         &mut registry,
         config,
-        HeadlessBrowser::discover().map(Arc::new),
+        HeadlessBrowser::discover(config.browser.headless).map(Arc::new),
     );
 
     if let Some(global) =

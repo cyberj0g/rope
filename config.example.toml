@@ -37,6 +37,13 @@ web_search = "ask"
 external = "ask"
 mcp = "ask"
 
+# Web tools use a persistent browser profile (~/.local/share/rope/browser-profile,
+# ROPE_BROWSER_PROFILE to relocate). Set headless = false (or pass --browser-headed)
+# to run tool browsing in a visible window; `rope browser-login [URL]` opens a
+# visible window on the same profile to sign in to sites like Reddit.
+[browser]
+headless = true
+
 # MCP servers are started once per Rope session. Project config replaces a
 # global server with the same name instead of merging their process settings.
 #[mcp.servers.files]
