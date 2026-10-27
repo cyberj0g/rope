@@ -38,6 +38,52 @@ Set `ROPE_BROWSER` to an external Chrome, Chromium, Brave, or Edge executable wh
 automatic discovery is not sufficient. Developers can skip embedding and point
 `ROPE_PATCHRIGHT_RUNTIME_DIR` at an unpacked runtime payload.
 
+## Running as a systemd service
+
+The headless server is usually run as a system service so it survives logout and
+restarts itself after a crash. `/etc/systemd/system/rope.service`:
+
+```ini
+[Unit]
+Description=Rope headless server
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=flame
+WorkingDirectory=/projects/Rope
+Environment=HOME=/home/flame
+Environment=PATH=/home/flame/.cargo/bin:/home/flame/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/rope --headless --listen 0.0.0.0:8787
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/usr/bin/rope` is a symlink to `target/release/rope`, so a new build is picked up
+on the next restart. Cargo links into `target/release/deps` and then swaps the
+`target/release/rope` path, which means a running instance keeps its own copy of
+the old binary and a build needs no downtime; only the restart loads the new code:
+
+```sh
+cargo build --release
+sudo systemctl restart rope
+```
+
+The unit runs the whole tree (Rope, its Node sidecar, and Chrome) in one cgroup, so
+`systemctl stop` or a crash cleans the browser up too; `SIGTERM` triggers the normal
+shutdown path, which stops active sessions and removes their temporary profiles.
+Headless logging goes to stderr, which lands in the journal:
+
+```sh
+journalctl -u rope -f
+systemctl status rope
+```
+
 ## GitHub Actions
 
 The `Build` workflow tests Rope and builds release archives for these native
