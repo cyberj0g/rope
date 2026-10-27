@@ -122,8 +122,9 @@ for WebSocket messages, attachments, reconnect behavior, and current limits.
 
 - Provider-independent streaming runtime for OpenAI-compatible endpoints
   (Responses API by default, `chat_completions` fallback) with named
-  model profiles: context size, temperature, reasoning effort, and
-  vision capability.
+  model profiles: context size, temperature, reasoning effort, vision
+  capability, and per-model `extra_body` fields for endpoint-specific
+  request parameters.
 - Embedded images rendered inline when the terminal supports Sixel, the Kitty
   graphics protocol, or the iTerm2 image protocol (auto-detected at runtime;
   works on kitty, Ghostty, WezTerm, iTerm2, foot, Xterm, mlterm, Rio, and

@@ -391,6 +391,7 @@ async fn main() -> Result<()> {
             ],
             price_per_token: Some(0.000002),
             vision: true,
+            extra_body: serde_json::Map::new(),
         },
         ModelConfig {
             name: "mock-mini".into(),
@@ -402,6 +403,7 @@ async fn main() -> Result<()> {
             reasoning_efforts: Vec::new(),
             price_per_token: None,
             vision: false,
+            extra_body: serde_json::Map::new(),
         },
     ];
     config.tools = ToolPolicies {

@@ -135,6 +135,12 @@ pub struct ModelConfig {
     pub price_per_token: Option<f64>,
     #[serde(default)]
     pub vision: bool,
+    /// Extra JSON fields merged into every request body sent to this model,
+    /// for endpoint-specific switches an OpenAI-compatible server accepts but
+    /// the spec has no field for (e.g. `experimental_speed_projection`).
+    /// They are applied last, so an explicit field wins over a generated one.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Context size for entries that omit `max_context_tokens`; the same fallback
@@ -159,6 +165,7 @@ impl Default for ModelConfig {
             ],
             price_per_token: None,
             vision: true,
+            extra_body: serde_json::Map::new(),
         }
     }
 }
@@ -745,6 +752,7 @@ fn replace_mcp_servers(base: &mut toml::Value, overlay: &toml::Value) {
 mod tests {
     use super::*;
     use clap::Parser;
+    use serde_json::json;
 
     #[test]
     fn cli_accepts_only_session_and_one_request() {
@@ -791,6 +799,52 @@ mod tests {
         assert_eq!(config.model_name(), "qwen");
         assert_eq!(config.effective_temperature(), Some(0.5));
         assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    /// Endpoint-specific fields a model's config adds to every request body,
+    /// in both the inline-table and the sub-table form.
+    #[test]
+    fn reads_per_model_extra_body_fields() {
+        let inline: ModelConfig = toml::from_str(
+            r#"name = "steered"
+extra_body = { experimental_speed_projection = true, top_k = 5 }"#,
+        )
+        .unwrap();
+        let table: ModelConfig = toml::from_str(
+            r#"name = "steered"
+
+[extra_body]
+experimental_speed_projection = true
+top_k = 5"#,
+        )
+        .unwrap();
+
+        for model in [&inline, &table] {
+            assert_eq!(
+                model.extra_body["experimental_speed_projection"],
+                json!(true)
+            );
+            assert_eq!(model.extra_body["top_k"], json!(5));
+        }
+        assert!(ModelConfig::default().extra_body.is_empty());
+    }
+
+    #[test]
+    fn extra_body_round_trips_through_the_written_config() {
+        let mut config = Config::default();
+        assert!(
+            !toml::to_string_pretty(&config)
+                .unwrap()
+                .contains("extra_body")
+        );
+
+        config.models[0]
+            .extra_body
+            .insert("experimental_speed_projection".into(), json!(true));
+        let written = toml::to_string_pretty(&config).unwrap();
+        let reread: Config = toml::from_str(&written).unwrap();
+
+        assert_eq!(reread.models[0].extra_body, config.models[0].extra_body);
     }
 
     #[test]

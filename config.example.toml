@@ -23,6 +23,10 @@ reasoning_effort = "xhigh"
 reasoning_efforts = ["low", "medium", "xhigh"]
 # price_per_token = 0.0000025
 vision = true
+# extra JSON fields merged into every request for this model, for
+# endpoint-specific switches the spec has no field for; they are applied
+# last, so they win over generated fields of the same name
+# extra_body = { experimental_speed_projection = true }
 
 [tools]
 read = "allow"

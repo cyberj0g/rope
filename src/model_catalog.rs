@@ -64,6 +64,7 @@ pub fn model_config(id: String) -> ModelConfig {
             reasoning_efforts: Vec::new(),
             price_per_token: None,
             vision: false,
+            extra_body: serde_json::Map::new(),
         },
     }
 }
@@ -129,6 +130,7 @@ impl Defaults {
             reasoning_efforts: self.reasoning_efforts.to_vec(),
             price_per_token: None,
             vision: self.vision,
+            extra_body: serde_json::Map::new(),
         }
     }
 }

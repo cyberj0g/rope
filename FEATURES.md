@@ -16,6 +16,7 @@
 - OpenAI-first onboarding with official endpoint recognition and pinned current OpenAI models above the full API catalog
 - explicit per-model provider routing, including duplicate model IDs across endpoints and legacy single-endpoint config compatibility
 - named model profiles with context size, temperature, reasoning defaults/options, and vision capabilities; omitted names use the API model ID
+- per-model `extra_body` config table merged into every request body for that model (both wire formats), for endpoint-specific switches the OpenAI schemas have no field for, such as `experimental_speed_projection`; the fields are applied last, so they win over generated fields of the same name, and they reach auxiliary requests (compaction, session titles) too
 - minimal `[[models]]` entries use neutral omitted-field defaults (no vision, temperature, or reasoning) instead of inheriting the built-in default model's profile
 - stale saved model selections fall back to the config's model with a startup warning instead of failing to start
 - built-in defaults for popular OpenAI-compatible model families, including Qwen3.8

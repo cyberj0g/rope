@@ -109,11 +109,20 @@ impl Provider for OpenAiProvider {
             .endpoints
             .get(&request.provider)
             .context("provider is not configured")?;
-        Ok(Some(if endpoint.api == ProviderApi::Responses {
+        let extra_body = request.extra_body.clone();
+        let mut body = if endpoint.api == ProviderApi::Responses {
             super::responses::request_body(request)?
         } else {
             serde_json::to_value(WireRequest::from(request))?
-        }))
+        };
+        // A model's configured extra fields are merged last, so an explicit
+        // one always wins over a field of the same name that Rope generates.
+        if let Some(fields) = body.as_object_mut() {
+            for (key, value) in extra_body {
+                fields.insert(key, value);
+            }
+        }
+        Ok(Some(body))
     }
 
     async fn stream(&self, request: CompletionRequest) -> Result<ResponseStream> {
@@ -121,12 +130,15 @@ impl Provider for OpenAiProvider {
             .endpoints
             .get(&request.provider)
             .with_context(|| format!("provider {} is not configured", request.provider))?;
+        let body = self
+            .request_body(request)?
+            .context("missing request body")?;
         if endpoint.api == ProviderApi::Responses {
             return super::responses::stream(
                 &self.client,
                 &endpoint.base_url,
                 &endpoint.api_key,
-                request,
+                body,
             )
             .await;
         }
@@ -134,11 +146,7 @@ impl Provider for OpenAiProvider {
             "{}/chat/completions",
             endpoint.base_url.trim_end_matches('/')
         );
-        let mut builder = self.client.post(url).json(
-            &self
-                .request_body(request)?
-                .context("missing request body")?,
-        );
+        let mut builder = self.client.post(url).json(&body);
         if !endpoint.api_key.is_empty() {
             builder = builder.bearer_auth(&endpoint.api_key);
         }
@@ -466,6 +474,58 @@ mod tests {
         assert_eq!(provider.endpoints.len(), 2);
         assert_eq!(provider.endpoints["two"].base_url, "https://two.example/v1");
         assert_eq!(provider.endpoints["two"].api, ProviderApi::ChatCompletions);
+    }
+
+    /// A model's `extra_body` reaches both wire formats, and wins over a
+    /// field of the same name that Rope generates.
+    #[test]
+    fn extra_body_fields_reach_both_request_bodies() {
+        let mut config = crate::config::Config::default();
+        config.providers = vec![
+            crate::config::ProviderConfig {
+                name: "responses".into(),
+                base_url: "https://responses.example/v1".into(),
+                api_key: String::new(),
+                api: ProviderApi::Responses,
+            },
+            crate::config::ProviderConfig {
+                name: "chat".into(),
+                base_url: "https://chat.example/v1".into(),
+                api_key: String::new(),
+                api: ProviderApi::ChatCompletions,
+            },
+        ];
+        let provider = OpenAiProvider::from_config(&config);
+
+        for name in ["responses", "chat"] {
+            let body = provider
+                .request_body(CompletionRequest {
+                    provider: name.into(),
+                    model: "model".into(),
+                    messages: vec![Message::user_with_images("hello".into(), Vec::new())],
+                    temperature: Some(0.5),
+                    reasoning_effort: None,
+                    max_tokens: None,
+                    stream: true,
+                    tools: Vec::new(),
+                    extra_body: serde_json::Map::from_iter([
+                        (
+                            "experimental_speed_projection".into(),
+                            serde_json::json!(true),
+                        ),
+                        ("temperature".into(), serde_json::json!(0.1)),
+                    ]),
+                })
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(
+                body["experimental_speed_projection"],
+                serde_json::json!(true),
+                "{name}"
+            );
+            assert_eq!(body["temperature"], serde_json::json!(0.1), "{name}");
+        }
     }
 
     #[test]

@@ -21,10 +21,10 @@ pub async fn stream(
     client: &Client,
     base_url: &str,
     api_key: &str,
-    request: CompletionRequest,
+    body: Value,
 ) -> Result<ResponseStream> {
     let url = format!("{}/responses", base_url.trim_end_matches('/'));
-    let mut builder = client.post(url).json(&request_body(request)?);
+    let mut builder = client.post(url).json(&body);
     if !api_key.is_empty() {
         builder = builder.bearer_auth(api_key);
     }
@@ -458,6 +458,7 @@ mod tests {
             max_tokens: Some(100),
             stream: true,
             tools: Vec::new(),
+            extra_body: serde_json::Map::new(),
         })
     }
 

@@ -129,6 +129,10 @@ mod tests {
                 max_tokens: Some(1024),
                 stream: true,
                 tools: Vec::new(),
+                extra_body: serde_json::Map::from_iter([(
+                    "experimental_speed_projection".into(),
+                    json!(true),
+                )]),
             };
             let expected = provider.request_body(request.clone()).unwrap().unwrap();
             let recorder = RecordingProvider {

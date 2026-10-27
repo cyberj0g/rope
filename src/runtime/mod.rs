@@ -115,6 +115,9 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     pub stream: bool,
     pub tools: Vec<ToolDefinition>,
+    /// Endpoint-specific fields the model's config asked for, merged into
+    /// the request body by the provider.
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -1003,6 +1006,7 @@ async fn summarize<P: Provider + ?Sized>(
         max_tokens: Some(max_tokens.min(u32::MAX as u64) as u32),
         stream: true,
         tools: Vec::new(),
+        extra_body: config.active_model().extra_body.clone(),
     };
     let (summary, end, raw_request) =
         summarize_stream(&provider, request, events, internal, progress).await?;
@@ -1150,6 +1154,7 @@ async fn generate_session_title<P: Provider + ?Sized>(
         max_tokens: Some(512),
         stream: true,
         tools: Vec::new(),
+        extra_body: config.active_model().extra_body.clone(),
     };
     let result: Result<(String, String)> = async {
         let (mut stream, _) = stream_with_retry(&provider, request, events, false, None).await?;
@@ -1402,6 +1407,7 @@ async fn agent<P: Provider + ?Sized>(
             max_tokens: None,
             stream: true,
             tools: tool_definitions,
+            extra_body: config.active_model().extra_body.clone(),
         };
         // A stream can break partway through a response — the connection
         // drops, or a chunk or a tool call arrives that cannot be decoded.
