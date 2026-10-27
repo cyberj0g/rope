@@ -221,9 +221,24 @@ function blockContent(session, b) {
   return wrap;
 }
 
-// Follow the bottom until the user scrolls away deliberately.
+// Follow the bottom until the user scrolls away deliberately. Programmatic
+// pins are tracked explicitly: any scroll event we did not cause counts as
+// the reader's own, so touch momentum after the finger lifts (which a time
+// window around touch input cannot cover) sticks just as reliably as a
+// wheel or key press, and the view is never dragged back mid-read.
 let stickBottom = true;
+let pinned = false;
 events.addEventListener("select", () => { stickBottom = true; });
+function pinBottom() {
+  const chat = $("chat");
+  if (chat.scrollHeight - chat.scrollTop - chat.clientHeight < 2) return;
+  pinned = true;
+  chat.scrollTop = chat.scrollHeight;
+  // The scroll event a programmatic assignment fires arrives before the
+  // next animation frame; the timeout is only a backstop.
+  requestAnimationFrame(() => { pinned = false; });
+  setTimeout(() => { pinned = false; }, 150);
+}
 // Blocks are reconciled by session + block ID: existing elements are kept and
 // repositioned (so expanded sections and reading position survive new blocks),
 // rebuilt only when their content key changes (carrying open state over), and
@@ -282,20 +297,13 @@ function renderChat() {
     } else marker?.remove();
   }
   if (search.query) applySearch();
-  if (stickBottom) chat.scrollTop = chat.scrollHeight;
+  if (stickBottom) pinBottom();
   updateJump();
 }
-// Layout changes (approval card, attachment plates) resize the chat area and
-// fire scroll events without user intent, so only honor scrolls that follow a
-// real wheel/touch/key input.
-let userScrollAt = 0;
-for (const ev of ["wheel", "touchstart", "pointerdown", "keydown"]) {
-  $("chat").addEventListener(ev, () => { userScrollAt = Date.now(); }, { passive: true });
-}
 $("chat").addEventListener("scroll", () => {
+  if (pinned) return;
   const away = $("chat").scrollHeight - $("chat").scrollTop - $("chat").clientHeight;
-  const byUser = Date.now() - userScrollAt < 150;
-  if (byUser && away > 160) stickBottom = false;
+  if (away > 80) stickBottom = false;
   else if (away < 40) stickBottom = true;
 });
 function updateJump() {
@@ -303,7 +311,7 @@ function updateJump() {
   const away = chat.scrollHeight - chat.scrollTop - chat.clientHeight > 120;
   $("jump").classList.toggle("on", away && !!$("chatInner")._els?.size);
 }
-$("jump").onclick = () => { $("chat").scrollTop = $("chat").scrollHeight; updateJump(); };
+$("jump").onclick = () => { stickBottom = true; pinBottom(); updateJump(); };
 $("chat").addEventListener("scroll", updateJump);
 
 /* ticking timers: the snapshot carries the last reported elapsed_ms, so running

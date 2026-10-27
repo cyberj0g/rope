@@ -983,6 +983,13 @@ try {
   if (layout.chipMaxRight > layout.clientW + 1) fail(`topbar chips reach x=${layout.chipMaxRight.toFixed(0)} at 320px`);
   if (layout.titleWidth < 80) fail(`session title squeezed to ${layout.titleWidth.toFixed(0)}px at 320px`);
   if (layout.stripRight > layout.clientW + 1) fail(`status strip reaches x=${layout.stripRight.toFixed(0)} at 320px`);
+  const stripLayout = await spage.evaluate(() => {
+    const strip = document.getElementById("strip");
+    return { height: strip.getBoundingClientRect().height, modelHidden: getComputedStyle(document.getElementById("stripModel")).display === "none", hintHidden: document.getElementById("compHint").hidden };
+  });
+  if (!stripLayout.modelHidden) fail("status strip still shows the duplicated model segment at 320px");
+  if (stripLayout.height > 30) fail(`status strip is ${stripLayout.height.toFixed(0)}px tall at 320px (expected one line)`);
+  if (!stripLayout.hintHidden) fail("empty composer hint line is not collapsed while idle");
   await spage.click("#input");
   await spage.fill("#input", "/");
   await waitFor(spage, () => document.getElementById("palette").classList.contains("on"), "narrow palette");
@@ -1226,6 +1233,75 @@ try {
   await waitForMain(`window.__rope.state.selected === __a`, "returned to parent chat", 10000, rootAgentSession);
   await shot(page, "25-agent.png");
   ok("agent picker, /agent, child chat, reload, and parent navigation work");
+
+  console.log("31. scroll stick: the reading position survives a live turn; the jump arrow returns");
+  await page.click("#tbMenu");
+  await waitFor(page, () => document.getElementById("app").classList.contains("side-open"), "sidebar open for new chat");
+  await page.click("#newChat");
+  await waitFor(page, () => document.getElementById("app").classList.contains("on") && !document.querySelector("#chatInner .msg"), "empty new chat rendered");
+  await waitFor(page, idleProbe, "stick check chat ready");
+  await sendPrompt(page, "Stick check one");
+  await page.fill("#input", "Stick check two");
+  await page.keyboard.press("Enter");
+  // Wait until the second (long scripted) reply makes the chat scrollable.
+  await waitFor(page, () => {
+    const c = document.getElementById("chat");
+    return c.scrollHeight - c.clientHeight > 200;
+  }, "stick check chat scrollable", 20000);
+  // Scroll away mid-generation: the stream must not drag the reader back.
+  await page.evaluate(() => {
+    const c = document.getElementById("chat");
+    c.scrollTop = c.scrollHeight - c.clientHeight - 300;
+    c.dispatchEvent(new Event("scroll"));
+  });
+  await page.waitForTimeout(1000); // more deltas arrive and re-render meanwhile
+  const mid = await page.evaluate(() => ({
+    generating: document.getElementById("tbPhase").classList.contains("generating"),
+    jumpOn: document.getElementById("jump").classList.contains("on"),
+    gap: document.getElementById("chat").scrollHeight - document.getElementById("chat").scrollTop - document.getElementById("chat").clientHeight,
+  }));
+  if (!mid.generating) fail("stick check turn finished before the mid-generation check ran");
+  if (!mid.jumpOn) fail("floating jump arrow is not shown after scrolling back");
+  if (mid.gap < 150) fail(`the live stream dragged the reader back mid-turn (gap=${mid.gap})`);
+  await waitFor(page, idleProbe, "stick check turn settled", 45000);
+  const held = await page.evaluate(() => document.getElementById("chat").scrollHeight - document.getElementById("chat").scrollTop - document.getElementById("chat").clientHeight);
+  if (held < 150) fail(`the completed turn pulled the view back to the bottom (gap=${held})`);
+  await page.click("#jump");
+  await page.waitForTimeout(400);
+  const back = await page.evaluate(() => ({
+    gap: document.getElementById("chat").scrollHeight - document.getElementById("chat").scrollTop - document.getElementById("chat").clientHeight,
+    jumpOn: document.getElementById("jump").classList.contains("on"),
+  }));
+  if (back.gap > 8) fail(`jump arrow did not return to the bottom (gap=${back.gap})`);
+  if (back.jumpOn) fail("jump arrow stays shown at the bottom");
+  // Back at the bottom, a fresh render follows the bottom again.
+  await sendPrompt(page, "Stick check three");
+  await page.waitForTimeout(500); // let a few deltas stream in
+  const follows = await page.evaluate(() => document.getElementById("chat").scrollHeight - document.getElementById("chat").scrollTop - document.getElementById("chat").clientHeight);
+  if (follows > 25) fail(`the view stopped following the bottom after the jump (gap=${follows})`);
+  await waitFor(page, idleProbe, "follow-the-bottom turn settled", 45000);
+  ok("scrolled-back view survives a live turn; the floating arrow returns and following resumes");
+
+  console.log("32. text size control (Aa sheet + /font, persisted)");
+  await page.click("#tbFont");
+  await waitFor(page, () => document.getElementById("sheetTitle").textContent === "Text size", "text size sheet");
+  if (await page.evaluate(() => document.querySelectorAll("#sheetBody .srow").length) !== 5) fail("text size sheet does not list five sizes");
+  await page.evaluate(() => [...document.querySelectorAll("#sheetBody .srow")].find(r => r.textContent.includes("Extra large"))?.click());
+  await waitForMain(`getComputedStyle(document.documentElement).getPropertyValue("--fs").trim() === "1.4"`, "--fs set by the sheet");
+  const zoom = await page.evaluate(() => getComputedStyle(document.getElementById("chatInner")).zoom);
+  if (!String(zoom).includes("1.4")) fail(`chat zoom is ${JSON.stringify(zoom)}, expected 1.4`);
+  if (await mainEval("window.__rope.prefs.fontScale") !== 1.4) fail("font scale not kept in prefs");
+  await page.fill("#input", "/font small");
+  await page.keyboard.press("Enter");
+  await waitForMain(`window.__rope.prefs.fontScale === 0.9`, "/font small applied");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await waitFor(page, () => document.getElementById("app").classList.contains("on"), "app after reload");
+  await waitForMain(`getComputedStyle(document.documentElement).getPropertyValue("--fs").trim() === "0.9"`, "font scale restored after reload");
+  await page.fill("#input", "/font normal");
+  await page.keyboard.press("Enter");
+  await waitForMain(`window.__rope.prefs.fontScale === 1`, "text size reset to normal");
+  await shot(page, "26-font.png");
+  ok("Aa sheet and /font scale the conversation live and persist across reload");
 
   if (pageErrors.length) {
     fail("page errors: " + pageErrors.slice(0, 3).join(" | "));

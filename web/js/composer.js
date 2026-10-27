@@ -3,7 +3,7 @@ import { LS, S, prefs, savePrefs, draft } from "./state.js";
 import { request, command, commandTo, select } from "./protocol.js";
 import { updateSendBtn, newSession } from "./status.js";
 import { clearAttachments, uploadAttachment, closeCamera } from "./attachments.js";
-import { openSheet, closeSheet, fillPlanBody, openAgentPicker } from "./panels.js";
+import { openSheet, closeSheet, fillPlanBody, openAgentPicker, openFontSheet, applyFontScale } from "./panels.js";
 import { openSearch, closeSearch } from "./search.js";
 import { renderChat } from "./chat.js";
 
@@ -137,6 +137,7 @@ const COMMANDS = [
   { c: "/git", d: "Show project git status" },
   { c: "/search", d: "Search this conversation" },
   { c: "/sound", d: "Toggle completion sound (/sound off)" },
+  { c: "/font", d: "Text size: /font small · normal · large · xl · huge" },
   { c: "/clear", d: "Clear the input" },
   { c: "/help", d: "Show commands" },
 ];
@@ -204,6 +205,16 @@ async function runSlash(cmd, rest) {
   else if (cmd === "/thinking") prefs.showThinking = arg === "off" ? false : !prefs.showThinking;
   else if (cmd === "/tools") prefs.showTools = arg === "off" ? false : !prefs.showTools;
   else if (cmd === "/sound") prefs.sound = arg === "off" ? false : !prefs.sound;
+  else if (cmd === "/font") {
+    const sizes = { small: 0.9, normal: 1, medium: 1, large: 1.2, xl: 1.4, xlarge: 1.4, huge: 1.7 };
+    if (!arg) openFontSheet();
+    else if (sizes[arg.toLowerCase()] != null) {
+      prefs.fontScale = sizes[arg.toLowerCase()];
+      savePrefs();
+      applyFontScale();
+      toast(`text size: ${arg.toLowerCase()}`);
+    } else toast("Sizes: small, normal, large, xl, huge", "err");
+  }
   else if (cmd === "/plan") openSheet("Plan", b => fillPlanBody(b, S.selected && S.sessions.get(S.selected)?.plan));
   else if (cmd === "/git") $("chipGit").click();
   else if (cmd === "/search") openSearch();

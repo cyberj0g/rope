@@ -1,5 +1,5 @@
 import { $, esc, fmt, toast } from "./helpers.js";
-import { S } from "./state.js";
+import { S, prefs, savePrefs } from "./state.js";
 import { request, command } from "./protocol.js";
 
 let sheetOpen = null;
@@ -83,6 +83,40 @@ function openAgentPicker() {
   });
 }
 $("chipAgent").onclick = openAgentPicker;
+
+// Text size: a viewer-side zoom over the conversation (and the composer's
+// font), kept in the browser's local prefs like the other view toggles.
+const FONT_STEPS = [
+  [0.9, "Small"],
+  [1, "Normal"],
+  [1.2, "Large"],
+  [1.4, "Extra large"],
+  [1.7, "Huge"],
+];
+function applyFontScale() {
+  document.documentElement.style.setProperty("--fs", String(prefs.fontScale));
+}
+function openFontSheet() {
+  openSheet("Text size", body => {
+    for (const [value, label] of FONT_STEPS) {
+      const row = document.createElement("div");
+      row.className = "srow";
+      row.innerHTML = `<div class="t"><div class="n" style="font-size:${(14 * value).toFixed(1)}px">${esc(label)}</div></div>${prefs.fontScale === value ? '<span class="badge">current</span>' : ""}`;
+      row.onclick = () => {
+        prefs.fontScale = value;
+        savePrefs();
+        applyFontScale();
+        openFontSheet(); // repaint the "current" badge
+      };
+      body.appendChild(row);
+    }
+    const note = document.createElement("div");
+    note.className = "sheet-note";
+    note.textContent = "Saved in this browser. Also available as /font small · normal · large · xl · huge.";
+    body.appendChild(note);
+  });
+}
+$("tbFont").onclick = openFontSheet;
 
 $("chipModel").onclick = () => {
   const st = S.selected && S.sessions.get(S.selected)?.state;
@@ -195,4 +229,4 @@ $("chipPlan").onclick = () => {
   openSheet("Plan", body => fillPlanBody(body, S.selected && S.sessions.get(S.selected)?.plan));
 };
 
-export { openSheet, closeSheet, openDiffSheet, fillPlanBody, renderPlanSheet, openAgentPicker };
+export { openSheet, closeSheet, openDiffSheet, fillPlanBody, renderPlanSheet, openAgentPicker, openFontSheet, applyFontScale };

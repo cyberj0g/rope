@@ -5,7 +5,7 @@ import { highlight, inline, md } from "./markdown.js";
 import { blockEl, renderChat } from "./chat.js";
 import { imageCache } from "./files.js";
 import { setPhase, renderSide, renderStatus, renderChips, renderApproval } from "./status.js";
-import { renderPlanSheet } from "./panels.js";
+import { renderPlanSheet, applyFontScale } from "./panels.js";
 import { renderPlates, uploadAttachment } from "./attachments.js";
 import { hidePalette } from "./composer.js";
 
@@ -85,4 +85,5 @@ const debugHandle = {
   },
 };
 window.__rope = debugHandle;
+applyFontScale();
 boot();

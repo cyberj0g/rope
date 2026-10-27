@@ -179,6 +179,9 @@ function updateSendBtn() {
   $("hintLeft").textContent = running
     ? (st?.delegation ? `steering subagent · ${st.queued_steers || 0} queued` : `steering · ${st?.queued_steers || 0} queued`)
     : "";
+  // The hint line only ever carries steering text: drop it entirely while
+  // idle so the composer bar stays compact on phone layouts.
+  $("compHint").hidden = !running;
 }
 function renderChips() {
   const snap = S.selected && S.sessions.get(S.selected);

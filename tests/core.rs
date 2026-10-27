@@ -558,6 +558,91 @@ async fn settings_are_scoped_revisioned_and_saved_in_the_session() {
 }
 
 #[tokio::test]
+async fn reasoning_effort_is_validated_saved_and_restored_on_resume() {
+    use rope::runtime::ReasoningEffort;
+    let harness = Harness::new().await;
+    let core = &harness.core;
+    let a = core.create(Some("a".into())).await.unwrap();
+    let model = core.models()[0].clone();
+    let saved_default = model.reasoning_effort.unwrap();
+    let chosen = model
+        .reasoning_efforts
+        .iter()
+        .copied()
+        .find(|effort| *effort != saved_default)
+        .unwrap();
+    let unsupported = [
+        ReasoningEffort::None,
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ]
+    .into_iter()
+    .find(|effort| !model.reasoning_efforts.contains(effort))
+    .unwrap();
+    // The web sheet shows the model's own efforts; an effort outside them is
+    // rejected without touching the session's state.
+    assert_eq!(
+        core.subscribe(&a).await.unwrap().snapshot.state.reasoning_effort,
+        Some(saved_default)
+    );
+    assert_eq!(
+        core.command(
+            &a,
+            Action::SetReasoning {
+                effort: Some(unsupported),
+                revision: 0,
+            }
+        )
+        .await
+        .unwrap_err()
+        .code,
+        "invalid_settings"
+    );
+    assert_eq!(
+        core.subscribe(&a).await.unwrap().snapshot.state.reasoning_effort,
+        Some(saved_default)
+    );
+    core.command(
+        &a,
+        Action::SetReasoning {
+            effort: Some(chosen),
+            revision: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let snapshot = core.subscribe(&a).await.unwrap().snapshot;
+    assert_eq!(snapshot.state.reasoning_effort, Some(chosen));
+    assert_eq!(snapshot.state.settings_revision, 1);
+    let meta: rope::session::SessionMeta = serde_json::from_slice(
+        &std::fs::read(harness.storage.path().join("a/session.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta.settings.as_ref().unwrap().reasoning_effort, Some(chosen));
+    core.shutdown().await.unwrap();
+    // A fresh core resuming the same session restores the saved effort.
+    let (sender, _requests) = tokio::sync::mpsc::unbounded_channel();
+    let resumed = rope::core::Core::new(
+        rope::config::Config::default(),
+        harness.project.path().into(),
+        harness.storage.path().into(),
+        std::sync::Arc::new(support::ControlledProvider(sender)),
+    )
+    .await
+    .unwrap();
+    let a = resumed.open(Some("a".into())).await.unwrap();
+    assert_eq!(
+        resumed.subscribe(&a).await.unwrap().snapshot.state.reasoning_effort,
+        Some(chosen)
+    );
+    resumed.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn slow_subscribers_do_not_block_the_runtime_and_can_resnapshot() {
     let mut harness = Harness::new().await;
     let core = harness.core.clone();
