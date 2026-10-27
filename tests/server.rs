@@ -123,6 +123,13 @@ async fn web_page_and_module_imports_are_served_without_authentication() {
         response.headers()["content-type"],
         "text/html; charset=utf-8"
     );
+    let csp = response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("script-src 'self'"));
+    assert!(csp.contains("script-src-attr 'none'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     let html = response.text().await.unwrap();
     assert!(html.contains("type=\"module\""));
     let assets = regex::Regex::new(r#"(?:src|href)="(/assets/[^"]+)""#).unwrap();
@@ -155,6 +162,9 @@ async fn web_page_and_module_imports_are_served_without_authentication() {
                     .map(|c| url.join(&c[1]).unwrap()),
             );
         }
+    }
+    for vendor in ["markdown-it.mjs", "purify.mjs"] {
+        assert!(visited.contains(&base.join(&format!("assets/js/vendor/{vendor}")).unwrap()));
     }
     let response = client
         .get(base.join("assets/missing.js").unwrap())

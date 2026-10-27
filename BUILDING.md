@@ -109,3 +109,21 @@ for public repositories; private repositories consume the account's included
 Actions minutes. Cargo outputs and the browser payload are cached to keep tagged
 builds short. Non-release runs use only the Linux test runner and store no
 binary artifacts.
+
+## Web renderer security tests
+
+The browser Markdown parser and sanitizer are checked in under
+`web/js/vendor/` and embedded by Rust, so normal Cargo builds need no Node/npm
+step. To regenerate them or run the standalone Chromium regressions:
+
+```sh
+npm ci --prefix web --ignore-scripts
+npm run --prefix web vendor
+npm exec --prefix web -- playwright install chromium
+npm test --prefix web
+```
+
+Set `ROPE_E2E_BROWSER` to use an existing Chrome/Chromium executable. These tests
+exercise the real DOM without CSP (to detect sanitizer failures), including
+malicious streaming prefixes, event execution, renderer fidelity, and remote
+image suppression. Rust transport tests verify CSP and embedded module serving.

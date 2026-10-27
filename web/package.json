@@ -1,0 +1,14 @@
+{
+  "name": "rope-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor": "node vendor.mjs",
+    "test": "node --test security.test.mjs"
+  },
+  "devDependencies": {
+    "dompurify": "3.4.17",
+    "markdown-it": "15.0.3",
+    "playwright": "1.58.2"
+  }
+}

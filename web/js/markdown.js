@@ -1,4 +1,6 @@
 import { esc } from "./helpers.js";
+import MarkdownIt from "./vendor/markdown-it.mjs";
+import DOMPurify from "./vendor/purify.mjs";
 
 const KEYWORDS = new Set(("let const var fn function return if else match while for loop break continue impl pub struct enum trait type use mod " +
   "def class import from as with try except raise new delete void int float bool string true false null this self None True False " +
@@ -24,87 +26,56 @@ function highlight(code, lang) {
   }
   return out + esc(code.slice(last));
 }
-function inline(s) {
-  // Code spans are carved out before any emphasis or link parsing so their
-  // text stays literal; only the surrounding prose is further transformed.
-  const emph = t => {
-    t = esc(t);
-    t = t.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    t = t.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
-    t = t.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-    t = t.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
-      (_, a, u) => `<a href="${u}" target="_blank" rel="noopener">${a}</a>`);
-    t = t.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g,
-      (_, p, u) => `${p}<a href="${u}" target="_blank" rel="noopener">${u.replace(/^[a-z]+:\/\//i, "").slice(0, 48)}${u.length > 60 ? "…" : ""}</a>`);
-    return t;
-  };
-  return s.split(/(`[^`\n]+`)/g).map(part =>
-    /^`[^`\n]+`$/.test(part) ? `<code>${esc(part.slice(1, -1))}</code>` : emph(part)
-  ).join("");
+// Parse Markdown into tokens; never run substitutions over generated HTML.
+// Sanitize last, after every renderer/plugin, including our trusted highlighter.
+const parser = new MarkdownIt({ html: false, breaks: true, linkify: true });
+parser.validateLink = url => /^https?:\/\//i.test(url);
+parser.linkify.set({ fuzzyLink: false, fuzzyEmail: false });
+parser.renderer.rules.link_open = (tokens, idx, options, env, renderer) => {
+  tokens[idx].attrSet("target", "_blank");
+  tokens[idx].attrSet("rel", "noopener noreferrer");
+  return renderer.renderToken(tokens, idx, options);
+};
+// Chat attachments have a separate authenticated renderer. Markdown must not
+// load remote images (tracking or requests to services on the user's network).
+parser.renderer.rules.image = (tokens, idx, options, env, renderer) =>
+  esc(renderer.renderInlineAsText(tokens[idx].children || [], options, env));
+parser.renderer.rules.fence = (tokens, idx) => {
+  const token = tokens[idx];
+  const lang = token.info.trim().split(/\s+/)[0];
+  return `<pre data-lang="${esc(lang)}"><code>${highlight(token.content.replace(/\n$/, ""), lang)}</code></pre>\n`;
+};
+// Keep the existing decorative task markers without permitting arbitrary HTML.
+parser.core.ruler.after("inline", "task_markers", state => {
+  for (let i = 2; i < state.tokens.length; i++) {
+    const token = state.tokens[i];
+    if (token.type !== "inline" || state.tokens[i - 1].type !== "paragraph_open"
+        || state.tokens[i - 2].type !== "list_item_open") continue;
+    const first = token.children?.[0];
+    const match = first?.type === "text" && first.content.match(/^\[([ xX])\]\s+/);
+    if (!match) continue;
+    first.content = first.content.slice(match[0].length);
+    const marker = new state.Token("task_marker", "span", 0);
+    marker.meta = { done: match[1] !== " " };
+    token.children.unshift(marker);
+  }
+});
+parser.renderer.rules.task_marker = (tokens, idx) =>
+  `<span class="task${tokens[idx].meta.done ? " done" : ""}"></span>`;
+
+const SANITIZE = {
+  ALLOWED_TAGS: ["p", "br", "strong", "em", "del", "s", "a", "code", "pre",
+    "h1", "h2", "h3", "h4", "h5", "h6", "hr", "blockquote", "ul", "ol", "li",
+    "table", "thead", "tbody", "tr", "th", "td", "span"],
+  ALLOWED_ATTR: ["href", "title", "target", "rel", "class", "data-lang", "start"],
+  ALLOW_DATA_ATTR: false,
+  ALLOW_ARIA_ATTR: false,
+};
+function inline(text) {
+  return DOMPurify.sanitize(parser.renderInline(text || ""), SANITIZE);
 }
 function md(text) {
-  if (!text) return "";
-  const fences = [];
-  const body = text.replace(/```([\w+-]*)\n?([\s\S]*?)(?:```|$)/g, (m, lang, code) => {
-    fences.push(`<pre data-lang="${esc(lang)}"><code>${highlight(code.replace(/\n$/, ""), lang)}</code></pre>`);
-    return `\u0000F${fences.length - 1}\u0000`;
-  });
-  const lines = body.split("\n");
-  let html = "", para = [], list = null;
-  const flushP = () => {
-    if (para.length) { html += `<p>${para.map(inline).join("<br>")}</p>`; para = []; }
-  };
-  const flushL = () => {
-    if (list) {
-      html += `<${list.tag}>${list.items.map(i =>
-        `<li>${i.task ? `<span class="task${i.done ? " done" : ""}"></span>` : ""}${inline(i.text)}</li>`
-      ).join("")}</${list.tag}>`;
-      list = null;
-    }
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const t = line.trim();
-    if (/^\u0000F\d+\u0000$/.test(t)) { flushP(); flushL(); html += t; continue; }
-    if (!t) { flushP(); flushL(); continue; }
-    let m;
-    if ((m = t.match(/^(#{1,4})\s+(.*)/))) { flushP(); flushL(); html += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; continue; }
-    if (/^(-{3,}|\*{3,})$/.test(t)) { flushP(); flushL(); html += "<hr>"; continue; }
-    if (/^>\s?/.test(t)) {
-      flushP(); flushL();
-      const q = [t.replace(/^>\s?/, "")];
-      while (lines[i + 1] && /^>\s?/.test(lines[i + 1].trim())) { i++; q.push(lines[i].trim().replace(/^>\s?/, "")); }
-      html += `<blockquote>${q.map(inline).join("<br>")}</blockquote>`; continue;
-    }
-    if (t.includes("|") && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1])) {
-      flushP(); flushL();
-      const cells = r => r.trim().replace(/^\||\|$/g, "").split("|").map(c => inline(c.trim()));
-      const head = cells(t); i += 2;
-      const rows = [];
-      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) { rows.push(cells(lines[i])); i++; }
-      i--;
-      html += `<table><thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
-      continue;
-    }
-    if ((m = t.match(/^[-*]\s+\[( |x|X)\]\s+(.*)/))) {
-      flushP();
-      if (!list || list.tag !== "ul") { flushL(); list = { tag: "ul", items: [] }; }
-      list.items.push({ text: m[2], task: true, done: m[1].toLowerCase() === "x" }); continue;
-    }
-    if ((m = t.match(/^[-*]\s+(.*)/))) {
-      flushP();
-      if (!list || list.tag !== "ul") { flushL(); list = { tag: "ul", items: [] }; }
-      list.items.push({ text: m[1] }); continue;
-    }
-    if ((m = t.match(/^\d+[.)]\s+(.*)/))) {
-      flushP();
-      if (!list || list.tag !== "ol") { flushL(); list = { tag: "ol", items: [] }; }
-      list.items.push({ text: m[1] }); continue;
-    }
-    flushL(); para.push(t);
-  }
-  flushP(); flushL();
-  return html.replace(/\u0000F(\d+)\u0000/g, (_, i) => fences[+i]);
+  return DOMPurify.sanitize(parser.render(text || ""), SANITIZE);
 }
 function plain(text) {
   return `<pre class="plain">${esc(text)}</pre>`;

@@ -296,6 +296,7 @@ impl Server {
             .route("/assets/{*path}", get(web_asset))
             .merge(attachments)
             .layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize))
+            .layer(middleware::from_fn(security_headers))
             .with_state(app);
         let task = tokio::spawn(async move {
             axum::serve(
@@ -327,6 +328,23 @@ impl Drop for Server {
     }
 }
 
+// Block inline script/event handlers even if a future rendering bug bypasses
+// Markdown sanitization. Inline styles are used by the current UI.
+async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; script-src-attr 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 async fn web_asset(Path(path): Path<String>) -> Response {
     let body = match path.as_str() {
         "styles.css" => include_str!("../web/styles.css"),
@@ -338,6 +356,8 @@ async fn web_asset(Path(path): Path<String>) -> Response {
         "js/files.js" => include_str!("../web/js/files.js"),
         "js/helpers.js" => include_str!("../web/js/helpers.js"),
         "js/markdown.js" => include_str!("../web/js/markdown.js"),
+        "js/vendor/markdown-it.mjs" => include_str!("../web/js/vendor/markdown-it.mjs"),
+        "js/vendor/purify.mjs" => include_str!("../web/js/vendor/purify.mjs"),
         "js/panels.js" => include_str!("../web/js/panels.js"),
         "js/protocol.js" => include_str!("../web/js/protocol.js"),
         "js/search.js" => include_str!("../web/js/search.js"),

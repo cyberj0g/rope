@@ -3,3 +3,4 @@
 /.rope/
 /browser-runtime/
 tests/web/shots/
+web/node_modules/

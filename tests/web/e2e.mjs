@@ -537,6 +537,18 @@ try {
   if (!inlineOut.includes("<code>a ~b~ c</code>")) fail("inline code lost literal tildes: " + inlineOut);
   if (!inlineOut.includes('<a href="https://e.com"')) fail("links outside code no longer rendered: " + inlineOut);
   ok("inline code spans stay literal, formatting outside still works");
+  // Exercise the actual chat sink as well as the standalone renderer suite.
+  // Attribute assertions must pass even though CSP also blocks execution.
+  const markdownAttack = "[x](https://**https://a/onmouseover=window.__ropeMarkdownXss=1//**)";
+  await sendPrompt(page, markdownAttack);
+  const attackBubble = page.locator(".msg.user .bubble").last();
+  const injectedHandlers = await attackBubble.evaluate(el =>
+    [...el.querySelectorAll("*")].flatMap(node => [...node.attributes])
+      .filter(attr => /^on/i.test(attr.name)).map(attr => attr.name));
+  if (injectedHandlers.length) fail("Markdown introduced event handlers: " + injectedHandlers.join(", "));
+  await attackBubble.locator("a").hover();
+  if (await mainEval("window.__ropeMarkdownXss === 1")) fail("Markdown XSS executed");
+  ok("crafted Markdown stays inert in the actual chat DOM");
   const ages = await mainEval(`(() => {
     const now = 1789643144881; // millisecond epoch reference
     const R = window.__rope;
